@@ -1,0 +1,21 @@
+[package]
+name = "dash-rs"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust implementation of MPEG-DASH playback logic: MPD parsing, ABR selection, media fetching, and an MSE-like buffer abstraction"
+license = "BSD-3-Clause"
+repository = "https://github.com/jacksd60/dash-rs"
+keywords = ["dash", "mpeg-dash", "streaming", "abr", "mpd"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+dash-mpd    = "0.20"
+bytes       = "1"
+url         = "2"
+thiserror   = "2"
+async-trait = "0.1"
+tracing     = "0.1"
+
+[dev-dependencies]
+tokio              = { version = "1", features = ["full"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -1,0 +1,65 @@
+use std::sync::Arc;
+
+use url::Url;
+
+use crate::{
+    error::DashError,
+    fetch::{FetchRequest, RequestType, SegmentFetcher},
+};
+
+// Re-export the MPD root type so callers don't need a direct dash-mpd dep
+// for basic usage.
+pub use dash_mpd::MPD;
+
+/// Loads and parses MPEG-DASH manifests from a URL.
+///
+/// Mirrors the responsibilities of `ManifestLoader.js` in dash.js:
+/// - Fetches the raw XML text via the provided [`SegmentFetcher`].
+/// - Handles redirect tracking (the `final_url` from the response is used
+///   as the manifest's base URI for relative segment URL resolution).
+/// - Delegates XML parsing to `dash-mpd::parse`.
+///
+/// Manifest refreshing (live streams) is the responsibility of the caller
+/// or a higher-level `ManifestUpdater` component.
+pub struct ManifestLoader<F: SegmentFetcher> {
+    fetcher: Arc<F>,
+}
+
+impl<F: SegmentFetcher> ManifestLoader<F> {
+    /// Create a new loader backed by the given fetcher.
+    pub fn new(fetcher: Arc<F>) -> Self {
+        Self { fetcher }
+    }
+
+    /// Fetch and parse the MPD manifest at `url`.
+    ///
+    /// On success returns the parsed [`MPD`] document together with the
+    /// resolved base URL (the final URL after any redirects, used for
+    /// resolving relative segment URLs later).
+    pub async fn load(&self, url: &Url) -> Result<(MPD, Url), DashError> {
+        tracing::info!(url = %url, "loading manifest");
+
+        let request = FetchRequest::new(url.clone(), RequestType::Manifest);
+        let response = self.fetcher.fetch(request).await?;
+
+        let base_url = response.final_url.clone();
+
+        let text = String::from_utf8_lossy(&response.data);
+
+        tracing::debug!(
+            url = %base_url,
+            bytes = response.data.len(),
+            "manifest fetched, parsing"
+        );
+
+        let mpd = dash_mpd::parse(&text)?;
+
+        tracing::info!(
+            url = %base_url,
+            periods = mpd.periods.len(),
+            "manifest parsed successfully"
+        );
+
+        Ok((mpd, base_url))
+    }
+}
