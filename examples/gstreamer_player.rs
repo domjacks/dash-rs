@@ -211,30 +211,49 @@ async fn run_session(
     // pipeline to Playing so decoding and rendering begin.
     session.media_source_mut().set_playing()?;
 
-    // Segment fetch loop.
-    println!("\n=== Fetching {SEGMENTS_TO_FETCH} segments ===");
+    // Tell the session the pipeline clock has started so buffer-level
+    // estimates subtract elapsed playing time from pushed content duration.
+    // This mirrors dash.js reading dashMetrics.getCurrentBufferLevel().
+    session.notify_playing();
+
+    // ── Segment fetch loop — dash.js ScheduleController pattern ──────────────
+    //
+    // After each append completes, check estimated buffer level against the
+    // target (default 12 s, matching bufferTimeDefault in dash.js).
+    //
+    //   buffer_level < target  → fetch the next segment immediately
+    //   buffer_level ≥ target  → wait SCHEDULE_POLL_MS and re-check
+    //
+    // This prevents pushing all segments at once (which would let EOS race
+    // through the pipeline before any frames are rendered) while still
+    // fetching eagerly whenever the buffer is not yet full.
+    const SCHEDULE_POLL_MS: u64 = 500; // dash.js scheduleTimeout default
+
+    println!("\n=== Fetching {SEGMENTS_TO_FETCH} segments (buffer target: {:.0} s) ===",
+        session.buffer_target_ms() / 1_000.0);
     println!(
-        "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {}",
-        "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "video fetch"
+        "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:<10}  {}",
+        "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
     );
 
-    // Segment duration for the BBC BBB stream (3 840 ms per segment).
-    // We pace the fetch loop so that we never push more than one segment's
-    // worth of data ahead of the playback clock.  Each iteration targets
-    // SEGMENT_DURATION_MS: after fetching and pushing a segment we sleep for
-    // however long is left before the next segment is due to be consumed.
-    // This prevents the entire 30-second buffer from being pushed instantly,
-    // which would cause EOS to race through the pipeline before any frames
-    // are rendered.
-    const SEGMENT_DURATION_MS: u64 = 3_840;
-
     for seg in 1..=SEGMENTS_TO_FETCH {
-        let t_seg_start = Instant::now();
+        // ── Video: gate on buffer level ──────────────────────────────────────
+        loop {
+            let buf = session.estimated_buffer_level_ms(&MediaType::Video);
+            if buf < session.buffer_target_ms() {
+                break;
+            }
+            tracing::debug!(
+                buf_level_ms = buf as u64,
+                target_ms = session.buffer_target_ms() as u64,
+                "video buffer full — waiting"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
+        }
 
-        let throughput_bps =
-            f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        let buffer_level_ms = (seg as f64) * (SEGMENT_DURATION_MS as f64);
-        let metrics = AbrMetrics::new(throughput_bps, buffer_level_ms);
+        let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+        let vid_buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
+        let metrics = AbrMetrics::new(throughput_bps, vid_buf_ms);
 
         let t_video = Instant::now();
         let video_decision = session
@@ -242,41 +261,43 @@ async fn run_session(
             .await?;
         let video_ms = t_video.elapsed().as_millis();
 
+        // ── Audio: gate on buffer level ──────────────────────────────────────
+        // dash.js slaves audio target to video buffer level + 1 s so that
+        // audio and video stay in lock-step.
+        let audio_target_ms = session
+            .estimated_buffer_level_ms(&MediaType::Video)
+            .min(session.buffer_target_ms());
+        loop {
+            let buf = session.estimated_buffer_level_ms(&MediaType::Audio);
+            if buf < audio_target_ms + 1_000.0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
+        }
+
+        let aud_buf_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
+        let audio_metrics = AbrMetrics::new(throughput_bps, aud_buf_ms);
         let audio_decision = session
-            .fetch_next_segment(MediaType::Audio, &metrics)
+            .fetch_next_segment(MediaType::Audio, &audio_metrics)
             .await?;
 
-        let measured_bps =
-            f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+        let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
 
         println!(
-            "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps)",
+            "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
             seg,
             video_decision.index,
             format!("{:?}", video_decision.reason),
             audio_decision.index,
             format!("{:?}", audio_decision.reason),
+            vid_buf_ms / 1_000.0,
             video_ms,
             measured_bps / 1_000.0,
         );
-
-        // Pace: sleep for the remainder of the segment duration so the
-        // pipeline clock stays ahead of the pushed data by at most one
-        // segment.  Skip the sleep on the last segment so EOS is sent
-        // promptly after the last frame is due.
-        if seg < SEGMENTS_TO_FETCH {
-            let elapsed_ms = t_seg_start.elapsed().as_millis() as u64;
-            if elapsed_ms < SEGMENT_DURATION_MS {
-                tokio::time::sleep(std::time::Duration::from_millis(
-                    SEGMENT_DURATION_MS - elapsed_ms,
-                ))
-                .await;
-            }
-        }
     }
 
-    // All segments have been pushed and the last segment's playback window
-    // has elapsed — signal EOS so the pipeline drains cleanly.
+    // All segments pushed.  Signal EOS so the pipeline drains and posts
+    // GST_MESSAGE_EOS once the last frame has been rendered.
     session.end_of_stream().await?;
     println!("\nAll segments fetched — waiting for pipeline EOS…");
 

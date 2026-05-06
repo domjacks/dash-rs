@@ -1,6 +1,6 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Instant};
 
-use dash_mpd::{AdaptationSet, Period, MPD};
+use dash_mpd::{AdaptationSet, Period, SegmentTemplate, MPD};
 use url::Url;
 
 use crate::{
@@ -41,9 +41,16 @@ struct TrackState {
     representations: Vec<RepresentationInfo>,
     /// Index of the representation currently being downloaded.
     current_index: usize,
-    /// How many segments have been fetched so far (used to build URLs when
-    /// `SegmentTemplate` `$Number$` addressing is used).
+    /// The segment number to request next.  Initialised to `start_number`
+    /// (from `SegmentTemplate@startNumber`, default 1).
     segment_number: u64,
+    /// First segment number declared in the manifest (SegmentTemplate@startNumber,
+    /// default 1).  Used to compute how many segments have been fetched.
+    start_number: u64,
+    /// Duration of a single segment in milliseconds, derived from
+    /// `SegmentTemplate@duration / SegmentTemplate@timescale * 1000`.
+    /// Used for buffer-level estimation.
+    segment_duration_ms: f64,
     /// The `SourceBufferSink` wrapping the underlying buffer.
     sink: SourceBufferSink,
 }
@@ -53,12 +60,16 @@ impl TrackState {
         media_type: MediaType,
         representations: Vec<RepresentationInfo>,
         sink: SourceBufferSink,
+        start_number: u64,
+        segment_duration_ms: f64,
     ) -> Self {
         Self {
             _media_type: media_type,
             representations,
             current_index: 0,
-            segment_number: 1,
+            segment_number: start_number,
+            start_number,
+            segment_duration_ms,
             sink,
         }
     }
@@ -111,6 +122,13 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     abr: AbrController,
     video_track: Option<TrackState>,
     audio_track: Option<TrackState>,
+    /// Buffer target in milliseconds.  Fetch is gated until estimated buffer
+    /// level drops below this value — mirrors `bufferTimeDefault` (12 s) in
+    /// dash.js's `ScheduleController`.
+    buffer_target_ms: f64,
+    /// Wall-clock instant when the pipeline transitioned to Playing.  Set by
+    /// [`Self::notify_playing`]; used for buffer-level estimation.
+    playback_started_at: Option<Instant>,
 }
 
 // Re-export for convenience in the example.
@@ -160,11 +178,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let video_track = if let Some(adaptation) = video_adaptation {
             let reps = extract_representations(adaptation);
             if !reps.is_empty() {
-                // Pick the MIME type from the first representation.
                 let mime = adaptation_mime_type(adaptation);
                 let sink_buf = media_source.add_source_buffer(&mime)?;
                 let sink = SourceBufferSink::new(sink_buf);
-                Some(TrackState::new(MediaType::Video, reps, sink))
+                let (start_number, seg_dur_ms) =
+                    extract_segment_timing(adaptation, period);
+                Some(TrackState::new(MediaType::Video, reps, sink, start_number, seg_dur_ms))
             } else {
                 None
             }
@@ -178,7 +197,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 let mime = adaptation_mime_type(adaptation);
                 let sink_buf = media_source.add_source_buffer(&mime)?;
                 let sink = SourceBufferSink::new(sink_buf);
-                Some(TrackState::new(MediaType::Audio, reps, sink))
+                let (start_number, seg_dur_ms) =
+                    extract_segment_timing(adaptation, period);
+                Some(TrackState::new(MediaType::Audio, reps, sink, start_number, seg_dur_ms))
             } else {
                 None
             }
@@ -194,6 +215,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             abr: AbrController::default(),
             video_track,
             audio_track,
+            buffer_target_ms: 12_000.0,
+            playback_started_at: None,
         })
     }
 
@@ -259,7 +282,58 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
     }
 
-    // ── Quality selection ─────────────────────────────────────────────────────
+    // ── Buffer scheduling ─────────────────────────────────────────────────────
+
+    /// Record that the pipeline has entered Playing state.
+    ///
+    /// Call this immediately after your media source transitions to Playing so
+    /// that [`Self::estimated_buffer_level_ms`] can subtract elapsed playback
+    /// time from the pushed content duration — mirroring the way dash.js reads
+    /// `dashMetrics.getCurrentBufferLevel()` to decide whether to schedule the
+    /// next fetch.
+    pub fn notify_playing(&mut self) {
+        self.playback_started_at = Some(Instant::now());
+    }
+
+    /// Estimated buffer level ahead of the current playback position, in
+    /// milliseconds.
+    ///
+    /// Computed as `segments_fetched × segment_duration_ms − elapsed_playing_ms`.
+    /// This is a wall-clock approximation: it assumes the pipeline plays at
+    /// exactly real-time speed, which is true for a non-live pipeline with
+    /// correct timestamps.
+    ///
+    /// Returns `0.0` before any segments have been fetched or if the estimate
+    /// would be negative (buffer empty / stall condition).
+    pub fn estimated_buffer_level_ms(&self, media_type: &MediaType) -> f64 {
+        let track = match self.track(media_type) {
+            Ok(t) => t,
+            Err(_) => return 0.0,
+        };
+        let segments_fetched = track.segment_number.saturating_sub(track.start_number);
+        let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
+        let elapsed_ms = self
+            .playback_started_at
+            .map(|t| t.elapsed().as_millis() as f64)
+            .unwrap_or(0.0);
+        (pushed_ms - elapsed_ms).max(0.0)
+    }
+
+    /// The buffer fill target in milliseconds.
+    ///
+    /// The scheduling loop should gate fetches until the estimated buffer level
+    /// falls below this value.  Default: **12 000 ms** (matches
+    /// `bufferTimeDefault` in dash.js's `ScheduleController`).
+    pub fn buffer_target_ms(&self) -> f64 {
+        self.buffer_target_ms
+    }
+
+    /// Override the buffer fill target.
+    pub fn set_buffer_target_ms(&mut self, ms: f64) {
+        self.buffer_target_ms = ms;
+    }
+
+
 
     /// Run the ABR controller and return the recommended quality for the
     /// given media type without changing any state.
@@ -556,8 +630,34 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
-/// Extract [`RepresentationInfo`] from an [`AdaptationSet`], sorted by
-/// bandwidth ascending.
+/// Extract `(start_number, segment_duration_ms)` from the `SegmentTemplate`
+/// that governs `adaptation`, walking up to `period` if needed.
+///
+/// `start_number` defaults to 1 when `@startNumber` is absent (DASH spec §5.3.9.2).
+/// `segment_duration_ms` defaults to 2 000 ms when `@duration` / `@timescale`
+/// are absent (safe fallback that keeps the buffer estimator conservative).
+fn extract_segment_timing(adaptation: &AdaptationSet, period: &Period) -> (u64, f64) {
+    let tmpl: Option<&SegmentTemplate> = adaptation
+        .SegmentTemplate
+        .as_ref()
+        .or(period.SegmentTemplate.as_ref());
+
+    let Some(t) = tmpl else {
+        return (1, 2_000.0);
+    };
+
+    let start_number = t.startNumber.unwrap_or(1);
+
+    let seg_dur_ms = match (t.duration, t.timescale) {
+        (Some(dur), Some(ts)) => dur / (ts as f64) * 1_000.0,
+        (Some(dur), None) => dur * 1_000.0, // timescale defaults to 1
+        _ => 2_000.0,
+    };
+
+    (start_number, seg_dur_ms)
+}
+
+
 fn extract_representations(adaptation: &AdaptationSet) -> Vec<RepresentationInfo> {
     let mut reps: Vec<RepresentationInfo> = adaptation
         .representations

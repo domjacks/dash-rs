@@ -15,7 +15,7 @@ JavaScript runtime.
 |---|---|---|
 | `abr` | Adaptive bitrate rules and controller | `src/streaming/rules/` |
 | `media_source` | MSE-style `MediaSource` / `SourceBuffer` traits + in-memory stub | `ExternalMediaSource.js`, `ExternalSourceBuffer.js`, `SourceBufferSink.js` |
-| `fetch` | `SegmentFetcher` trait + stub (no real HTTP yet) | `FragmentLoader.js`, `URLLoader.js` |
+| `fetch` | `SegmentFetcher` trait + stub | `FragmentLoader.js`, `URLLoader.js` |
 | `manifest` | Manifest loading via [`dash-mpd`](https://crates.io/crates/dash-mpd) | `ManifestLoader.js` |
 | `session` | Top-level `DashSession` coordinator | `MediaPlayer.js`, `StreamProcessor.js` |
 
