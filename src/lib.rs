@@ -54,6 +54,3 @@ pub use abr::{AbrController, AbrMetrics, QualityDecision};
 pub use error::DashError;
 pub use manifest::MPD;
 pub use session::{DashSession, MediaType};
-
-#[cfg(feature = "sink-gstreamer")]
-pub use media_source::gstreamer::{GstMediaSource, GstPipeline};

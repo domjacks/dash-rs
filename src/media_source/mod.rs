@@ -1,7 +1,5 @@
 pub mod sink;
 pub mod stub;
-#[cfg(feature = "sink-gstreamer")]
-pub mod gstreamer;
 
 use async_trait::async_trait;
 use bytes::Bytes;

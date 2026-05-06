@@ -230,8 +230,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// Shared reference to the underlying [`MediaSource`].
     ///
     /// Useful for accessing implementation-specific methods (e.g.
-    /// [`crate::media_source::gstreamer::GstMediaSource::set_playing`]) after
-    /// the session has been constructed.
+    /// `GstMediaSource::set_playing`) after the session has been constructed.
     pub fn media_source(&self) -> &M {
         &self.media_source
     }

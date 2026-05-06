@@ -202,14 +202,27 @@ Each rule lives in its own file under `src/abr/`.  Rules must:
 
 ### Adding a `MediaSource` or `SourceBuffer` implementation
 
-Implement the trait in a new module (e.g. `src/media_source/gstreamer.rs`).
+Concrete implementations that are only needed by a specific example belong
+**alongside that example**, not in `src/`.  Create an
+`examples/<example-name>/` subdirectory, put the implementation in its own
+file (e.g. `examples/gstreamer_player/gst_media_source.rs`), and declare it
+as a module from `main.rs` (`mod gst_media_source;`).  Import the library
+traits via `dash_rs::media_source::{MediaSource, SourceBuffer, …}`.
+
+Only promote an implementation into `src/` if it is intended to be reusable
+by downstream crates.
+
 Do not modify `src/media_source/mod.rs` (the trait definitions) unless the
 MSE spec requires a new method.
 
 ### Adding a `SegmentFetcher` implementation
 
-Implement the trait in a new module under `src/fetch/` (e.g.
-`src/fetch/http.rs`).  Gate it behind a Cargo feature if it adds heavy
+Concrete fetcher implementations that are only needed by a specific example
+belong **alongside that example** (see `examples/http_fetch.rs` and
+`examples/gstreamer_player/main.rs` for the established pattern).
+
+Only promote a fetcher into `src/fetch/` if it is intended to be reusable by
+downstream crates.  Gate it behind a Cargo feature if it adds heavy
 dependencies (e.g. `reqwest`):
 
 ```toml
@@ -230,7 +243,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `MediaSource` / `SourceBuffer` traits | `src/media_source/mod.rs` |
 | Append queue + window management | `src/media_source/sink.rs` |
 | In-memory stub implementations | `src/media_source/stub.rs` |
-| GStreamer `MediaSource` / `SourceBuffer` (`sink-gstreamer` feature) | `src/media_source/gstreamer.rs` |
+| GStreamer `MediaSource` / `SourceBuffer` (`sink-gstreamer` feature) | `examples/gstreamer_player/gst_media_source.rs` |
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
@@ -240,7 +253,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | MSE abstraction tests | `tests/media_source.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
-| GStreamer full-playback example | `examples/gstreamer_player.rs` |
+| GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
 
 ---
 

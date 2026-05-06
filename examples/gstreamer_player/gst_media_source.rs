@@ -1,5 +1,10 @@
 //! GStreamer-backed [`MediaSource`] and [`SourceBuffer`] implementations.
 //!
+//! This module lives alongside the `gstreamer_player` example rather than in
+//! the library itself — concrete sink implementations belong with the example
+//! that uses them, not in `src/`.  Only the traits (`MediaSource`,
+//! `SourceBuffer`) live in the library.
+//!
 //! Enabled by the `sink-gstreamer` Cargo feature.  Requires GStreamer ≥ 1.14
 //! headers at build time.  On macOS install via Homebrew:
 //!
@@ -20,8 +25,8 @@
 //! ```
 //!
 //! Bytes reach `appsrc` through [`GstSourceBuffer::append_buffer`], which is
-//! called by [`crate::media_source::sink::SourceBufferSink`] inside
-//! [`crate::session::DashSession`].
+//! called by `dash_rs::media_source::sink::SourceBufferSink` inside
+//! `dash_rs::session::DashSession`.
 //!
 //! # Main-thread requirement on macOS
 //!
@@ -34,11 +39,10 @@
 //! thread without any additional dispatch.
 //!
 //! The caller is responsible for ensuring `NSApplication` is initialised
-//! before the pipeline transitions to Playing.  See
-//! `examples/gstreamer_player.rs` for the recommended setup:
-//! wrap `main()` with `gst::macos_main()`, run the GStreamer bus loop on the
-//! main thread via `glib::MainLoop::run()`, and push segments from a
-//! background OS thread.
+//! before the pipeline transitions to Playing.  See `main.rs` for the
+//! recommended setup: wrap `main()` with `gst::macos_main()`, run the
+//! GStreamer bus loop on the main thread via `glib::MainLoop::run()`, and
+//! push segments from a background OS thread.
 
 use async_trait::async_trait;
 // Conventional short aliases used throughout the gstreamer-rs ecosystem.
@@ -46,12 +50,12 @@ use gstreamer as gst;
 use gstreamer_app as gst_app;
 use gst::prelude::*;
 
-use crate::{
+use dash_rs::{
     error::DashError,
     media_source::{Chunk, MediaSource, ReadyState, SourceBuffer, TimeRange},
 };
 
-// Re-export so callers only need `dash_rs::media_source::gstreamer::*`.
+// Re-export so `main.rs` can use `gst_media_source::GstPipeline` if needed.
 pub use gst::Pipeline as GstPipeline;
 
 // ── GstSourceBuffer ───────────────────────────────────────────────────────────
@@ -273,8 +277,8 @@ impl GstMediaSource {
     /// Transition the pipeline to `Playing` state.
     ///
     /// Call this after all source buffers have been created (i.e. after
-    /// [`crate::session::DashSession::from_url`] has returned) and before the
-    /// first [`crate::session::DashSession::fetch_next_segment`] call.
+    /// `DashSession::from_url` has returned) and before the first
+    /// `DashSession::fetch_next_segment` call.
     pub fn set_playing(&self) -> Result<(), DashError> {
         self.pipeline
             .set_state(gst::State::Playing)

@@ -48,6 +48,8 @@
 //!                   └─ segment fetch loop      (ABR + push bytes)
 //! ```
 
+mod gst_media_source;
+
 use std::{
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -61,10 +63,10 @@ use bytes::Bytes;
 use dash_rs::{
     abr::AbrMetrics,
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
-    media_source::gstreamer::GstMediaSource,
     session::{DashSession, MediaType},
     DashError,
 };
+use gst_media_source::GstMediaSource;
 use gstreamer as gst;
 use gst::prelude::*;
 use url::Url;
