@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use dash_mpd::{AdaptationSet, MPD};
+use dash_mpd::{AdaptationSet, Period, MPD};
 use url::Url;
 
 use crate::{
@@ -150,12 +150,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let video_adaptation = period
             .adaptations
             .iter()
-            .find(|a| dash_mpd::is_video_adaptation(a));
+            .find(dash_mpd::is_video_adaptation);
 
         let audio_adaptation = period
             .adaptations
             .iter()
-            .find(|a| dash_mpd::is_audio_adaptation(a));
+            .find(dash_mpd::is_audio_adaptation);
 
         let video_track = if let Some(adaptation) = video_adaptation {
             let reps = extract_representations(adaptation);
@@ -202,6 +202,20 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The parsed MPD manifest.
     pub fn mpd(&self) -> &MPD {
         &self.mpd
+    }
+
+    /// Shared reference to the underlying [`MediaSource`].
+    ///
+    /// Useful for accessing implementation-specific methods (e.g.
+    /// [`crate::media_source::gstreamer::GstMediaSource::set_playing`]) after
+    /// the session has been constructed.
+    pub fn media_source(&self) -> &M {
+        &self.media_source
+    }
+
+    /// Exclusive reference to the underlying [`MediaSource`].
+    pub fn media_source_mut(&mut self) -> &mut M {
+        &mut self.media_source
     }
 
     /// Available video representations, sorted ascending by bandwidth.
@@ -444,10 +458,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Resolve the URL for the next segment of the given representation.
     ///
-    /// This is a simplified implementation that handles the common
-    /// `SegmentTemplate` with `$Number$` addressing. A production
-    /// implementation would also handle `$Time$`, `SegmentList`, and
-    /// `SegmentBase` (indexed range requests).
+    /// Handles `SegmentTemplate` with `$Number$` / `$Number%0Nd$` addressing,
+    /// respecting `BaseURL` elements at Period and AdaptationSet level.
+    /// `$Time$`, `SegmentList`, and `SegmentBase` are not yet implemented.
     fn resolve_segment_url(
         &self,
         media_type: &MediaType,
@@ -466,11 +479,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 media_type: media_type.to_string(),
             })?;
 
-        // Walk SegmentTemplate from Representation → AdaptationSet → Period.
+        // Walk SegmentTemplate from AdaptationSet → Period.
         let template = adaptation
             .SegmentTemplate
             .as_ref()
-            .or_else(|| period.SegmentTemplate.as_ref());
+            .or(period.SegmentTemplate.as_ref());
 
         if let Some(tmpl) = template {
             let media_tmpl = tmpl
@@ -478,14 +491,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .as_deref()
                 .ok_or(DashError::SegmentUrlUnresolvable)?;
 
-            let url_str = media_tmpl
-                .replace("$RepresentationID$", &rep.id)
-                .replace("$Number$", &segment_number.to_string())
-                .replace("$Bandwidth$", &rep.bandwidth.to_string());
+            let url_str =
+                expand_template(media_tmpl, &rep.id, rep.bandwidth, segment_number);
 
-            // Resolve relative to base URL.
-            let resolved = self
-                .base_url
+            // Chain Period → AdaptationSet BaseURL, then resolve template path.
+            let base = resolve_adaptation_base_url(&self.base_url, period, adaptation);
+            let resolved = base
                 .join(&url_str)
                 .map_err(|_| DashError::SegmentUrlUnresolvable)?;
 
@@ -499,7 +510,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// representation.
     ///
     /// Handles the common `@initialization` attribute form of `SegmentTemplate`
-    /// (e.g. `initialization="video/$RepresentationID$/init.mp4"`).
+    /// (e.g. `initialization="video/$RepresentationID$/init.mp4"` or a fixed
+    /// path like `initialization="1920x1080p25/IS.mp4"`).
     /// Returns [`DashError::SegmentUrlUnresolvable`] when no initialisation
     /// URL can be derived from the manifest.
     fn resolve_init_url(
@@ -519,22 +531,20 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 media_type: media_type.to_string(),
             })?;
 
-        // Walk SegmentTemplate from AdaptationSet → Period (same precedence
-        // as resolve_segment_url).
+        // Walk SegmentTemplate from AdaptationSet → Period.
         let template = adaptation
             .SegmentTemplate
             .as_ref()
-            .or_else(|| period.SegmentTemplate.as_ref());
+            .or(period.SegmentTemplate.as_ref());
 
         if let Some(tmpl) = template {
             // @initialization attribute — the most common form.
             if let Some(init_tmpl) = tmpl.initialization.as_deref() {
-                let url_str = init_tmpl
-                    .replace("$RepresentationID$", &rep.id)
-                    .replace("$Bandwidth$", &rep.bandwidth.to_string());
+                // Segment number is irrelevant for init segments; pass 0.
+                let url_str = expand_template(init_tmpl, &rep.id, rep.bandwidth, 0);
 
-                return self
-                    .base_url
+                let base = resolve_adaptation_base_url(&self.base_url, period, adaptation);
+                return base
                     .join(&url_str)
                     .map_err(|_| DashError::SegmentUrlUnresolvable);
             }
@@ -556,7 +566,7 @@ fn extract_representations(adaptation: &AdaptationSet) -> Vec<RepresentationInfo
             let bandwidth = r.bandwidth?;
             Some(RepresentationInfo {
                 id: r.id.clone().unwrap_or_default(),
-                bandwidth: bandwidth as u64,
+                bandwidth,
                 width: r.width.map(|w| w as u32),
                 height: r.height.map(|h| h as u32),
             })
@@ -594,4 +604,149 @@ fn adaptation_mime_type(adaptation: &AdaptationSet) -> String {
 
     // Last resort — opaque binary type.
     "application/octet-stream".to_owned()
+}
+
+/// Expand DASH `SegmentTemplate` identifier tokens.
+///
+/// Handled identifiers:
+/// - `$RepresentationID$`
+/// - `$Bandwidth$`
+/// - `$Number$` and `$Number%0{width}d$` (zero-padded decimal)
+///
+/// Unknown identifiers are reproduced verbatim (including the surrounding
+/// `$` delimiters) so as not to silently corrupt a URL.
+fn expand_template(tmpl: &str, rep_id: &str, bandwidth: u64, number: u64) -> String {
+    let mut out = String::with_capacity(tmpl.len() + 32);
+    let mut s = tmpl;
+
+    while let Some(open) = s.find('$') {
+        out.push_str(&s[..open]);
+        s = &s[open + 1..]; // skip opening '$'
+
+        if let Some(close) = s.find('$') {
+            let token = &s[..close]; // e.g. "Number%06d", "RepresentationID"
+            s = &s[close + 1..]; // skip closing '$'
+
+            // Split token into identifier and optional format specifier.
+            let (name, fmt) = if let Some(pct) = token.find('%') {
+                (&token[..pct], Some(&token[pct..]))
+            } else {
+                (token, None)
+            };
+
+            match name {
+                "RepresentationID" => out.push_str(rep_id),
+                "Bandwidth" => out.push_str(&bandwidth.to_string()),
+                "Number" => {
+                    // Handle %0{width}d zero-padding, e.g. %06d → "000001".
+                    let mut formatted = false;
+                    if let Some(f) = fmt {
+                        if f.starts_with("%0") && f.ends_with('d') {
+                            if let Ok(w) = f[2..f.len() - 1].parse::<usize>() {
+                                out.push_str(&format!("{:0>width$}", number, width = w));
+                                formatted = true;
+                            }
+                        }
+                    }
+                    if !formatted {
+                        out.push_str(&number.to_string());
+                    }
+                }
+                _ => {
+                    // Unknown identifier — reproduce verbatim.
+                    out.push('$');
+                    out.push_str(token);
+                    out.push('$');
+                }
+            }
+        } else {
+            // Unterminated '$' — pass through literally.
+            out.push('$');
+        }
+    }
+
+    out.push_str(s);
+    out
+}
+
+/// Resolve the effective base URL for an adaptation set by chaining
+/// Period → AdaptationSet `BaseURL` elements against the MPD base URL.
+///
+/// Each element is resolved with `Url::join` so relative values work
+/// correctly. Returns the MPD base URL unchanged when neither level
+/// provides a `BaseURL`.
+fn resolve_adaptation_base_url(
+    mpd_base: &Url,
+    period: &Period,
+    adaptation: &AdaptationSet,
+) -> Url {
+    let mut base = mpd_base.clone();
+
+    if let Some(period_base) = period.BaseURL.first() {
+        if let Ok(u) = base.join(&period_base.base) {
+            base = u;
+        }
+    }
+
+    if let Some(adapt_base) = adaptation.BaseURL.first() {
+        if let Ok(u) = base.join(&adapt_base.base) {
+            base = u;
+        }
+    }
+
+    base
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::expand_template;
+
+    #[test]
+    fn expand_plain_number() {
+        assert_eq!(
+            expand_template("seg_$Number$.m4s", "r1", 1000, 42),
+            "seg_42.m4s"
+        );
+    }
+
+    #[test]
+    fn expand_zero_padded_number_width6() {
+        // BBC R&D BBB uses %06d.
+        assert_eq!(
+            expand_template("$RepresentationID$/$Number%06d$.m4s", "1920x1080p25", 4741120, 1),
+            "1920x1080p25/000001.m4s"
+        );
+    }
+
+    #[test]
+    fn expand_zero_padded_number_width3() {
+        assert_eq!(
+            expand_template("$Number%03d$.m4s", "id", 999, 7),
+            "007.m4s"
+        );
+    }
+
+    #[test]
+    fn expand_representation_id_and_bandwidth() {
+        assert_eq!(
+            expand_template("$RepresentationID$_$Bandwidth$.mp4", "hd", 5000000, 0),
+            "hd_5000000.mp4"
+        );
+    }
+
+    #[test]
+    fn expand_unknown_identifier_preserved() {
+        // $Time$ is not yet implemented; must not silently drop it.
+        assert_eq!(
+            expand_template("$Time$.m4s", "id", 100, 1),
+            "$Time$.m4s"
+        );
+    }
+
+    #[test]
+    fn expand_unterminated_dollar_preserved() {
+        assert_eq!(expand_template("seg$", "id", 100, 1), "seg$");
+    }
 }

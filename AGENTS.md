@@ -29,6 +29,10 @@ cargo run --example http_fetch
 # Override the manifest URL
 cargo run --example http_fetch -- https://your-stream/manifest.mpd
 
+# GStreamer playback example (requires sink-gstreamer feature + GStreamer installed)
+cargo run --features sink-gstreamer --example gstreamer_player
+cargo run --features sink-gstreamer --example gstreamer_player -- https://your-stream/manifest.mpd
+
 # Lint
 cargo clippy -- -D warnings
 
@@ -49,6 +53,22 @@ brew install protobuf
 apt-get install protobuf-compiler
 
 # Windows — download from https://github.com/protocolbuffers/protobuf/releases
+```
+
+#### `sink-gstreamer` feature
+
+Requires GStreamer ≥ 1.14 headers.  The Homebrew formula bundles all required
+plugins in a single install:
+
+```bash
+brew install gstreamer       # macOS
+```
+
+If `cargo build --features sink-gstreamer` cannot find the headers, prepend
+the framework `bin` directory so its own `pkg-config` is found first:
+
+```bash
+export PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/bin:$PATH"
 ```
 
 ---
@@ -170,6 +190,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `MediaSource` / `SourceBuffer` traits | `src/media_source/mod.rs` |
 | Append queue + window management | `src/media_source/sink.rs` |
 | In-memory stub implementations | `src/media_source/stub.rs` |
+| GStreamer `MediaSource` / `SourceBuffer` (`sink-gstreamer` feature) | `src/media_source/gstreamer.rs` |
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
@@ -178,6 +199,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | MSE abstraction tests | `tests/media_source.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
+| GStreamer full-playback example | `examples/gstreamer_player.rs` |
 
 ---
 
@@ -211,3 +233,13 @@ The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 - Subtitle / text track handling.
 - DRM / Encrypted Media Extensions.
 - MPD patch (`<Patch>` element).
+
+### `GstSourceBuffer` known gaps
+
+- `buffered()` only tracks ranges from chunks whose `Chunk::start`/`end` are set.
+  DASH segments currently do not carry timing (they're set to `None`), so the
+  buffer-occupancy ABR rule sees an empty range.  Work-around: parse the fMP4
+  `sidx` box to extract timing before building the `Chunk`.
+- `remove()` does not flush GStreamer's downstream queue; it only removes the
+  locally tracked time range.
+- `change_type()` does not renegotiate caps with GStreamer at runtime.

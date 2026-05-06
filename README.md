@@ -86,7 +86,7 @@ async fn main() -> Result<(), dash_rs::DashError> {
 
     // 2. Load the manifest and start a session.
     //    Use StubSegmentFetcher for now; replace with an HTTP fetcher later.
-    let url = Url::parse("https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd")?;
+    let url = Url::parse("https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd")?;
     let mut session = DashSession::from_url(
         &url,
         StubSegmentFetcher,

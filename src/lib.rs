@@ -29,7 +29,7 @@
 //! media_source.open();
 //!
 //! // 2. Load the manifest and start a session.
-//! let url = Url::parse("https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd").unwrap();
+//! let url = Url::parse("https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd").unwrap();
 //! let mut session = DashSession::from_url(&url, StubSegmentFetcher, media_source).await?;
 //!
 //! // 3. Provide real throughput / buffer measurements; use zeroed placeholders here.
@@ -54,3 +54,6 @@ pub use abr::{AbrController, AbrMetrics, QualityDecision};
 pub use error::DashError;
 pub use manifest::MPD;
 pub use session::{DashSession, MediaType};
+
+#[cfg(feature = "sink-gstreamer")]
+pub use media_source::gstreamer::{GstMediaSource, GstPipeline};

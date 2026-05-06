@@ -128,11 +128,11 @@ impl SegmentFetcher for HttpSegmentFetcher {
 
 // ── main ──────────────────────────────────────────────────────────────────────
 
-/// A well-known public MPEG-DASH test stream (Envivio via Akamai CDN).
+/// BBC R&D Big Buck Bunny MPEG-DASH test stream (common-init variant).
 /// Uses `SegmentTemplate` with `$Number$` addressing — compatible with the
 /// current `resolve_segment_url` implementation.
 const DEFAULT_MPD_URL: &str =
-    "https://dash.akamaized.net/envivio/EnvivioDash3/manifest.mpd";
+    "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
 
 /// Number of media segments to fetch per track after the init segment.
 const SEGMENTS_TO_FETCH: u32 = 4;

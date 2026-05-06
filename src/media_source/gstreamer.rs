@@ -1,0 +1,500 @@
+//! GStreamer-backed [`MediaSource`] and [`SourceBuffer`] implementations.
+//!
+//! Enabled by the `sink-gstreamer` Cargo feature.  Requires GStreamer ≥ 1.14
+//! headers at build time.  On macOS install via Homebrew:
+//!
+//! ```text
+//! brew install gstreamer
+//! ```
+//!
+//! # Architecture
+//!
+//! Each call to [`GstMediaSource::add_source_buffer`] creates an
+//! `appsrc ! queue ! decodebin` chain inside the shared [`gst::Pipeline`].
+//! When `decodebin` identifies the codec on the first fragment it fires
+//! `pad-added`; the closure wires the new pad to the appropriate sink:
+//!
+//! ```text
+//! appsrc ─► queue ─► decodebin ──(video pad)──► videoconvert ─► autovideosink
+//!                               ╰─(audio pad)──► audioconvert ─► audioresample ─► autoaudiosink
+//! ```
+//!
+//! Bytes reach `appsrc` through [`GstSourceBuffer::append_buffer`], which is
+//! called by [`crate::media_source::sink::SourceBufferSink`] inside
+//! [`crate::session::DashSession`].
+//!
+//! # Main-thread requirement on macOS
+//!
+//! `autovideosink` on macOS selects `osxvideosink`, which must render from the
+//! Cocoa main thread.  See `examples/gstreamer_player.rs` for the recommended
+//! setup: run the GStreamer bus loop on `main()` and spawn the tokio fetch
+//! loop on a background OS thread.
+
+use async_trait::async_trait;
+// Conventional short aliases used throughout the gstreamer-rs ecosystem.
+use gstreamer as gst;
+use gstreamer_app as gst_app;
+use gst::prelude::*;
+
+use crate::{
+    error::DashError,
+    media_source::{Chunk, MediaSource, ReadyState, SourceBuffer, TimeRange},
+};
+
+// Re-export so callers only need `dash_rs::media_source::gstreamer::*`.
+pub use gst::Pipeline as GstPipeline;
+
+// ── GstSourceBuffer ───────────────────────────────────────────────────────────
+
+/// A [`SourceBuffer`] backed by a GStreamer [`gst_app::AppSrc`] element.
+///
+/// Created exclusively by [`GstMediaSource::add_source_buffer`]; do not
+/// construct directly.
+pub struct GstSourceBuffer {
+    mime_type: String,
+    appsrc: gst_app::AppSrc,
+    is_updating: bool,
+    timestamp_offset: f64,
+    append_window_start: f64,
+    append_window_end: f64,
+    /// Accumulated buffered time ranges, built from chunks that carry timing.
+    buffered: Vec<TimeRange>,
+}
+
+impl GstSourceBuffer {
+    fn new(mime_type: impl Into<String>, appsrc: gst_app::AppSrc) -> Self {
+        Self {
+            mime_type: mime_type.into(),
+            appsrc,
+            is_updating: false,
+            timestamp_offset: 0.0,
+            append_window_start: 0.0,
+            append_window_end: f64::INFINITY,
+            buffered: Vec::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl SourceBuffer for GstSourceBuffer {
+    fn mime_type(&self) -> &str {
+        &self.mime_type
+    }
+
+    fn is_updating(&self) -> bool {
+        self.is_updating
+    }
+
+    fn buffered(&self) -> Vec<TimeRange> {
+        self.buffered.clone()
+    }
+
+    fn timestamp_offset(&self) -> f64 {
+        self.timestamp_offset
+    }
+
+    fn set_timestamp_offset(&mut self, offset: f64) {
+        self.timestamp_offset = offset;
+    }
+
+    fn append_window_start(&self) -> f64 {
+        self.append_window_start
+    }
+
+    fn set_append_window_start(&mut self, start: f64) {
+        self.append_window_start = start;
+    }
+
+    fn append_window_end(&self) -> f64 {
+        self.append_window_end
+    }
+
+    fn set_append_window_end(&mut self, end: f64) {
+        self.append_window_end = end;
+    }
+
+    async fn append_buffer(&mut self, chunk: Chunk) -> Result<(), DashError> {
+        if self.is_updating {
+            return Err(DashError::SourceBufferUpdating);
+        }
+
+        self.is_updating = true;
+
+        // Build a GStreamer buffer from the chunk bytes.
+        let mut gst_buf = gst::Buffer::from_slice(chunk.data);
+
+        // Stamp PTS and duration when the chunk carries timing info.
+        if let Some(start) = chunk.start {
+            let buf_mut = gst_buf
+                .get_mut()
+                .expect("freshly created buffer has no other owners");
+            buf_mut.set_pts(gst::ClockTime::from_nseconds(
+                (start * 1_000_000_000.0) as u64,
+            ));
+            if let Some(end) = chunk.end {
+                let dur_ns = ((end - start) * 1_000_000_000.0) as u64;
+                buf_mut.set_duration(gst::ClockTime::from_nseconds(dur_ns));
+                // Track this range for buffered() queries.
+                self.buffered.push(TimeRange::new(start, end));
+            }
+        }
+
+        tracing::debug!(
+            mime = %self.mime_type,
+            label = %chunk.label,
+            pts = ?gst_buf.pts(),
+            bytes = gst_buf.size(),
+            "pushing buffer to appsrc"
+        );
+
+        // push_buffer() is synchronous and normally non-blocking (default
+        // max-bytes 200 KB / 100 ms).  For typical DASH segments (100 KB –
+        // 2 MB) this returns immediately; backpressure only kicks in when
+        // the pipeline stalls.
+        self.appsrc
+            .push_buffer(gst_buf)
+            .map_err(|flow| DashError::AppendFailed(format!("appsrc flow error: {flow:?}")))?;
+
+        self.is_updating = false;
+        Ok(())
+    }
+
+    async fn remove(&mut self, start: f64, end: f64) -> Result<(), DashError> {
+        tracing::warn!(
+            mime = %self.mime_type,
+            start,
+            end,
+            "GstSourceBuffer::remove is a no-op; GStreamer manages its own buffer"
+        );
+        self.buffered.retain(|r| r.end <= start || r.start >= end);
+        Ok(())
+    }
+
+    async fn abort(&mut self) -> Result<(), DashError> {
+        self.is_updating = false;
+        // Flush the appsrc so GStreamer discards any queued data.
+        self.appsrc.send_event(gst::event::FlushStart::new());
+        self.appsrc.send_event(gst::event::FlushStop::new(true));
+        tracing::debug!(mime = %self.mime_type, "GstSourceBuffer aborted");
+        Ok(())
+    }
+
+    async fn change_type(&mut self, mime_type: &str) -> Result<(), DashError> {
+        tracing::warn!(
+            old = %self.mime_type,
+            new = mime_type,
+            "GstSourceBuffer::change_type: updating stored mime type only; \
+             GStreamer caps renegotiation is not supported at runtime"
+        );
+        self.mime_type = mime_type.to_owned();
+        Ok(())
+    }
+}
+
+// ── GstMediaSource ────────────────────────────────────────────────────────────
+
+/// A [`MediaSource`] backed by a GStreamer pipeline.
+///
+/// ## Lifecycle
+///
+/// ```text
+/// let ms = GstMediaSource::new()?;       // pipeline created, ready_state = Open
+/// let pipeline = ms.pipeline();          // clone the handle *before* moving ms
+///
+/// let session = DashSession::from_url(&url, fetcher, ms).await?;
+/// // DashSession internally calls add_source_buffer() for each track, adding
+/// // appsrc + decodebin chains to the pipeline.
+///
+/// session.media_source_mut().set_playing()?;  // transition to Playing
+/// ```
+pub struct GstMediaSource {
+    pipeline: gst::Pipeline,
+    ready_state: ReadyState,
+    duration: Option<f64>,
+    /// (mime_type, appsrc) for every source buffer that has been added.
+    source_buffers: Vec<(String, gst_app::AppSrc)>,
+}
+
+impl GstMediaSource {
+    /// Create a new empty GStreamer pipeline.
+    ///
+    /// Calls [`gst::init`] if GStreamer has not been initialised yet.
+    pub fn new() -> Result<Self, DashError> {
+        gst::init()
+            .map_err(|e| DashError::AppendFailed(format!("gst::init failed: {e}")))?;
+
+        let pipeline = gst::Pipeline::default();
+        tracing::debug!("GstMediaSource: pipeline created");
+
+        Ok(Self {
+            pipeline,
+            ready_state: ReadyState::Open,
+            duration: None,
+            source_buffers: Vec::new(),
+        })
+    }
+
+    /// Return a cloned reference to the underlying GStreamer pipeline.
+    ///
+    /// Clone this **before** moving `GstMediaSource` into a `DashSession` so
+    /// that the caller retains a handle for the bus loop and state transitions.
+    pub fn pipeline(&self) -> gst::Pipeline {
+        self.pipeline.clone()
+    }
+
+    /// Transition the pipeline to `Playing` state.
+    ///
+    /// Call this after all source buffers have been created (i.e. after
+    /// [`crate::session::DashSession::from_url`] has returned) and before the
+    /// first [`crate::session::DashSession::fetch_next_segment`] call.
+    pub fn set_playing(&self) -> Result<(), DashError> {
+        self.pipeline
+            .set_state(gst::State::Playing)
+            .map_err(|e| DashError::AppendFailed(format!("set_state(Playing) failed: {e}")))?;
+        tracing::info!("GstMediaSource: pipeline set to Playing");
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl MediaSource for GstMediaSource {
+    fn ready_state(&self) -> ReadyState {
+        self.ready_state.clone()
+    }
+
+    fn duration(&self) -> Option<f64> {
+        self.duration
+    }
+
+    fn set_duration(&mut self, duration: f64) -> Result<(), DashError> {
+        self.duration = Some(duration);
+        Ok(())
+    }
+
+    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
+        if self.ready_state != ReadyState::Open {
+            return Err(DashError::MediaSourceNotOpen {
+                state: self.ready_state.clone(),
+            });
+        }
+
+        tracing::info!(mime = mime_type, "GstMediaSource: adding source buffer");
+
+        // ── Build the caps for the appsrc ────────────────────────────────────
+        // fMP4 (fragmented ISOBMFF) segments — the QuickTime container covers
+        // both video/mp4 and audio/mp4 DASH tracks.
+        let caps = gst::Caps::builder("video/quicktime")
+            .field("variant", "iso-fragmented")
+            .build();
+
+        // ── Create appsrc ────────────────────────────────────────────────────
+        let appsrc = gst_app::AppSrc::builder()
+            .caps(&caps)
+            .format(gst::Format::Bytes)
+            .stream_type(gst_app::AppStreamType::Stream)
+            .is_live(true)
+            // fMP4 carries its own timestamps; do not generate synthetic ones.
+            .do_timestamp(false)
+            .build();
+
+        // ── Create queue + decodebin ─────────────────────────────────────────
+        let is_video = mime_type.starts_with("video/");
+        let track_tag = if is_video { "video" } else { "audio" };
+
+        let queue = gst::ElementFactory::make("queue")
+            .name(format!("queue-{track_tag}"))
+            .build()
+            .map_err(|e| DashError::AppendFailed(format!("failed to create queue: {e}")))?;
+
+        let decodebin = gst::ElementFactory::make("decodebin")
+            .name(format!("decodebin-{track_tag}"))
+            .build()
+            .map_err(|e| {
+                DashError::AppendFailed(format!("failed to create decodebin: {e}"))
+            })?;
+
+        // ── Add to pipeline and link the static part ─────────────────────────
+        self.pipeline
+            .add_many([appsrc.upcast_ref::<gst::Element>(), &queue, &decodebin])
+            .map_err(|e| DashError::AppendFailed(format!("pipeline.add_many failed: {e}")))?;
+
+        gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &queue, &decodebin])
+            .map_err(|e| DashError::AppendFailed(format!("link_many failed: {e}")))?;
+
+        // ── Wire decodebin's dynamic pads to sinks ───────────────────────────
+        //
+        // decodebin fires `pad-added` when it has parsed enough data to know
+        // the codec.  We then create converter + sink elements, add them to
+        // the live pipeline, and sync their state with the parent.
+        //
+        // All captured values must be 'static + Send.
+        let pipeline_weak = self.pipeline.downgrade();
+
+        decodebin.connect_pad_added(move |_elem: &gst::Element, src_pad: &gst::Pad| {
+            let Some(pipeline) = pipeline_weak.upgrade() else {
+                return;
+            };
+
+            // Determine audio vs video from the newly negotiated caps.
+            let caps = src_pad
+                .current_caps()
+                .unwrap_or_else(|| src_pad.query_caps(None));
+            let structure = match caps.structure(0) {
+                Some(s) => s,
+                None => return,
+            };
+            let media_type = structure.name();
+
+            if media_type.starts_with("video/") {
+                wire_sink_chain(&pipeline, src_pad, "videoconvert", None, "autovideosink");
+            } else if media_type.starts_with("audio/") {
+                wire_sink_chain(
+                    &pipeline,
+                    src_pad,
+                    "audioconvert",
+                    Some("audioresample"),
+                    "autoaudiosink",
+                );
+            } else {
+                tracing::warn!(media_type = %media_type, "unrecognised pad type; skipping");
+            }
+        });
+
+        // ── Store the appsrc handle and return the source buffer ─────────────
+        self.source_buffers
+            .push((mime_type.to_owned(), appsrc.clone()));
+
+        Ok(Box::new(GstSourceBuffer::new(mime_type, appsrc)))
+    }
+
+    fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
+        let pos = self
+            .source_buffers
+            .iter()
+            .position(|(m, _)| m == mime_type)
+            .ok_or_else(|| DashError::SourceBufferNotFound {
+                mime_type: mime_type.to_owned(),
+            })?;
+
+        let (_, appsrc) = self.source_buffers.remove(pos);
+        // Flush downstream before removal.
+        let _ = appsrc.end_of_stream();
+        if let Err(err) = self.pipeline.remove(appsrc.upcast_ref::<gst::Element>()) {
+            tracing::warn!("failed to remove appsrc from pipeline: {err}");
+        }
+        Ok(())
+    }
+
+    async fn end_of_stream(&mut self) -> Result<(), DashError> {
+        tracing::info!("GstMediaSource: signalling EOS on all appsrc elements");
+        for (mime, appsrc) in &self.source_buffers {
+            appsrc.end_of_stream().map_err(|e| {
+                DashError::AppendFailed(format!("appsrc EOS ({mime}) failed: {e:?}"))
+            })?;
+        }
+        self.ready_state = ReadyState::Ended;
+        Ok(())
+    }
+
+    fn close(&mut self) {
+        tracing::info!("GstMediaSource: closing pipeline");
+        let _ = self.pipeline.set_state(gst::State::Null);
+        self.source_buffers.clear();
+        self.ready_state = ReadyState::Closed;
+    }
+}
+
+impl Drop for GstMediaSource {
+    fn drop(&mut self) {
+        if self.ready_state != ReadyState::Closed {
+            let _ = self.pipeline.set_state(gst::State::Null);
+        }
+    }
+}
+
+// ── Private helpers ───────────────────────────────────────────────────────────
+
+/// Create `converter [? resample] sink` elements, add them to `pipeline`,
+/// link `src_pad` into the head of the chain, and sync state with parent.
+fn wire_sink_chain(
+    pipeline: &gst::Pipeline,
+    src_pad: &gst::Pad,
+    converter_name: &str,
+    resample_name: Option<&str>,
+    sink_name: &str,
+) {
+    let make = |name: &str| -> Option<gst::Element> {
+        match gst::ElementFactory::make(name).build() {
+            Ok(e) => Some(e),
+            Err(err) => {
+                tracing::error!("failed to create {name}: {err}");
+                None
+            }
+        }
+    };
+
+    let converter = match make(converter_name) {
+        Some(e) => e,
+        None => return,
+    };
+    let resample: Option<gst::Element> = resample_name.and_then(make);
+    let sink = match make(sink_name) {
+        Some(e) => e,
+        None => return,
+    };
+
+    // Add all new elements to the live pipeline.
+    let mut to_add: Vec<&gst::Element> = vec![&converter];
+    if let Some(ref r) = resample {
+        to_add.push(r);
+    }
+    to_add.push(&sink);
+
+    if let Err(err) = pipeline.add_many(to_add.as_slice()) {
+        tracing::error!("pipeline.add_many (sink chain) failed: {err}");
+        return;
+    }
+
+    // Link the chain.
+    let link_result: Result<(), _> = if let Some(ref r) = resample {
+        gst::Element::link_many([&converter, r, &sink])
+    } else {
+        gst::Element::link_many([&converter, &sink])
+    };
+    if let Err(err) = link_result {
+        tracing::error!("link_many (sink chain) failed: {err}");
+        return;
+    }
+
+    // Connect decodebin's dynamic pad to the head of the chain.
+    let converter_sink = match converter.static_pad("sink") {
+        Some(p) => p,
+        None => {
+            tracing::error!("{converter_name} has no static sink pad");
+            return;
+        }
+    };
+    if let Err(err) = src_pad.link(&converter_sink) {
+        tracing::error!("pad link failed: {err}");
+        return;
+    }
+
+    // Sync each new element to the pipeline's running state.
+    let all: &[&gst::Element] = if let Some(ref r) = resample {
+        &[&converter, r, &sink]
+    } else {
+        &[&converter, &sink]
+    };
+    for el in all {
+        if let Err(err) = el.sync_state_with_parent() {
+            tracing::error!("sync_state_with_parent failed for {}: {err}", el.name());
+        }
+    }
+
+    tracing::info!(
+        converter = converter_name,
+        resample = resample_name.unwrap_or("none"),
+        sink = sink_name,
+        "sink chain wired and synced"
+    );
+}
