@@ -49,6 +49,10 @@ use async_trait::async_trait;
 use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 
 use dash_rs::{
     error::DashError,
@@ -56,6 +60,7 @@ use dash_rs::{
 };
 
 // Re-export so `main.rs` can use `gst_media_source::GstPipeline` if needed.
+#[allow(unused_imports)]
 pub use gst::Pipeline as GstPipeline;
 
 // ── GstSourceBuffer ───────────────────────────────────────────────────────────
@@ -227,6 +232,15 @@ pub struct GstMediaSource {
     duration: Option<f64>,
     /// (mime_type, appsrc) for every source buffer that has been added.
     source_buffers: Vec<(String, gst_app::AppSrc)>,
+    /// When `true`, sink elements will have `sync=false` to prevent stalling
+    /// on absolute-timestamp CMAF live streams whose PTS values are on the
+    /// Unix epoch (≈ 1.778 × 10¹⁸ ns ahead of the monotonic pipeline clock).
+    ///
+    /// Set via [`Self::set_live_mode`] after the session is constructed but
+    /// before [`Self::set_playing`] is called.  Uses an `Arc<AtomicBool>`
+    /// because the same value must be readable from the `pad-added` GStreamer
+    /// streaming callback that fires after `set_playing`.
+    live_mode: Arc<AtomicBool>,
 }
 
 impl GstMediaSource {
@@ -262,6 +276,7 @@ impl GstMediaSource {
             ready_state: ReadyState::Open,
             duration: None,
             source_buffers: Vec::new(),
+            live_mode: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -284,6 +299,29 @@ impl GstMediaSource {
             .map_err(|e| DashError::AppendFailed(format!("set_state(Playing) failed: {e}")))?;
         tracing::info!("GstMediaSource: pipeline set to Playing");
         Ok(())
+    }
+
+    /// Enable live-stream mode.
+    ///
+    /// When set to `true`, a buffer pad probe is installed on each converter's
+    /// sink pad by the `pad-added` callback.  The probe remaps the absolute
+    /// Unix-epoch PTS/DTS carried by CMAF live segments (e.g. BBC Two HD:
+    /// PTS ≈ 1.778 × 10¹⁸ ns) to values starting from zero, so that
+    /// `autovideosink` renders frames immediately at the correct frame rate
+    /// instead of scheduling them ~56 years in the future.
+    ///
+    /// The sink's `sync` property is left at its default (`true`), which keeps
+    /// GStreamer's frame-pacing mechanism intact and avoids the burst-then-gap
+    /// stutter that `sync=false` would cause.
+    ///
+    /// Call this **after** [`DashSession::from_url`] (which calls
+    /// `add_source_buffer`) but **before** [`Self::set_playing`].  The
+    /// `pad-added` callback reads the flag lazily when it fires during preroll,
+    /// so the ordering is correct as long as `set_live_mode` is called before
+    /// the pipeline transitions to Playing.
+    pub fn set_live_mode(&mut self, live: bool) {
+        self.live_mode.store(live, Ordering::Relaxed);
+        tracing::info!(live, "GstMediaSource: live_mode updated");
     }
 }
 
@@ -332,6 +370,12 @@ impl MediaSource for GstMediaSource {
             .do_timestamp(false)
             .build();
 
+        // Disable the default 200 KB appsrc buffer limit so that push_buffer()
+        // never returns a flow error when the pipeline is ahead by multiple
+        // seconds of content.  The fetch-loop's buffer-level gate (12 s
+        // target) bounds memory usage instead.
+        appsrc.set_property("max-bytes", 0u64);
+
         // ── Create queue + decodebin ─────────────────────────────────────────
         let is_video = mime_type.starts_with("video/");
         let track_tag = if is_video { "video" } else { "audio" };
@@ -362,11 +406,17 @@ impl MediaSource for GstMediaSource {
         //
         // All captured values must be 'static + Send.
         let pipeline_weak = self.pipeline.downgrade();
+        let live_mode_arc = Arc::clone(&self.live_mode);
 
         decodebin.connect_pad_added(move |_elem: &gst::Element, src_pad: &gst::Pad| {
             let Some(pipeline) = pipeline_weak.upgrade() else {
                 return;
             };
+
+            // Read the live-mode flag at the time the pad fires (not at
+            // closure-creation time) so that a `set_live_mode(true)` call
+            // made after `from_url` but before `set_playing` is reflected.
+            let remap_pts = live_mode_arc.load(Ordering::Relaxed);
 
             // Determine audio vs video from the newly negotiated caps.
             let caps = src_pad
@@ -391,7 +441,7 @@ impl MediaSource for GstMediaSource {
                 // Deferring via MainContext::invoke would leave the pad unlinked
                 // during decodebin's preroll window, causing the pipeline to
                 // stall or error before video playback begins.
-                wire_sink_chain(&pipeline, src_pad, "videoconvert", None, "autovideosink");
+                wire_sink_chain(&pipeline, src_pad, "videoconvert", None, "autovideosink", remap_pts);
             } else if media_type.starts_with("audio/") {
                 wire_sink_chain(
                     &pipeline,
@@ -399,6 +449,7 @@ impl MediaSource for GstMediaSource {
                     "audioconvert",
                     Some("audioresample"),
                     "autoaudiosink",
+                    remap_pts,
                 );
             } else {
                 tracing::warn!(media_type = %media_type, "unrecognised pad type; skipping");
@@ -461,12 +512,23 @@ impl Drop for GstMediaSource {
 
 /// Create `converter [? resample] sink` elements, add them to `pipeline`,
 /// link `src_pad` into the head of the chain, and sync state with parent.
+///
+/// When `remap_pts` is `true` a buffer pad probe is installed on the
+/// converter's sink pad.  The probe subtracts the first buffer's PTS from
+/// every subsequent buffer's PTS, and independently does the same for DTS.
+/// This remaps absolute Unix-epoch timestamps (e.g. BBC Two HD live CMAF
+/// segments: PTS ≈ 1.778 × 10¹⁸ ns) to relative values starting at zero.
+/// Combined with the default `sync=true` on the sink, GStreamer paces frames
+/// at the correct rate from the moment the first frame arrives, eliminating
+/// both the "frame scheduled 56 years in the future" stall and the burst-gap
+/// stutter that `sync=false` causes.
 fn wire_sink_chain(
     pipeline: &gst::Pipeline,
     src_pad: &gst::Pad,
     converter_name: &str,
     resample_name: Option<&str>,
     sink_name: &str,
+    remap_pts: bool,
 ) {
     let make = |name: &str| -> Option<gst::Element> {
         match gst::ElementFactory::make(name).build() {
@@ -522,6 +584,91 @@ fn wire_sink_chain(
     if let Err(err) = src_pad.link(&converter_sink) {
         tracing::error!("pad link failed: {err}");
         return;
+    }
+
+    // Install a combined SEGMENT + BUFFER probe on the converter's sink pad.
+    //
+    // CMAF live streams (e.g. BBC Two HD) carry absolute Unix-epoch PTS values
+    // in their fMP4 `tfdt` boxes (≈ 1.778 × 10¹⁸ ns).  qtdemux emits a
+    // NEWSEGMENT event whose `start` field equals that same absolute value.
+    // GStreamer computes `running_time = pts − segment.start`, so:
+    //
+    //   • Buffer probe alone: pts → 0, but segment.start still absolute →
+    //     running_time = 0 − 1.778×10¹⁸ → unsigned underflow → sink
+    //     schedules every frame 56 years in the future → no video.
+    //
+    // Fix: intercept both the SEGMENT event and every BUFFER.
+    //   1. Replace every SEGMENT event with a zeroed segment
+    //      {start=0, time=0, base=0, rate=1.0}.
+    //   2. On each buffer: subtract the first absolute PTS seen from pts/dts.
+    //
+    // Result: running_time = (pts_abs − offset) − 0 = small relative value;
+    // the sink's sync=true paces frames at the correct rate from t=0.
+    if remap_pts {
+        let pts_off: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+        let dts_off: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
+
+        converter_sink.add_probe(
+            gst::PadProbeType::BUFFER | gst::PadProbeType::EVENT_DOWNSTREAM,
+            move |_pad, info| {
+                // ── SEGMENT event ───────────────────────────────────────────
+                // Check type without borrowing info.data mutably yet.
+                let is_segment = if let Some(gst::PadProbeData::Event(ref ev)) =
+                    info.data
+                {
+                    ev.type_() == gst::EventType::Segment
+                } else {
+                    false
+                };
+
+                if is_segment {
+                    // Replace with a fresh zeroed TIME segment so that
+                    // running_time = remapped_pts − segment.start = remapped_pts.
+                    let new_seg = gst::FormattedSegment::<gst::ClockTime>::new();
+                    info.data = Some(gst::PadProbeData::Event(
+                        gst::event::Segment::new(&new_seg),
+                    ));
+                    tracing::info!(
+                        "live PTS probe: replaced SEGMENT with zeroed TIME segment"
+                    );
+                    return gst::PadProbeReturn::Ok;
+                }
+
+                // ── BUFFER ──────────────────────────────────────────────────
+                if let Some(gst::PadProbeData::Buffer(ref mut buf)) = info.data {
+                    let buf_mut = buf.make_mut();
+
+                    if let Some(pts) = buf_mut.pts() {
+                        let off = *pts_off
+                            .lock()
+                            .unwrap()
+                            .get_or_insert(pts.nseconds());
+                        let new_pts = pts.nseconds().saturating_sub(off);
+                        tracing::debug!(
+                            pts_abs = pts.nseconds(),
+                            pts_new = new_pts,
+                            "live PTS probe: remapped pts"
+                        );
+                        buf_mut.set_pts(gst::ClockTime::from_nseconds(new_pts));
+                    }
+
+                    if let Some(dts) = buf_mut.dts() {
+                        let off = *dts_off
+                            .lock()
+                            .unwrap()
+                            .get_or_insert(dts.nseconds());
+                        buf_mut.set_dts(gst::ClockTime::from_nseconds(
+                            dts.nseconds().saturating_sub(off),
+                        ));
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+        tracing::info!(
+            converter = converter_name,
+            "live PTS/DTS remapping probe installed"
+        );
     }
 
     // Sync each new element to the pipeline's running state.

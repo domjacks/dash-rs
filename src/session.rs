@@ -1,4 +1,7 @@
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Instant, SystemTime, UNIX_EPOCH},
+};
 
 use dash_mpd::{AdaptationSet, BaseURL, Period, Representation, SegmentTemplate, MPD};
 use url::Url;
@@ -46,8 +49,16 @@ struct TrackState {
     /// (from `SegmentTemplate@startNumber`, default 1).
     segment_number: u64,
     /// First segment number declared in the manifest (SegmentTemplate@startNumber,
-    /// default 1).  Used to compute how many segments have been fetched.
+    /// default 1).  Used to compute how many segments have been fetched for
+    /// the EOS segment-count check.
     start_number: u64,
+    /// The segment number at which *this session* began fetching.  For VOD
+    /// streams this equals `start_number`.  For live streams it is set to the
+    /// live-edge segment after snapping (e.g. 463 047 128 for BBC Two HD),
+    /// so that [`DashSession::estimated_buffer_level_ms`] counts only the
+    /// segments pushed in this session rather than all segments since the
+    /// beginning of the broadcast.
+    initial_segment_number: u64,
     /// Duration of a single segment in milliseconds, derived from
     /// `SegmentTemplate@duration / SegmentTemplate@timescale * 1000`.
     /// Used for buffer-level estimation.
@@ -75,6 +86,7 @@ impl TrackState {
             current_index: 0,
             segment_number: start_number,
             start_number,
+            initial_segment_number: start_number,
             segment_duration_ms,
             total_segments,
             sink,
@@ -157,6 +169,15 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// `None` disables the timeout.  Mirrors `AbandonRequestsRule`'s
     /// role in dash.js.
     abandon_timeout_ms: Option<u64>,
+    /// Milliseconds between live-manifest refreshes, derived from
+    /// `MPD@minimumUpdatePeriod`.  `None` for static (VOD) streams or when
+    /// the attribute is absent from the manifest.
+    minimum_update_period_ms: Option<u64>,
+    /// Wall-clock instant of the most recent manifest load or refresh.
+    /// Seeded by [`Self::from_url`] after the initial network load; `None`
+    /// when the session was constructed via [`Self::from_mpd`] without a
+    /// network fetch.  Used by [`Self::should_refresh_manifest`].
+    last_manifest_refresh: Option<Instant>,
 }
 
 // Re-export for convenience in the example.
@@ -172,7 +193,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let loader = ManifestLoader::new(Arc::clone(&fetcher));
         let (mpd, base_url) = loader.load(url).await?;
 
-        let session = Self::from_mpd(mpd, base_url, fetcher, media_source)?;
+        let mut session = Self::from_mpd(mpd, base_url, fetcher, media_source)?;
+        // Record when the manifest was fetched so the refresh timer starts from now.
+        session.last_manifest_refresh = Some(Instant::now());
         Ok(session)
     }
 
@@ -204,7 +227,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             .iter()
             .find(dash_mpd::is_audio_adaptation);
 
-        let video_track = if let Some(adaptation) = video_adaptation {
+        let mut video_track = if let Some(adaptation) = video_adaptation {
             let reps = extract_representations(adaptation);
             if !reps.is_empty() {
                 let mime = adaptation_mime_type(adaptation);
@@ -250,7 +273,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             None
         };
 
-        let audio_track = if let Some(adaptation) = audio_adaptation {
+        let mut audio_track = if let Some(adaptation) = audio_adaptation {
             let reps = extract_representations(adaptation);
             if !reps.is_empty() {
                 let mime = adaptation_mime_type(adaptation);
@@ -296,6 +319,67 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             None
         };
 
+        // Apply live-edge starting segment for dynamic streams.
+        //
+        // For a live stream the manifest declares `@availabilityStartTime`
+        // (AST), and segments are addressed by absolute number:
+        //   segment_number = floor((now − AST) / seg_dur) + startNumber
+        //
+        // Starting at segment 1 would request a long-gone segment and receive
+        // a 404.  We snap to the live edge minus a safety margin so playback
+        // begins near the head of the DVR window.
+        let is_dynamic = mpd.mpdtype.as_deref() == Some("dynamic");
+        let ast_s: Option<f64> = mpd.availabilityStartTime.map(|dt| dt.timestamp() as f64);
+        let spd_s: Option<f64> = mpd.suggestedPresentationDelay.map(|d| d.as_secs_f64());
+        if is_dynamic {
+            if let Some(ast) = ast_s {
+                let now_s = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_secs_f64())
+                    .unwrap_or(0.0);
+                if let Some(ref mut track) = video_track {
+                    let seg = compute_live_edge_segment(
+                        ast,
+                        now_s,
+                        track.segment_duration_ms / 1_000.0,
+                        track.start_number,
+                        spd_s,
+                    );
+                    tracing::info!(
+                        media_type = "video",
+                        segment_number = seg,
+                        "live stream: snapped to live-edge segment"
+                    );
+                    track.segment_number = seg;
+                    // Fix live buffer-level estimation: count segments fetched
+                    // in *this session*, not since startNumber.
+                    track.initial_segment_number = seg;
+                }
+                if let Some(ref mut track) = audio_track {
+                    let seg = compute_live_edge_segment(
+                        ast,
+                        now_s,
+                        track.segment_duration_ms / 1_000.0,
+                        track.start_number,
+                        spd_s,
+                    );
+                    tracing::info!(
+                        media_type = "audio",
+                        segment_number = seg,
+                        "live stream: snapped to live-edge segment"
+                    );
+                    track.segment_number = seg;
+                    // Fix live buffer-level estimation: count segments fetched
+                    // in *this session*, not since startNumber.
+                    track.initial_segment_number = seg;
+                }
+            }
+        }
+
+        // Extract live-stream fields before `mpd` is moved into the struct.
+        let mpd_minimum_update_period_ms =
+            mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
+
         Ok(Self {
             mpd,
             base_url,
@@ -312,6 +396,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             schedule_while_paused: false,
             buffer_to_keep_s: 30.0,
             abandon_timeout_ms: None,
+            minimum_update_period_ms: mpd_minimum_update_period_ms,
+            last_manifest_refresh: None,
         })
     }
 
@@ -455,7 +541,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             Ok(t) => t,
             Err(_) => return 0.0,
         };
-        let segments_fetched = track.segment_number.saturating_sub(track.start_number);
+        let segments_fetched = track.segment_number.saturating_sub(track.initial_segment_number);
         let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
         let elapsed_ms = self
             .playback_started_at
@@ -586,9 +672,157 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         Ok(())
     }
 
-    // ── ABR ───────────────────────────────────────────────────────────────────
+    // ── Live stream ───────────────────────────────────────────────────────────
 
-    /// Run the ABR controller and return the recommended quality for the
+    /// Returns `true` when the manifest describes a live/dynamic stream
+    /// (`MPD@type = "dynamic"`).
+    ///
+    /// Live streams require periodic manifest refreshes (see
+    /// [`Self::should_refresh_manifest`] and [`Self::refresh_manifest`]) to
+    /// discover newly available segments as the presentation advances.
+    pub fn is_live(&self) -> bool {
+        self.mpd.mpdtype.as_deref() == Some("dynamic")
+    }
+
+    /// The minimum interval (in milliseconds) between manifest refreshes, as
+    /// declared in `MPD@minimumUpdatePeriod`.
+    ///
+    /// Returns `None` for VOD streams or live streams that omit the attribute.
+    pub fn minimum_update_period_ms(&self) -> Option<u64> {
+        self.minimum_update_period_ms
+    }
+
+    /// Returns `true` when the session should call [`Self::refresh_manifest`]
+    /// before the next segment fetch.
+    ///
+    /// Conditions:
+    /// 1. The stream is live (`MPD@type = "dynamic"`).
+    /// 2. `MPD@minimumUpdatePeriod` is present.
+    /// 3. At least `minimumUpdatePeriod` milliseconds have elapsed since the
+    ///    last manifest load or refresh (or the manifest has never been fetched
+    ///    over the network, i.e. the session was built via [`Self::from_mpd`]).
+    ///
+    /// For the common pattern call this at the top of the fetch loop:
+    ///
+    /// ```no_run
+    /// # use dash_rs::session::{DashSession, MediaType};
+    /// # use dash_rs::fetch::stub::StubSegmentFetcher;
+    /// # use dash_rs::media_source::stub::StubMediaSource;
+    /// # use dash_rs::abr::AbrMetrics;
+    /// # async fn example(mut session: DashSession<StubSegmentFetcher, StubMediaSource>) -> Result<(), dash_rs::error::DashError> {
+    /// # let metrics = AbrMetrics::new(5_000_000.0, 8_000.0);
+    /// loop {
+    ///     if session.should_refresh_manifest() {
+    ///         session.refresh_manifest().await?;
+    ///     }
+    ///     match session.fetch_next_segment(MediaType::Video, &metrics).await {
+    ///         Ok(_) => {}
+    ///         Err(dash_rs::error::DashError::EndOfStream { .. }) => break,
+    ///         Err(e) => return Err(e),
+    ///     }
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub fn should_refresh_manifest(&self) -> bool {
+        if !self.is_live() {
+            return false;
+        }
+        let Some(period_ms) = self.minimum_update_period_ms else {
+            return false;
+        };
+        match self.last_manifest_refresh {
+            // Never refreshed (session built via from_mpd without a network fetch).
+            None => true,
+            Some(last) => last.elapsed().as_millis() as u64 >= period_ms,
+        }
+    }
+
+    /// Re-fetch and re-parse the manifest, updating the session's view of the
+    /// stream's available segments.
+    ///
+    /// This is the primary driver of live DASH playback: as the presentation
+    /// advances, the server publishes new `SegmentTemplate` indices and the
+    /// client must refresh the manifest to learn about them.
+    ///
+    /// **What is updated:**
+    /// - `total_segments` for each track — grows as new segments become
+    ///   available; triggers `EndOfStream` correctly at the real stream end.
+    /// - `MPD@minimumUpdatePeriod` — in case the server changes it.
+    /// - `base_url` — updated to the final URL after any HTTP redirect.
+    /// - `last_manifest_refresh` — reset to now.
+    ///
+    /// **What is preserved (not reset):**
+    /// - The current segment number; no seek is performed.
+    /// - ABR controller state.
+    /// - Source buffer contents.
+    /// - Representations (assumed stable across refreshes).
+    ///
+    /// # Limitations
+    ///
+    /// - Only the first `Period` is considered (multi-period not yet supported).
+    /// - `startNumber` changes (sliding-window live) are not yet handled.
+    /// - `availabilityStartTime`-based live-edge calculation is not yet
+    ///   implemented; the caller is responsible for starting at the correct
+    ///   segment number.
+    pub async fn refresh_manifest(&mut self) -> Result<(), DashError> {
+        tracing::info!(url = %self.base_url, "refreshing live manifest");
+
+        let loader = ManifestLoader::new(Arc::clone(&self.fetcher));
+        let (new_mpd, new_base_url) = loader.load(&self.base_url).await?;
+
+        self.last_manifest_refresh = Some(Instant::now());
+        self.base_url = new_base_url;
+
+        // Update minimumUpdatePeriod in case the server changed it.
+        self.minimum_update_period_ms =
+            new_mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
+
+        // Re-derive total_segments for each track from the new manifest.
+        // For a live stream this is the primary update: the segment count grows
+        // as the presentation advances.
+        let presentation_duration = new_mpd.mediaPresentationDuration;
+        if let Some(period) = new_mpd.periods.first() {
+            if let Some(track) = self.video_track.as_mut() {
+                if let Some(adaptation) = find_adaptation(period, &MediaType::Video) {
+                    let (_, _, new_total) =
+                        extract_segment_timing(adaptation, period, presentation_duration);
+                    if new_total != track.total_segments {
+                        tracing::info!(
+                            media_type = "video",
+                            old = ?track.total_segments,
+                            new = ?new_total,
+                            "manifest refresh: segment count updated"
+                        );
+                        track.total_segments = new_total;
+                    }
+                }
+            }
+            if let Some(track) = self.audio_track.as_mut() {
+                if let Some(adaptation) = find_adaptation(period, &MediaType::Audio) {
+                    let (_, _, new_total) =
+                        extract_segment_timing(adaptation, period, presentation_duration);
+                    if new_total != track.total_segments {
+                        tracing::info!(
+                            media_type = "audio",
+                            old = ?track.total_segments,
+                            new = ?new_total,
+                            "manifest refresh: segment count updated"
+                        );
+                        track.total_segments = new_total;
+                    }
+                }
+            }
+        }
+
+        self.mpd = new_mpd;
+        tracing::info!(
+            minimum_update_period_ms = ?self.minimum_update_period_ms,
+            "manifest refreshed successfully"
+        );
+        Ok(())
+    }
+
+    // ── ABR ───────────────────────────────────────────────────────────────────
     /// given media type without changing any state.
     pub fn select_quality(
         &self,
@@ -989,6 +1223,47 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
+/// How many segments behind the live edge to start playback when the manifest
+/// does not declare `@suggestedPresentationDelay`.  Three segments (~12 s at
+/// 4 s/seg) gives enough leeway for CDN propagation without introducing
+/// too much latency.
+const DEFAULT_LIVE_SAFETY_SEGMENTS: u64 = 3;
+
+/// Compute the segment number to start fetching for a live/dynamic stream.
+///
+/// Uses the DASH spec §4.3 formula:
+/// ```text
+/// live_edge = floor((now − availabilityStartTime) / segment_duration) + startNumber
+/// start_at  = live_edge − safety_segments
+/// ```
+///
+/// `suggested_delay_s` is `MPD@suggestedPresentationDelay` converted to
+/// seconds.  When present it overrides the built-in safety margin.
+///
+/// Returns `start_number` unchanged when:
+/// - `seg_dur_secs ≤ 0` (degenerate template), or
+/// - `now_secs < ast_secs` (clock behind AST, should not happen in practice).
+fn compute_live_edge_segment(
+    ast_secs: f64,
+    now_secs: f64,
+    seg_dur_secs: f64,
+    start_number: u64,
+    suggested_delay_s: Option<f64>,
+) -> u64 {
+    if seg_dur_secs <= 0.0 || now_secs <= ast_secs {
+        return start_number;
+    }
+    let elapsed = now_secs - ast_secs;
+    let live_edge = (elapsed / seg_dur_secs).floor() as u64 + start_number;
+
+    let safety = match suggested_delay_s {
+        Some(spd) => (spd / seg_dur_secs).ceil() as u64,
+        None => DEFAULT_LIVE_SAFETY_SEGMENTS,
+    };
+
+    live_edge.saturating_sub(safety).max(start_number)
+}
+
 /// Extract `(start_number, segment_duration_ms, total_segments)` from the
 /// `SegmentTemplate` that governs `adaptation`, walking up to `period` if
 /// needed.  `presentation_duration` is `MPD@mediaPresentationDuration`.
@@ -1333,8 +1608,69 @@ fn merge_segment_templates(
 
 #[cfg(test)]
 mod tests {
-    use super::{expand_template, merge_segment_templates};
+    use super::{compute_live_edge_segment, expand_template, merge_segment_templates};
     use dash_mpd::{AdaptationSet, Period, Representation, SegmentTemplate};
+
+    // ── compute_live_edge_segment ─────────────────────────────────────────────
+
+    /// Basic: 100 segments have elapsed, no SPD → snap 3 back from live edge.
+    #[test]
+    fn live_edge_basic_safety_margin() {
+        // 4 s segments; 400 s of elapsed time → live_edge = 100 + 1 = 101
+        // safety = 3 → start at 98
+        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, None);
+        assert_eq!(seg, 98);
+    }
+
+    /// `suggestedPresentationDelay` overrides the default margin.
+    #[test]
+    fn live_edge_uses_suggested_presentation_delay() {
+        // SPD = 12 s, seg_dur = 4 s → safety = ceil(12/4) = 3
+        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, Some(12.0));
+        assert_eq!(seg, 98);
+        // SPD = 8 s → safety = 2
+        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, Some(8.0));
+        assert_eq!(seg, 99);
+    }
+
+    /// Non-zero `startNumber` is included in the result.
+    #[test]
+    fn live_edge_non_zero_start_number() {
+        // start_number = 5; live_edge = floor(400/4) + 5 = 105; safety=3 → 102
+        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 5, None);
+        assert_eq!(seg, 102);
+    }
+
+    /// Non-zero `availabilityStartTime` (e.g. BBC: AST = epoch + 25 s).
+    #[test]
+    fn live_edge_with_nonzero_ast() {
+        // AST = 25 s, now = 425 s → elapsed = 400 s, live_edge = 100 + 1 = 101; safety=3 → 98
+        let seg = compute_live_edge_segment(25.0, 425.0, 4.0, 1, None);
+        assert_eq!(seg, 98);
+    }
+
+    /// Result is clamped to at least `start_number` (no underflow).
+    #[test]
+    fn live_edge_clamps_to_start_number() {
+        // Only 2 segments elapsed → live_edge = 3; safety = 3 → would underflow to 0
+        // clamped to start_number (1)
+        let seg = compute_live_edge_segment(0.0, 8.0, 4.0, 1, None);
+        assert_eq!(seg, 1);
+    }
+
+    /// `now < ast` (clock behind availability) → return `start_number`.
+    #[test]
+    fn live_edge_future_ast_returns_start_number() {
+        let seg = compute_live_edge_segment(1000.0, 500.0, 4.0, 1, None);
+        assert_eq!(seg, 1);
+    }
+
+    /// Degenerate `seg_dur = 0` → return `start_number` without panicking.
+    #[test]
+    fn live_edge_zero_duration_returns_start_number() {
+        let seg = compute_live_edge_segment(0.0, 400.0, 0.0, 1, None);
+        assert_eq!(seg, 1);
+    }
 
     // ── merge_segment_templates ───────────────────────────────────────────────
 

@@ -149,13 +149,37 @@ at session construction time (`extract_segment_timing()` in `src/session.rs`).
 
 ### `TrackState` segment timing fields
 
-`TrackState` carries two timing fields populated from the MPD:
+`TrackState` carries these timing fields populated from the MPD:
 
 - `start_number: u64` — `SegmentTemplate@startNumber` (default 1).
 - `segment_duration_ms: f64` — `SegmentTemplate.duration / timescale × 1000` (default 2 000 ms if absent).
+- `initial_segment_number: u64` — segment number at which *this session* started fetching.
+  For VOD this equals `start_number`.  For live streams it is set to the live-edge
+  segment after snapping so that `estimated_buffer_level_ms` counts only segments
+  pushed in this session, not from the beginning of the broadcast.
 
-`segments_fetched` is computed as `segment_number − start_number` (not a separate counter).
+`segments_fetched_for_eos` is computed as `segment_number − start_number` (used by the
+VOD EOS segment-count check in `fetch_next_segment`; live streams use `total_segments = None`
+so this path is skipped).
+
+`segments_fetched_for_buffer` is computed as `segment_number − initial_segment_number` (used
+by `estimated_buffer_level_ms`).
+
 `segment_number` advances by 1 on every successful `fetch_next_segment` call.
+
+For **live streams** (`MPD@type="dynamic"`), `from_mpd` / `from_url` snap
+both `segment_number` and `initial_segment_number` to the live edge on construction using
+`availabilityStartTime`:
+
+```
+segment_number = floor((now − availabilityStartTime) / seg_dur) + startNumber − safety_margin
+initial_segment_number = segment_number   (set at the same time)
+```
+
+`safety_margin` defaults to 3 segments; `MPD@suggestedPresentationDelay`
+overrides it when present.  `segment_number` is clamped to at least
+`start_number`.  The helper is `compute_live_edge_segment()` in
+`src/session.rs`.
 
 ### `DashSession` uses the first `Period` only
 
@@ -251,6 +275,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Segment timing extraction | `extract_segment_timing()` in `src/session.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
+| Live-stream API tests | `tests/session.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
@@ -271,6 +296,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `InsufficientBufferRule.js` | `abr::insufficient_buffer::InsufficientBufferRule` |
 | `SwitchHistoryRule.js` | `abr::switch_history::SwitchHistoryRule` |
 | `AbrController.js` | `abr::AbrController` |
+| `ManifestUpdater.js` | `session::DashSession::is_live` + `should_refresh_manifest` + `refresh_manifest` |
 | `MediaPlayer.js` + `StreamProcessor.js` | `session::DashSession` |
 | `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` |
 
@@ -280,7 +306,6 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 
-- Live / dynamic MPD refresh (`ManifestUpdater`).
 - `SegmentList` and `SegmentBase` (byte-range) segment addressing.
 - `$Time$` template variable in `SegmentTemplate`.
 - Multi-period playback.
@@ -288,8 +313,14 @@ The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 - DRM / Encrypted Media Extensions.
 - MPD patch (`<Patch>` element).
 
-### `GstSourceBuffer` known gaps
+### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
 
+- **Absolute-timestamp live streams (BBC CMAF)**: handled by
+  `GstMediaSource::set_live_mode(true)`, which sets `sync=false` on the sink
+  elements wired by the `pad-added` callback.  This makes frames render as
+  they arrive rather than waiting for the monotonic pipeline clock to reach
+  the Unix-epoch PTS (≈ 1.778 × 10¹⁸ ns for BBC Two HD).  Call it after
+  `DashSession::from_url` and before `set_playing` whenever `session.is_live()`.
 - `buffered()` only tracks ranges from chunks whose `Chunk::start`/`end` are set.
   DASH segments currently do not carry timing (they're set to `None`), so the
   buffer-occupancy ABR rule sees an empty range.  Work-around: parse the fMP4

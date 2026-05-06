@@ -219,51 +219,6 @@ cargo test --test media_source
 cargo test --doc
 ```
 
-Expected output (all 33 tests pass):
-
-```
-test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured
-
-running 11 tests
-test buffer_rule_abstains_when_no_buffer ... ok
-test buffer_rule_returns_some_when_buffer_present ... ok
-test controller_empty_representations ... ok
-test controller_picks_conservative_result ... ok
-test controller_selects_high_with_good_conditions ... ok
-test insufficient_buffer_abstains_above_threshold ... ok
-test insufficient_buffer_fires_below_threshold ... ok
-test switch_history_abstains_with_no_history ... ok
-test switch_history_clamps_after_recent_switch ... ok
-test throughput_rule_empty_representations ... ok
-test throughput_rule_selects_highest_fitting_quality ... ok
-
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured
-
-running 14 tests
-test source_buffer_sink_append_and_abort ... ok
-test source_buffer_sink_remove_validates_range ... ok
-test stub_media_source_add_and_remove_source_buffer ... ok
-test stub_media_source_add_source_buffer_requires_open ... ok
-test stub_media_source_end_of_stream ... ok
-test stub_media_source_open_close ... ok
-test stub_media_source_set_duration ... ok
-test stub_source_buffer_abort_clears_updating ... ok
-test stub_source_buffer_append_and_buffered ... ok
-test stub_source_buffer_change_type ... ok
-test stub_source_buffer_init_segment_not_tracked_in_time_ranges ... ok
-test stub_source_buffer_keeps_discontinuous_ranges_separate ... ok
-test stub_source_buffer_merges_adjacent_ranges ... ok
-test stub_source_buffer_remove_clears_range ... ok
-
-test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured
-
-running 2 doc-tests
-test src/session.rs - session::DashSession (line 93) - compile ... ok
-test src/lib.rs - (line 18) - compile ... ok
-
-test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured
-```
-
 ---
 
 ## Running the examples

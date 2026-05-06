@@ -61,7 +61,6 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use dash_rs::{
-    abr::AbrMetrics,
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     session::{DashSession, MediaType},
     DashError,
@@ -206,6 +205,16 @@ async fn run_session(
         Err(e) => println!("  audio  init skipped: {e}"),
     }
 
+    // For live CMAF streams (e.g. BBC Two HD), the fMP4 `tfdt` box carries
+    // absolute Unix-epoch timestamps.  GStreamer's monotonic pipeline clock
+    // starts from zero (boot time), so with `sync=true` the sinks would
+    // schedule frames ~56 years in the future and the pipeline would stall.
+    // Setting live_mode=true disables sink sync so frames render immediately.
+    if session.is_live() {
+        tracing::info!("live stream — enabling live_mode (sink sync disabled)");
+        session.media_source_mut().set_live_mode(true);
+    }
+
     // Now that source buffers have received the init segments, transition the
     // pipeline to Playing so decoding and rendering begin.
     session.media_source_mut().set_playing()?;
@@ -291,8 +300,12 @@ async fn run_session(
             }
 
             let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-            let vid_buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
-            let metrics = AbrMetrics::new(throughput_bps, vid_buf_ms);
+            // Use current_metrics() so SwitchHistoryRule sees the real
+            // current_index; then overwrite throughput and buffer with live
+            // measurements (current_metrics leaves those at 0).
+            let mut metrics = session.current_metrics(MediaType::Video);
+            metrics.throughput_bps = throughput_bps;
+            metrics.buffer_level_ms = session.estimated_buffer_level_ms(&MediaType::Video);
 
             let t_video = Instant::now();
             match session.fetch_next_segment(MediaType::Video, &metrics).await {
@@ -327,8 +340,9 @@ async fn run_session(
             }
 
             let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-            let aud_buf_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
-            let audio_metrics = AbrMetrics::new(throughput_bps, aud_buf_ms);
+            let mut audio_metrics = session.current_metrics(MediaType::Audio);
+            audio_metrics.throughput_bps = throughput_bps;
+            audio_metrics.buffer_level_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
             match session
                 .fetch_next_segment(MediaType::Audio, &audio_metrics)
                 .await
