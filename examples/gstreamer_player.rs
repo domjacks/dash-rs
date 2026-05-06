@@ -29,12 +29,17 @@
 //!
 //! # Thread model
 //!
-//! On macOS, `autovideosink` delegates to `osxvideosink`, which **must** run
-//! from the Cocoa main thread.  To satisfy this constraint the example does
-//! **not** use `#[tokio::main]`:
+//! On macOS, `autovideosink` delegates to `osxvideosink` or `glimagesink`,
+//! both of which require GLib's main loop (and therefore macOS's CFRunLoop)
+//! to be running on the main thread to create their Cocoa `NSWindow`.
+//!
+//! To satisfy this constraint the example does **not** use `#[tokio::main]`,
+//! and uses `glib::MainLoop::run()` instead of a `bus.timed_pop()` poll loop:
 //!
 //! ```text
-//! main() thread  ← GStreamer bus loop (Cocoa / video-sink safe)
+//! main() thread  ← glib::MainLoop::run()  (drives GLib/CFRunLoop for video sink)
+//!   │               └─ bus.add_watch()    (EOS / error handling)
+//!   │               └─ glib::timeout_add  (fetch-error detection)
 //!   │
 //!   └─ OS thread ← tokio multi-thread runtime
 //!                   ├─ DashSession::from_url  (manifest fetch + parse)
@@ -213,10 +218,22 @@ async fn run_session(
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "video fetch"
     );
 
+    // Segment duration for the BBC BBB stream (3 840 ms per segment).
+    // We pace the fetch loop so that we never push more than one segment's
+    // worth of data ahead of the playback clock.  Each iteration targets
+    // SEGMENT_DURATION_MS: after fetching and pushing a segment we sleep for
+    // however long is left before the next segment is due to be consumed.
+    // This prevents the entire 30-second buffer from being pushed instantly,
+    // which would cause EOS to race through the pipeline before any frames
+    // are rendered.
+    const SEGMENT_DURATION_MS: u64 = 3_840;
+
     for seg in 1..=SEGMENTS_TO_FETCH {
+        let t_seg_start = Instant::now();
+
         let throughput_bps =
             f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        let buffer_level_ms = (seg as f64) * 4_000.0;
+        let buffer_level_ms = (seg as f64) * (SEGMENT_DURATION_MS as f64);
         let metrics = AbrMetrics::new(throughput_bps, buffer_level_ms);
 
         let t_video = Instant::now();
@@ -242,9 +259,24 @@ async fn run_session(
             video_ms,
             measured_bps / 1_000.0,
         );
+
+        // Pace: sleep for the remainder of the segment duration so the
+        // pipeline clock stays ahead of the pushed data by at most one
+        // segment.  Skip the sleep on the last segment so EOS is sent
+        // promptly after the last frame is due.
+        if seg < SEGMENTS_TO_FETCH {
+            let elapsed_ms = t_seg_start.elapsed().as_millis() as u64;
+            if elapsed_ms < SEGMENT_DURATION_MS {
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    SEGMENT_DURATION_MS - elapsed_ms,
+                ))
+                .await;
+            }
+        }
     }
 
-    // Signal the pipeline that no more data is coming.
+    // All segments have been pushed and the last segment's playback window
+    // has elapsed — signal EOS so the pipeline drains cleanly.
     session.end_of_stream().await?;
     println!("\nAll segments fetched — waiting for pipeline EOS…");
 
@@ -254,6 +286,18 @@ async fn run_session(
 // ── main ──────────────────────────────────────────────────────────────────────
 
 fn main() {
+    // On macOS, GStreamer video sinks require NSApplication to be initialised
+    // on the main thread before any window or GL context is created.
+    // gst::macos_main() calls gst_macos_main(), which invokes
+    // [NSApplication sharedApplication] and runs our closure on the Cocoa
+    // main thread — eliminating the "An NSApplication needs to be running on
+    // the main thread" warning and enabling video output.
+    //
+    // On other platforms the closure is invoked directly.
+    gst::macos_main(run);
+}
+
+fn run() {
     // Initialise tracing before GStreamer so library log events are captured.
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
@@ -315,63 +359,85 @@ fn main() {
     });
 
     // ── GStreamer bus loop (runs on main thread) ───────────────────────────
+    //
+    // We use glib::MainLoop + bus.add_watch() instead of bus.timed_pop() so
+    // that the GLib main loop runs on the main thread.  On macOS, GLib's
+    // main loop integrates with CFRunLoop, which is required for
+    // autovideosink (osxvideosink / glimagesink) to create its Cocoa
+    // NSWindow.  bus.timed_pop() only blocks — it never spins CFRunLoop,
+    // so the video sink window is never realised.
 
     let bus = pipeline.bus().expect("pipeline has no bus");
+    let main_loop = gst::glib::MainLoop::new(None, false);
 
-    loop {
-        // Poll with a short timeout so we can also check the done channel.
-        match bus.timed_pop(gst::ClockTime::from_mseconds(200)) {
-            Some(msg) => {
-                use gst::MessageView;
-                match msg.view() {
-                    MessageView::Eos(..) => {
-                        println!("GStreamer EOS — playback finished.");
-                        break;
-                    }
-                    MessageView::Error(err) => {
-                        eprintln!(
-                            "GStreamer error from {}: {} ({})",
-                            msg.src()
-                                .map(|s: &gst::Object| s.path_string().to_string())
-                                .unwrap_or_else(|| "unknown".into()),
-                            err.error(),
-                            err.debug().unwrap_or_default(),
-                        );
-                        break;
-                    }
-                    MessageView::Warning(warn) => {
-                        tracing::warn!(
-                            src = ?msg.src().map(|s: &gst::Object| s.path_string()),
-                            msg = %warn.error(),
-                            "GStreamer warning"
-                        );
-                    }
-                    MessageView::StateChanged(sc) => {
-                        // Only log top-level pipeline state changes.
-                        if msg.src().map(|s| *s == pipeline).unwrap_or(false) {
-                            tracing::info!(
-                                old = ?sc.old(),
-                                new = ?sc.current(),
-                                "pipeline state changed"
-                            );
-                        }
-                    }
-                    _ => {}
+    // Bus watch — callback fires on the GLib main context (main thread).
+    let main_loop_w = main_loop.clone();
+    let pipeline_w  = pipeline.clone();
+    let _watch = bus
+        .add_watch(move |_bus, msg| {
+            use gst::MessageView;
+            match msg.view() {
+                MessageView::Eos(..) => {
+                    println!("GStreamer EOS — playback finished.");
+                    main_loop_w.quit();
                 }
-            }
-            None => {
-                // Timeout — check whether the fetch task finished with an
-                // error before GStreamer had a chance to send EOS.
-                if let Ok(result) = done_rx.try_recv() {
-                    if let Err(e) = result {
-                        eprintln!("fetch error: {e}");
-                        break;
-                    }
-                    // Fetch finished successfully; keep waiting for EOS.
+                MessageView::Error(err) => {
+                    // Always print to stderr so the cause is visible even
+                    // when the tracing subscriber is filtered.
+                    eprintln!(
+                        "GStreamer ERROR\n  element : {}\n  message : {}\n  debug   : {}",
+                        msg.src()
+                            .map(|s: &gst::Object| s.path_string().to_string())
+                            .unwrap_or_else(|| "<unknown>".into()),
+                        err.error(),
+                        err.debug().unwrap_or_else(|| "<no debug>".into()),
+                    );
+                    main_loop_w.quit();
                 }
+                MessageView::Warning(warn) => {
+                    eprintln!(
+                        "GStreamer WARNING\n  element : {}\n  message : {}\n  debug   : {}",
+                        msg.src()
+                            .map(|s: &gst::Object| s.path_string().to_string())
+                            .unwrap_or_else(|| "<unknown>".into()),
+                        warn.error(),
+                        warn.debug().unwrap_or_else(|| "<no debug>".into()),
+                    );
+                }
+                MessageView::StateChanged(sc) => {
+                    // Only log top-level pipeline state changes.
+                    if msg.src().map(|s| *s == pipeline_w).unwrap_or(false) {
+                        tracing::info!(
+                            old = ?sc.old(),
+                            new = ?sc.current(),
+                            "pipeline state changed"
+                        );
+                    }
+                }
+                _ => {}
             }
-        }
-    }
+            gst::glib::ControlFlow::Continue
+        })
+        .expect("Failed to add bus watch");
+
+    // Periodic check for fetch errors that arrive before GStreamer EOS.
+    // The timer fires on the same GLib main context as the bus watch.
+    let main_loop_t = main_loop.clone();
+    let _timer = gst::glib::timeout_add(
+        std::time::Duration::from_millis(200),
+        move || match done_rx.try_recv() {
+            Ok(Err(e)) => {
+                eprintln!("fetch error: {e}");
+                main_loop_t.quit();
+                gst::glib::ControlFlow::Break
+            }
+            _ => gst::glib::ControlFlow::Continue,
+        },
+    );
+
+    // Blocks here, running the GLib / CFRunLoop event loop on the main
+    // thread.  autovideosink can now create its Cocoa window.
+    main_loop.run();
 
     // Tear down the pipeline before exiting.
     let _ = pipeline.set_state(gst::State::Null);

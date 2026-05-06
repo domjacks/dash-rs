@@ -25,10 +25,20 @@
 //!
 //! # Main-thread requirement on macOS
 //!
-//! `autovideosink` on macOS selects `osxvideosink`, which must render from the
-//! Cocoa main thread.  See `examples/gstreamer_player.rs` for the recommended
-//! setup: run the GStreamer bus loop on `main()` and spawn the tokio fetch
-//! loop on a background OS thread.
+//! `autovideosink` on macOS selects `osxvideosink` or `glimagesink`.  Both
+//! sinks require a running `NSApplication` before they can create a Cocoa
+//! `NSWindow`.  In GStreamer ≥ 1.22 the sinks marshal their own Cocoa and
+//! GL-context creation onto the main thread internally via
+//! `g_main_context_invoke` / `perform_selector_on_main_thread`, so
+//! `pad-added` can safely call [`wire_sink_chain`] on the GStreamer streaming
+//! thread without any additional dispatch.
+//!
+//! The caller is responsible for ensuring `NSApplication` is initialised
+//! before the pipeline transitions to Playing.  See
+//! `examples/gstreamer_player.rs` for the recommended setup:
+//! wrap `main()` with `gst::macos_main()`, run the GStreamer bus loop on the
+//! main thread via `glib::MainLoop::run()`, and push segments from a
+//! background OS thread.
 
 use async_trait::async_trait;
 // Conventional short aliases used throughout the gstreamer-rs ecosystem.
@@ -223,6 +233,24 @@ impl GstMediaSource {
         gst::init()
             .map_err(|e| DashError::AppendFailed(format!("gst::init failed: {e}")))?;
 
+        // On macOS, VideoToolbox (`vtdec` / `vtdec_hw`) requires `codec_data`
+        // to be present in the H.264 caps *before* its first frame.  For
+        // `avc3` streams (in-band SPS/PPS, no `avcC` box in the init
+        // segment) `h264parse` synthesises `codec_data` from the first IDR
+        // frame, but by that point vtdec has already tried — and failed — to
+        // create its VideoToolbox session, posting a pipeline error.
+        //
+        // Downranking vtdec to NONE causes `decodebin` to prefer
+        // `avdec_h264` (libav software decoder), which handles in-band
+        // SPS/PPS natively and works reliably with DASH avc3 content.
+        #[cfg(target_os = "macos")]
+        for name in ["vtdec", "vtdec_hw"] {
+            if let Some(factory) = gst::ElementFactory::find(name) {
+                factory.set_rank(gst::Rank::NONE);
+                tracing::debug!("lowered {name} rank to NONE (avc3 workaround)");
+            }
+        }
+
         let pipeline = gst::Pipeline::default();
         tracing::debug!("GstMediaSource: pipeline created");
 
@@ -292,7 +320,11 @@ impl MediaSource for GstMediaSource {
             .caps(&caps)
             .format(gst::Format::Bytes)
             .stream_type(gst_app::AppStreamType::Stream)
-            .is_live(true)
+            // VOD content: is_live(false) enables proper preroll so both
+            // audio and video sinks start clock-synchronised.  is_live(true)
+            // skips preroll, which causes the pipeline clock to start before
+            // the video decoder initialises, dropping early frames.
+            .is_live(false)
             // fMP4 carries its own timestamps; do not generate synthetic ones.
             .do_timestamp(false)
             .build();
@@ -345,7 +377,19 @@ impl MediaSource for GstMediaSource {
             };
             let media_type = structure.name();
 
+            tracing::info!(
+                media_type = %media_type,
+                "decodebin pad-added — wiring sink chain"
+            );
+
             if media_type.starts_with("video/") {
+                // Wire synchronously on the streaming thread.  GStreamer ≥ 1.22
+                // osxvideosink / glimagesink internally marshal their Cocoa
+                // NSWindow and GL-context creation onto the main thread via
+                // g_main_context_invoke — we do not need to do it from here.
+                // Deferring via MainContext::invoke would leave the pad unlinked
+                // during decodebin's preroll window, causing the pipeline to
+                // stall or error before video playback begins.
                 wire_sink_chain(&pipeline, src_pad, "videoconvert", None, "autovideosink");
             } else if media_type.starts_with("audio/") {
                 wire_sink_chain(
