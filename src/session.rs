@@ -1,6 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
-use dash_mpd::{AdaptationSet, BaseURL, Period, SegmentTemplate, MPD};
+use dash_mpd::{AdaptationSet, BaseURL, Period, Representation, SegmentTemplate, MPD};
 use url::Url;
 
 use crate::{
@@ -223,13 +223,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 );
 
                 // Wire timestamp offset from SegmentTemplate@presentationTimeOffset.
-                let tmpl = adaptation
-                    .SegmentTemplate
-                    .as_ref()
-                    .or(period.SegmentTemplate.as_ref());
-                if let Some(t) = tmpl {
-                    if let Some(pto) = t.presentationTimeOffset {
-                        let ts = t.timescale.unwrap_or(1);
+                // Merge across Representation → AdaptationSet → Period so that a
+                // template defined only at the Representation level is found too.
+                let first_repr = adaptation.representations.first();
+                if let Some(merged) = merge_segment_templates(first_repr, adaptation, period) {
+                    if let Some(pto) = merged.presentationTimeOffset {
+                        let ts = merged.timescale.unwrap_or(1);
                         sink.set_timestamp_offset(pto as f64 / ts as f64);
                     }
                 }
@@ -270,13 +269,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 );
 
                 // Wire timestamp offset from SegmentTemplate@presentationTimeOffset.
-                let tmpl = adaptation
-                    .SegmentTemplate
-                    .as_ref()
-                    .or(period.SegmentTemplate.as_ref());
-                if let Some(t) = tmpl {
-                    if let Some(pto) = t.presentationTimeOffset {
-                        let ts = t.timescale.unwrap_or(1);
+                // Merge across Representation → AdaptationSet → Period so that a
+                // template defined only at the Representation level is found too.
+                let first_repr = adaptation.representations.first();
+                if let Some(merged) = merge_segment_templates(first_repr, adaptation, period) {
+                    if let Some(pto) = merged.presentationTimeOffset {
+                        let ts = merged.timescale.unwrap_or(1);
                         sink.set_timestamp_offset(pto as f64 / ts as f64);
                     }
                 }
@@ -736,19 +734,36 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 }
             })?;
 
-            let template = adaptation
-                .SegmentTemplate
-                .as_ref()
-                .or(period.SegmentTemplate.as_ref())
+            // Find the dash_mpd::Representation for the selected quality level
+            // so we can check Representation-level SegmentTemplate and BaseURL.
+            let repr_obj: Option<&Representation> = adaptation
+                .representations
+                .iter()
+                .find(|r| r.id.as_deref() == Some(rep.id.as_str()));
+
+            // Merge SegmentTemplate: Representation → AdaptationSet → Period.
+            // Handles manifests (e.g. USP / Unified Streaming) where the template
+            // is at the Representation level rather than the AdaptationSet level.
+            let merged = merge_segment_templates(repr_obj, adaptation, period)
                 .ok_or(DashError::SegmentUrlUnresolvable)?;
 
-            let media_tmpl = template
+            let media_tmpl = merged
                 .media
                 .as_deref()
                 .ok_or(DashError::SegmentUrlUnresolvable)?;
 
             let path = expand_template(media_tmpl, &rep.id, rep.bandwidth, seg_num);
-            let candidates = collect_candidate_base_urls(&self.base_url, period, adaptation);
+
+            // Collect CDN candidates across all four BaseURL levels:
+            // manifest URL → MPD → Period → AdaptationSet → Representation.
+            let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+            let candidates = collect_candidate_base_urls(
+                &self.base_url,
+                &self.mpd.base_url,
+                period,
+                adaptation,
+                repr_base_urls,
+            );
             (candidates, path, seg_num)
         };
 
@@ -921,9 +936,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// Resolve the URL for the initialisation segment of the given
     /// representation.
     ///
-    /// Handles the common `@initialization` attribute form of `SegmentTemplate`
-    /// (e.g. `initialization="video/$RepresentationID$/init.mp4"` or a fixed
-    /// path like `initialization="1920x1080p25/IS.mp4"`).
+    /// Checks the merged `SegmentTemplate` across Representation → AdaptationSet
+    /// → Period.  Accepts both the common `@initialization` attribute form and
+    /// the `<Initialization sourceURL="…"/>` child-element form.
     /// Returns [`DashError::SegmentUrlUnresolvable`] when no initialisation
     /// URL can be derived from the manifest.
     fn resolve_init_url(
@@ -937,19 +952,31 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 media_type: media_type.to_string(),
             })?;
 
-        // Walk SegmentTemplate from AdaptationSet → Period.
-        let template = adaptation
-            .SegmentTemplate
-            .as_ref()
-            .or(period.SegmentTemplate.as_ref());
+        // Find the dash_mpd::Representation to check Representation-level fields.
+        let repr_obj: Option<&Representation> = adaptation
+            .representations
+            .iter()
+            .find(|r| r.id.as_deref() == Some(rep.id.as_str()));
 
-        if let Some(tmpl) = template {
-            // @initialization attribute — the most common form.
-            if let Some(init_tmpl) = tmpl.initialization.as_deref() {
-                // Segment number is irrelevant for init segments; pass 0.
+        // Merge SegmentTemplate: Representation → AdaptationSet → Period.
+        if let Some(tmpl) = merge_segment_templates(repr_obj, adaptation, period) {
+            // Prefer @initialization attribute; fall back to <Initialization sourceURL="...">.
+            let init_tmpl = tmpl
+                .initialization
+                .as_deref()
+                .or_else(|| tmpl.Initialization.as_ref()?.sourceURL.as_deref());
+
+            if let Some(init_tmpl) = init_tmpl {
                 let url_str = expand_template(init_tmpl, &rep.id, rep.bandwidth, 0);
 
-                let base = resolve_adaptation_base_url(&self.base_url, period, adaptation);
+                let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+                let base = resolve_effective_base_url(
+                    &self.base_url,
+                    &self.mpd.base_url,
+                    period,
+                    adaptation,
+                    repr_base_urls,
+                );
                 return base
                     .join(&url_str)
                     .map_err(|_| DashError::SegmentUrlUnresolvable);
@@ -977,14 +1004,37 @@ fn extract_segment_timing(
     period: &Period,
     presentation_duration: Option<std::time::Duration>,
 ) -> (u64, f64, Option<u64>) {
-    let tmpl: Option<&SegmentTemplate> = adaptation
-        .SegmentTemplate
-        .as_ref()
-        .or(period.SegmentTemplate.as_ref());
-
-    let Some(t) = tmpl else {
+    // Merge SegmentTemplate across hierarchy.  This function is called once
+    // per adaptation set before a specific representation is chosen, so we
+    // use the first representation as a sample.  All representations within
+    // a track should have the same effective segment duration; we warn if they
+    // differ since that would make the single `segment_duration_ms` field
+    // inaccurate for some representations.
+    let first_repr = adaptation.representations.first();
+    let Some(t) = merge_segment_templates(first_repr, adaptation, period) else {
         return (1, 2_000.0, None);
     };
+
+    // Warn if sibling representations declare inconsistent effective durations.
+    if adaptation.representations.len() > 1 {
+        let effective_dur_s = |r: &Representation| -> Option<f64> {
+            merge_segment_templates(Some(r), adaptation, period)
+                .and_then(|m| Some(m.duration? / m.timescale.unwrap_or(1) as f64))
+        };
+        let first_dur = first_repr.and_then(effective_dur_s);
+        for r in adaptation.representations.iter().skip(1) {
+            match (first_dur, effective_dur_s(r)) {
+                (Some(fd), Some(rd)) if (fd - rd).abs() > 1e-9 => {
+                    tracing::warn!(
+                        "AdaptationSet representations have inconsistent segment durations \
+                         ({fd} s vs {rd} s); using first representation as representative"
+                    );
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
 
     let start_number = t.startNumber.unwrap_or(1);
 
@@ -1127,44 +1177,41 @@ fn find_adaptation<'a>(period: &'a Period, media_type: &MediaType) -> Option<&'a
     })
 }
 
-/// Collect candidate base URLs for the given adaptation set, sorted by
-/// priority ascending (lower number = higher priority per DASH spec §5.10.1.3)
-/// with weight-based random ordering within each priority tier
-/// (Efraimidis–Spirakis reservoir algorithm).
+/// Collect candidate base URLs for a segment fetch by chaining `BaseURL`
+/// elements at every level of the DASH hierarchy (DASH spec §5.10.1.3):
 ///
-/// The list is guaranteed to contain at least the `mpd_base` URL as a
-/// fallback when neither `period` nor `adaptation` declare any `BaseURL`
-/// elements.
+///   manifest URL → MPD → Period → AdaptationSet → Representation
+///
+/// At each level that declares `BaseURL` elements, each parent candidate is
+/// combined with each child `BaseURL` (in priority / weight order) to produce
+/// the next level's candidates.  Levels with no `BaseURL` elements are passed
+/// through unchanged.
+///
+/// The list is guaranteed to be non-empty (falls back to the manifest URL).
 fn collect_candidate_base_urls(
-    mpd_base: &Url,
+    manifest_url: &Url,
+    mpd_base_urls: &[BaseURL],
     period: &Period,
     adaptation: &AdaptationSet,
+    repr_base_urls: &[BaseURL],
 ) -> Vec<Url> {
-    // Resolve period-level candidates against the manifest base URL.
-    let period_candidates: Vec<Url> = if period.BaseURL.is_empty() {
-        vec![mpd_base.clone()]
-    } else {
-        priority_weighted_order(&period.BaseURL)
-            .into_iter()
-            .filter_map(|b| mpd_base.join(&b.base).ok())
+    // Helper: expand a set of parent candidates with a set of BaseURL entries.
+    fn expand(parents: Vec<Url>, bases: &[BaseURL]) -> Vec<Url> {
+        if bases.is_empty() {
+            return parents;
+        }
+        let ordered = priority_weighted_order(bases);
+        parents
+            .iter()
+            .flat_map(|p| ordered.iter().filter_map(move |b| p.join(&b.base).ok()))
             .collect()
-    };
-
-    // If adaptation declares no extra BaseURL elements, return as-is.
-    if adaptation.BaseURL.is_empty() {
-        return period_candidates;
     }
 
-    // Combine: for each period candidate, try each adaptation-level BaseURL.
-    let adapt_ordered = priority_weighted_order(&adaptation.BaseURL);
-    period_candidates
-        .iter()
-        .flat_map(|pb| {
-            adapt_ordered
-                .iter()
-                .filter_map(move |ab| pb.join(&ab.base).ok())
-        })
-        .collect()
+    let root = vec![manifest_url.clone()];
+    let after_mpd = expand(root, mpd_base_urls);
+    let after_period = expand(after_mpd, &period.BaseURL);
+    let after_adapt = expand(after_period, &adaptation.BaseURL);
+    expand(after_adapt, repr_base_urls)
 }
 
 /// Sort a slice of `BaseURL` elements by priority ascending with
@@ -1198,35 +1245,187 @@ fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
     scored.into_iter().map(|(_, _, b)| b).collect()
 }
 
-/// Resolve the effective base URL for an adaptation set by chaining
-/// Period → AdaptationSet `BaseURL` elements against the MPD base URL.
+/// Resolve a single effective base URL for init-segment URL construction by
+/// deterministically walking the `BaseURL` chain from the manifest URL through
+/// every hierarchy level (MPD → Period → AdaptationSet → Representation).
 ///
-/// Each element is resolved with `Url::join` so relative values work
-/// correctly. Returns the MPD base URL unchanged when neither level
-/// provides a `BaseURL`.
-fn resolve_adaptation_base_url(mpd_base: &Url, period: &Period, adaptation: &AdaptationSet) -> Url {
-    let mut base = mpd_base.clone();
-
-    if let Some(period_base) = period.BaseURL.first() {
-        if let Ok(u) = base.join(&period_base.base) {
-            base = u;
+/// Unlike [`collect_candidate_base_urls`], which produces a full candidate
+/// list for CDN failover, this picks the **first** (highest-priority) element
+/// at each level and chains them.  Suitable for one-shot URL resolution where
+/// a single base is required.
+fn resolve_effective_base_url(
+    manifest_url: &Url,
+    mpd_base_urls: &[BaseURL],
+    period: &Period,
+    adaptation: &AdaptationSet,
+    repr_base_urls: &[BaseURL],
+) -> Url {
+    let mut base = manifest_url.clone();
+    for level in [mpd_base_urls, &period.BaseURL, &adaptation.BaseURL, repr_base_urls] {
+        if let Some(b) = level.first() {
+            if let Ok(u) = base.join(&b.base) {
+                base = u;
+            }
         }
     }
-
-    if let Some(adapt_base) = adaptation.BaseURL.first() {
-        if let Ok(u) = base.join(&adapt_base.base) {
-            base = u;
-        }
-    }
-
     base
+}
+
+/// Merge `SegmentTemplate` attributes across the DASH element hierarchy.
+///
+/// DASH §5.3.9.4 specifies that attributes not set at a lower level shall be
+/// inherited from the nearest parent element that defines them.  The
+/// resolution order is Representation (most specific) → AdaptationSet → Period
+/// (least specific).
+///
+/// Returns an **owned** merged template so the caller can hold it without
+/// lifetime ties to multiple levels of the MPD tree.  Returns `None` when no
+/// `SegmentTemplate` exists at any level.
+fn merge_segment_templates(
+    repr: Option<&Representation>,
+    adaptation: &AdaptationSet,
+    period: &Period,
+) -> Option<SegmentTemplate> {
+    // Collect sources from most-specific to least-specific.
+    let sources: [Option<&SegmentTemplate>; 3] = [
+        repr.and_then(|r| r.SegmentTemplate.as_ref()),
+        adaptation.SegmentTemplate.as_ref(),
+        period.SegmentTemplate.as_ref(),
+    ];
+
+    if sources.iter().all(|s| s.is_none()) {
+        return None;
+    }
+
+    // For each attribute: first source that has a value wins.
+    let mut merged = SegmentTemplate::default();
+    for tmpl in sources.iter().flatten() {
+        if merged.media.is_none() {
+            merged.media.clone_from(&tmpl.media);
+        }
+        if merged.initialization.is_none() {
+            merged.initialization.clone_from(&tmpl.initialization);
+        }
+        if merged.startNumber.is_none() {
+            merged.startNumber = tmpl.startNumber;
+        }
+        if merged.duration.is_none() {
+            merged.duration = tmpl.duration;
+        }
+        if merged.timescale.is_none() {
+            merged.timescale = tmpl.timescale;
+        }
+        if merged.presentationTimeOffset.is_none() {
+            merged.presentationTimeOffset = tmpl.presentationTimeOffset;
+        }
+        if merged.Initialization.is_none() {
+            merged.Initialization.clone_from(&tmpl.Initialization);
+        }
+        if merged.SegmentTimeline.is_none() {
+            merged.SegmentTimeline.clone_from(&tmpl.SegmentTimeline);
+        }
+    }
+
+    Some(merged)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
-    use super::expand_template;
+    use super::{expand_template, merge_segment_templates};
+    use dash_mpd::{AdaptationSet, Period, Representation, SegmentTemplate};
+
+    // ── merge_segment_templates ───────────────────────────────────────────────
+
+    /// Template present only at the Representation level (no AdaptationSet or
+    /// Period template).  Used by USP / Unified Streaming manifests where each
+    /// Representation carries its own SegmentTemplate.
+    #[test]
+    fn merge_repr_level_only() {
+        let mut repr = Representation::default();
+        repr.SegmentTemplate = Some(SegmentTemplate {
+            media: Some("video-$RepresentationID$-$Number$.m4s".into()),
+            initialization: Some("video-$RepresentationID$-init.mp4".into()),
+            timescale: Some(25_000),
+            duration: Some(96_000.0),
+            ..Default::default()
+        });
+
+        let merged =
+            merge_segment_templates(Some(&repr), &AdaptationSet::default(), &Period::default())
+                .unwrap();
+
+        assert_eq!(
+            merged.media.as_deref(),
+            Some("video-$RepresentationID$-$Number$.m4s")
+        );
+        assert_eq!(merged.timescale, Some(25_000));
+        assert_eq!(merged.duration, Some(96_000.0));
+        assert_eq!(merged.startNumber, None); // not set → absent in merged
+    }
+
+    /// Attribute inheritance: `startNumber` lives on the AdaptationSet template,
+    /// while `media`, `timescale`, and `duration` are on the Representation.
+    /// The Representation's `timescale` should win over the AdaptationSet's.
+    #[test]
+    fn merge_inherits_from_adaptation_set() {
+        let mut repr = Representation::default();
+        repr.SegmentTemplate = Some(SegmentTemplate {
+            media: Some("seg-$Number$.m4s".into()),
+            timescale: Some(48_000),
+            duration: Some(192_000.0),
+            ..Default::default()
+        });
+
+        let mut adaptation = AdaptationSet::default();
+        adaptation.SegmentTemplate = Some(SegmentTemplate {
+            startNumber: Some(5),
+            timescale: Some(1_000), // lower-priority; should be overridden
+            ..Default::default()
+        });
+
+        let merged = merge_segment_templates(Some(&repr), &adaptation, &Period::default()).unwrap();
+
+        assert_eq!(merged.media.as_deref(), Some("seg-$Number$.m4s"));
+        // Representation timescale (48 000) wins over AdaptationSet (1 000).
+        assert_eq!(merged.timescale, Some(48_000));
+        // startNumber: inherited from AdaptationSet because Representation doesn't set it.
+        assert_eq!(merged.startNumber, Some(5));
+    }
+
+    /// Period-level fallback: template only on Period, none lower.
+    #[test]
+    fn merge_period_level_fallback() {
+        let mut period = Period::default();
+        period.SegmentTemplate = Some(SegmentTemplate {
+            media: Some("s$Number$.m4s".into()),
+            timescale: Some(1_000),
+            duration: Some(2_000.0),
+            ..Default::default()
+        });
+
+        let merged =
+            merge_segment_templates(None, &AdaptationSet::default(), &period).unwrap();
+
+        assert_eq!(merged.media.as_deref(), Some("s$Number$.m4s"));
+        assert_eq!(merged.timescale, Some(1_000));
+    }
+
+    /// No SegmentTemplate at any level → `None`.
+    #[test]
+    fn merge_no_template_returns_none() {
+        assert!(merge_segment_templates(
+            Some(&Representation::default()),
+            &AdaptationSet::default(),
+            &Period::default()
+        )
+        .is_none());
+        assert!(merge_segment_templates(None, &AdaptationSet::default(), &Period::default())
+            .is_none());
+    }
+
+    // ── expand_template ───────────────────────────────────────────────────────
 
     #[test]
     fn expand_plain_number() {
