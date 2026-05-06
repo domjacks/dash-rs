@@ -12,6 +12,7 @@ use crate::{
         sink::{SourceBufferSink, StreamInfo},
         Chunk, MediaSource,
     },
+    mp4::parse_sidx,
 };
 
 // ── MediaType ─────────────────────────────────────────────────────────────────
@@ -670,6 +671,35 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         }
 
+        // Time-based EOS guard (mirrors dash.js ScheduleController):
+        //   signal EndOfStream when (timeToStreamEnd − bufferLevel) < ε
+        // This fires when the buffer already covers the tail of the stream,
+        // even before every declared segment has been individually counted.
+        {
+            let (total_segments, seg_dur_ms) = {
+                let track = self.track(&media_type)?;
+                (track.total_segments, track.segment_duration_ms)
+            };
+            if let Some(total) = total_segments {
+                const EOS_EPSILON: f64 = 0.00001;
+                let presentation_end_s = total as f64 * seg_dur_ms / 1000.0;
+                let current_time_s = self.estimated_playback_position_s();
+                let time_to_stream_end_s = (presentation_end_s - current_time_s).max(0.0);
+                let buffer_level_s = self.estimated_buffer_level_ms(&media_type) / 1000.0;
+                if time_to_stream_end_s - buffer_level_s < EOS_EPSILON {
+                    tracing::info!(
+                        media_type = %media_type,
+                        time_to_stream_end_s,
+                        buffer_level_s,
+                        "buffer covers end of stream — signalling EndOfStream"
+                    );
+                    return Err(DashError::EndOfStream {
+                        media_type: media_type.to_string(),
+                    });
+                }
+            }
+        }
+
         // Run ABR.
         let decision = {
             let track = self.track(&media_type)?;
@@ -791,10 +821,21 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
 
         // Build chunk and append.
+        // Parse sidx timing from the fetched data before consuming it.
+        let sidx = parse_sidx(&response.data);
+        if sidx.is_some() {
+            tracing::debug!(
+                media_type = %media_type,
+                segment_number = seg_number,
+                start_s = sidx.map(|s| s.start_s).unwrap_or(0.0),
+                end_s   = sidx.map(|s| s.end_s).unwrap_or(0.0),
+                "sidx timing extracted"
+            );
+        }
         let chunk = Chunk::new(
             response.data,
-            None, // Real implementations would parse the MP4 sidx/moov for timing.
-            None,
+            sidx.map(|s| s.start_s),
+            sidx.map(|s| s.end_s),
             format!("{}/{}", media_type, seg_number),
         );
 

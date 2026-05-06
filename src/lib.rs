@@ -47,10 +47,12 @@ pub mod error;
 pub mod fetch;
 pub mod manifest;
 pub mod media_source;
+pub mod mp4;
 pub mod session;
 
 // Top-level re-exports for the most commonly used types.
 pub use abr::{AbrController, AbrMetrics, QualityDecision};
 pub use error::DashError;
 pub use manifest::MPD;
+pub use mp4::{parse_sidx, SidxInfo};
 pub use session::{DashSession, MediaType};
