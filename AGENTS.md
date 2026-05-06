@@ -204,5 +204,4 @@ The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 - Multi-period playback.
 - Subtitle / text track handling.
 - DRM / Encrypted Media Extensions.
-- Microsoft Smooth Streaming (MSS).
 - MPD patch (`<Patch>` element).
