@@ -232,14 +232,20 @@ pub struct GstMediaSource {
     duration: Option<f64>,
     /// (mime_type, appsrc) for every source buffer that has been added.
     source_buffers: Vec<(String, gst_app::AppSrc)>,
-    /// When `true`, sink elements will have `sync=false` to prevent stalling
-    /// on absolute-timestamp CMAF live streams whose PTS values are on the
-    /// Unix epoch (≈ 1.778 × 10¹⁸ ns ahead of the monotonic pipeline clock).
+    /// When `true`, a PTS/DTS + SEGMENT remapping probe is installed on each
+    /// converter's sink pad by the `pad-added` callback.  The probe intercepts
+    /// the qtdemux `NEWSEGMENT` event (replacing it with a zeroed TIME segment)
+    /// and every decoded buffer (subtracting the first absolute PTS seen from
+    /// all subsequent PTS/DTS values).  This remaps absolute Unix-epoch
+    /// timestamps carried by CMAF live segments (e.g. BBC Two HD:
+    /// PTS ≈ 1.778 × 10¹⁸ ns) to relative values starting from zero, allowing
+    /// GStreamer's normal `sync=true` frame-pacing to work correctly.
     ///
     /// Set via [`Self::set_live_mode`] after the session is constructed but
-    /// before [`Self::set_playing`] is called.  Uses an `Arc<AtomicBool>`
-    /// because the same value must be readable from the `pad-added` GStreamer
-    /// streaming callback that fires after `set_playing`.
+    /// before [`Self::set_playing`] is called.  The `pad-added` callback reads
+    /// the flag lazily when it fires during preroll, so the ordering is correct
+    /// as long as `set_live_mode` is called before the pipeline transitions to
+    /// Playing.
     live_mode: Arc<AtomicBool>,
 }
 

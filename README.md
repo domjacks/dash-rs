@@ -27,8 +27,10 @@ JavaScript runtime.
 | `BufferOccupancyRule` | BOLA-inspired: maps buffer level to a Lyapunov utility score | `BolaRule.js` |
 | `InsufficientBufferRule` | Forces lowest quality when buffer falls below 2 s | `InsufficientBufferRule.js` |
 | `SwitchHistoryRule` | Prevents quality thrashing by enforcing an 8 s up-switch cooldown | `SwitchHistoryRule.js` |
+| `DroppedFramesRule` | Steps down quality when the decoder drop-frame ratio exceeds a threshold | `DroppedFramesRule.js` |
+| `AbandonRequestsRule` | Abandons an in-flight segment and switches down when effective download speed falls far below the current bitrate | `AbandonRequestRule.js` |
 
-The `AbrController` runs all four rules and takes the most conservative result.
+The `AbrController` runs all six rules and takes the most conservative result.
 
 ### MSE abstraction
 
@@ -368,9 +370,9 @@ Data flow per segment:
 
 ## What's not yet implemented
 
-- Live / dynamic MPD refresh (`ManifestUpdater`).
 - `SegmentList` and `SegmentBase` (byte-range) addressing — only `SegmentTemplate` with `$Number$` is currently supported.
 - `$Time$` template variable in `SegmentTemplate`.
 - Multi-period playback.
 - Subtitle / text track handling.
 - DRM / Encrypted Media Extensions.
+- MPD patch (`<Patch>` element).

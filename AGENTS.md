@@ -316,11 +316,15 @@ The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 ### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
 
 - **Absolute-timestamp live streams (BBC CMAF)**: handled by
-  `GstMediaSource::set_live_mode(true)`, which sets `sync=false` on the sink
-  elements wired by the `pad-added` callback.  This makes frames render as
-  they arrive rather than waiting for the monotonic pipeline clock to reach
-  the Unix-epoch PTS (≈ 1.778 × 10¹⁸ ns for BBC Two HD).  Call it after
-  `DashSession::from_url` and before `set_playing` whenever `session.is_live()`.
+  `GstMediaSource::set_live_mode(true)`, which installs a combined
+  `NEWSEGMENT` + `BUFFER` pad probe on each converter's sink pad.  The probe
+  replaces every qtdemux `NEWSEGMENT` event with a zeroed TIME segment
+  `{start=0, time=0, base=0}` and subtracts the first absolute PTS seen from
+  every decoded buffer's PTS and DTS.  This remaps Unix-epoch timestamps
+  (≈ 1.778 × 10¹⁸ ns for BBC Two HD) to relative values starting at zero so
+  that GStreamer's normal `sync=true` frame-pacing works correctly.  Call
+  `set_live_mode(true)` after `DashSession::from_url` and before `set_playing`
+  whenever `session.is_live()`.
 - `buffered()` only tracks ranges from chunks whose `Chunk::start`/`end` are set.
   DASH segments currently do not carry timing (they're set to `None`), so the
   buffer-occupancy ABR rule sees an empty range.  Work-around: parse the fMP4
