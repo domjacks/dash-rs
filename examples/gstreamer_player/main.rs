@@ -52,7 +52,7 @@ mod gst_media_source;
 
 use std::{
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
     },
     time::Instant,
@@ -65,9 +65,10 @@ use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     session::{DashSession, MediaType},
     DashError,
-};use gst_media_source::GstMediaSource;
-use gstreamer as gst;
+};
 use gst::prelude::*;
+use gst_media_source::GstMediaSource;
+use gstreamer as gst;
 use url::Url;
 
 // ── HttpSegmentFetcher ────────────────────────────────────────────────────────
@@ -108,8 +109,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
         })?;
 
         let status = resp.status().as_u16();
-        let final_url =
-            Url::parse(resp.url().as_str()).unwrap_or_else(|_| request.url.clone());
+        let final_url = Url::parse(resp.url().as_str()).unwrap_or_else(|_| request.url.clone());
 
         if !resp.status().is_success() {
             return Err(FetchError::Http {
@@ -141,15 +141,15 @@ impl SegmentFetcher for HttpSegmentFetcher {
     }
 
     async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let resp = self
-            .client
-            .head(url.as_str())
-            .send()
-            .await
-            .map_err(|e| FetchError::Network {
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+        let resp =
+            self.client
+                .head(url.as_str())
+                .send()
+                .await
+                .map_err(|e| FetchError::Network {
+                    url: url.clone(),
+                    message: e.to_string(),
+                })?;
         Ok(resp.status().is_success())
     }
 
@@ -159,14 +159,14 @@ impl SegmentFetcher for HttpSegmentFetcher {
 // ── Fetch / session task ──────────────────────────────────────────────────────
 
 /// BBC R&D Big Buck Bunny MPEG-DASH test stream (common-init variant).
-const DEFAULT_MPD_URL: &str =
-    "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
+const DEFAULT_MPD_URL: &str = "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
 
 /// Runs inside the tokio runtime on the background OS thread.
 async fn run_session(
     manifest_url: Url,
     media_source: GstMediaSource,
     throughput_tracker: Arc<AtomicU64>,
+    is_paused: Arc<AtomicBool>,
 ) -> Result<(), DashError> {
     let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
 
@@ -215,6 +215,10 @@ async fn run_session(
     // This mirrors dash.js reading dashMetrics.getCurrentBufferLevel().
     session.notify_playing();
 
+    // Track the previous pause state so we call notify_paused/notify_playing
+    // at most once per transition.
+    let mut session_paused = false;
+
     // ── Segment fetch loop — dash.js ScheduleController pattern ──────────────
     //
     // After each append completes, check estimated buffer level against the
@@ -228,8 +232,10 @@ async fn run_session(
     // fetching eagerly whenever the buffer is not yet full.
     const SCHEDULE_POLL_MS: u64 = 500; // dash.js scheduleTimeout default
 
-    println!("\n=== Fetching all segments (buffer target: {:.0} s) ===",
-        session.buffer_target_ms() / 1_000.0);
+    println!(
+        "\n=== Fetching all segments (buffer target: {:.0} s) ===",
+        session.buffer_target_ms() / 1_000.0
+    );
     println!(
         "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:<10}  {}",
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
@@ -248,6 +254,25 @@ async fn run_session(
         }
 
         seg += 1;
+
+        // Sync pause state with the GLib bus watch's atomic flag.
+        let currently_paused = is_paused.load(Ordering::Relaxed);
+        if currently_paused != session_paused {
+            if currently_paused {
+                session.notify_paused();
+            } else {
+                session.notify_playing();
+            }
+            session_paused = currently_paused;
+        }
+
+        // Prune old buffer data to bound memory usage.
+        // Use the wall-clock position estimate when a GStreamer query is not
+        // easily available from this thread.
+        let pos_s = session.estimated_playback_position_s();
+        session
+            .prune_all_tracks(pos_s, session.buffer_to_keep_s())
+            .await?;
 
         // ── Video: gate on buffer level, then fetch ──────────────────────────
         // (type alias avoids repeating the tuple annotation)
@@ -271,7 +296,11 @@ async fn run_session(
 
             let t_video = Instant::now();
             match session.fetch_next_segment(MediaType::Video, &metrics).await {
-                Ok(d) => Some((d.index, format!("{:?}", d.reason), t_video.elapsed().as_millis())),
+                Ok(d) => Some((
+                    d.index,
+                    format!("{:?}", d.reason),
+                    t_video.elapsed().as_millis(),
+                )),
                 Err(DashError::EndOfStream { .. }) => {
                     video_done = true;
                     None
@@ -300,7 +329,10 @@ async fn run_session(
             let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
             let aud_buf_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
             let audio_metrics = AbrMetrics::new(throughput_bps, aud_buf_ms);
-            match session.fetch_next_segment(MediaType::Audio, &audio_metrics).await {
+            match session
+                .fetch_next_segment(MediaType::Audio, &audio_metrics)
+                .await
+            {
                 Ok(d) => Some((d.index, format!("{:?}", d.reason))),
                 Err(DashError::EndOfStream { .. }) => {
                     audio_done = true;
@@ -367,9 +399,7 @@ fn run() {
     // calling it here first gives cleaner error messages).
     if let Err(e) = gst::init() {
         eprintln!("fatal: GStreamer init failed: {e}");
-        eprintln!(
-            "hint: ensure GStreamer ≥ 1.14 is installed (brew install gstreamer)"
-        );
+        eprintln!("hint: ensure GStreamer ≥ 1.14 is installed (brew install gstreamer)");
         std::process::exit(1);
     }
 
@@ -396,6 +426,10 @@ fn run() {
     // Shared throughput tracker.
     let throughput_tracker = Arc::new(AtomicU64::new(0u64));
 
+    // Shared pause-state flag updated from the GLib bus watch on the main
+    // thread and read by the background fetch loop.
+    let is_paused = Arc::new(AtomicBool::new(false));
+
     // Channel used to receive the fetch result from the background thread.
     let (done_tx, done_rx) = mpsc::channel::<Result<(), DashError>>();
 
@@ -403,6 +437,7 @@ fn run() {
     // session.  This keeps the main thread free for GStreamer's bus loop
     // (required for macOS video-sink rendering).
     let throughput_tracker_bg = Arc::clone(&throughput_tracker);
+    let is_paused_bg = Arc::clone(&is_paused);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -413,6 +448,7 @@ fn run() {
             manifest_url,
             media_source,
             throughput_tracker_bg,
+            is_paused_bg,
         ));
 
         done_tx.send(result).ok();
@@ -432,7 +468,8 @@ fn run() {
 
     // Bus watch — callback fires on the GLib main context (main thread).
     let main_loop_w = main_loop.clone();
-    let pipeline_w  = pipeline.clone();
+    let pipeline_w = pipeline.clone();
+    let is_paused_w = Arc::clone(&is_paused);
     let _watch = bus
         .add_watch(move |_bus, msg| {
             use gst::MessageView;
@@ -467,9 +504,12 @@ fn run() {
                 MessageView::StateChanged(sc) => {
                     // Only log top-level pipeline state changes.
                     if msg.src().map(|s| *s == pipeline_w).unwrap_or(false) {
+                        let new_state = sc.current();
+                        // Propagate pause/resume to the fetch loop.
+                        is_paused_w.store(new_state == gst::State::Paused, Ordering::Relaxed);
                         tracing::info!(
                             old = ?sc.old(),
-                            new = ?sc.current(),
+                            new = ?new_state,
                             "pipeline state changed"
                         );
                     }
@@ -483,17 +523,17 @@ fn run() {
     // Periodic check for fetch errors that arrive before GStreamer EOS.
     // The timer fires on the same GLib main context as the bus watch.
     let main_loop_t = main_loop.clone();
-    let _timer = gst::glib::timeout_add(
-        std::time::Duration::from_millis(200),
-        move || match done_rx.try_recv() {
+    let _timer =
+        gst::glib::timeout_add(std::time::Duration::from_millis(200), move || match done_rx
+            .try_recv()
+        {
             Ok(Err(e)) => {
                 eprintln!("fetch error: {e}");
                 main_loop_t.quit();
                 gst::glib::ControlFlow::Break
             }
             _ => gst::glib::ControlFlow::Continue,
-        },
-    );
+        });
 
     // Blocks here, running the GLib / CFRunLoop event loop on the main
     // thread.  autovideosink can now create its Cocoa window.

@@ -57,7 +57,12 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub fn new(data: Bytes, start: Option<f64>, end: Option<f64>, label: impl Into<String>) -> Self {
+    pub fn new(
+        data: Bytes,
+        start: Option<f64>,
+        end: Option<f64>,
+        label: impl Into<String>,
+    ) -> Self {
         Self {
             data,
             start,
@@ -152,10 +157,7 @@ pub trait MediaSource: Send {
 
     /// Create and attach a new [`SourceBuffer`] for the given MIME type.
     /// Only valid while `Open`.
-    fn add_source_buffer(
-        &mut self,
-        mime_type: &str,
-    ) -> Result<Box<dyn SourceBuffer>, DashError>;
+    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError>;
 
     /// Detach and discard the source buffer for the given MIME type.
     fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError>;

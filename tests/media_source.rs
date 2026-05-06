@@ -41,7 +41,10 @@ fn stub_media_source_add_and_remove_source_buffer() {
 
     // Removing a non-existent buffer should error.
     let result = ms.remove_source_buffer("video/mp4");
-    assert!(matches!(result, Err(DashError::SourceBufferNotFound { .. })));
+    assert!(matches!(
+        result,
+        Err(DashError::SourceBufferNotFound { .. })
+    ));
 }
 
 #[test]
@@ -68,7 +71,12 @@ async fn stub_source_buffer_append_and_buffered() {
     assert!(!buf.is_updating());
     assert!(buf.buffered().is_empty());
 
-    let chunk = Chunk::new(Bytes::from_static(b"\x00\x01\x02"), Some(0.0), Some(4.0), "seg-1");
+    let chunk = Chunk::new(
+        Bytes::from_static(b"\x00\x01\x02"),
+        Some(0.0),
+        Some(4.0),
+        "seg-1",
+    );
     buf.append_buffer(chunk).await.unwrap();
 
     let ranges = buf.buffered();
@@ -81,12 +89,22 @@ async fn stub_source_buffer_append_and_buffered() {
 async fn stub_source_buffer_merges_adjacent_ranges() {
     let mut buf = StubSourceBuffer::new("video/mp4");
 
-    buf.append_buffer(Chunk::new(Bytes::from_static(b"a"), Some(0.0), Some(4.0), "seg-1"))
-        .await
-        .unwrap();
-    buf.append_buffer(Chunk::new(Bytes::from_static(b"b"), Some(4.0), Some(8.0), "seg-2"))
-        .await
-        .unwrap();
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"a"),
+        Some(0.0),
+        Some(4.0),
+        "seg-1",
+    ))
+    .await
+    .unwrap();
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"b"),
+        Some(4.0),
+        Some(8.0),
+        "seg-2",
+    ))
+    .await
+    .unwrap();
 
     // Adjacent segments should be merged into one range.
     let ranges = buf.buffered();
@@ -99,13 +117,23 @@ async fn stub_source_buffer_merges_adjacent_ranges() {
 async fn stub_source_buffer_keeps_discontinuous_ranges_separate() {
     let mut buf = StubSourceBuffer::new("video/mp4");
 
-    buf.append_buffer(Chunk::new(Bytes::from_static(b"a"), Some(0.0), Some(4.0), "seg-1"))
-        .await
-        .unwrap();
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"a"),
+        Some(0.0),
+        Some(4.0),
+        "seg-1",
+    ))
+    .await
+    .unwrap();
     // Gap: segment 2 is missing.
-    buf.append_buffer(Chunk::new(Bytes::from_static(b"c"), Some(8.0), Some(12.0), "seg-3"))
-        .await
-        .unwrap();
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"c"),
+        Some(8.0),
+        Some(12.0),
+        "seg-3",
+    ))
+    .await
+    .unwrap();
 
     let ranges = buf.buffered();
     assert_eq!(ranges.len(), 2);
@@ -120,9 +148,14 @@ async fn stub_source_buffer_remove_clears_range() {
     for i in 0u32..5 {
         let start = (i * 4) as f64;
         let end = start + 4.0;
-        buf.append_buffer(Chunk::new(Bytes::from_static(b"x"), Some(start), Some(end), "seg"))
-            .await
-            .unwrap();
+        buf.append_buffer(Chunk::new(
+            Bytes::from_static(b"x"),
+            Some(start),
+            Some(end),
+            "seg",
+        ))
+        .await
+        .unwrap();
     }
 
     // Remove the first 8 seconds.

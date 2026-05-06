@@ -19,6 +19,24 @@ pub struct AbrMetrics {
     /// The index into the representation list that is currently playing.
     /// `None` if playback has not yet started.
     pub current_index: Option<usize>,
+
+    /// Number of video frames dropped by the decoder since the last metrics
+    /// snapshot. Set by the caller from renderer statistics (e.g.
+    /// `GstVideoDecoder` dropped-frame counters).  `None` if unavailable.
+    pub dropped_frames: Option<u64>,
+
+    /// Total video frames decoded (presented + dropped) since the last metrics
+    /// snapshot. Used with [`Self::dropped_frames`] to compute the drop ratio.
+    /// `None` if unavailable.
+    pub total_decoded_frames: Option<u64>,
+
+    /// Ratio of the effective in-flight download speed to the current
+    /// representation bitrate.  Set by the session when it detects that an
+    /// in-flight segment is downloading more slowly than its playback deadline
+    /// requires.  A value below `0.5` triggers [`AbandonRequestsRule`].
+    ///
+    /// [`AbandonRequestsRule`]: crate::abr::abandon_requests::AbandonRequestsRule
+    pub effective_download_ratio: Option<f64>,
 }
 
 impl AbrMetrics {
@@ -28,6 +46,9 @@ impl AbrMetrics {
             buffer_level_ms,
             latency_ms: 0.0,
             current_index: None,
+            dropped_frames: None,
+            total_decoded_frames: None,
+            effective_download_ratio: None,
         }
     }
 }

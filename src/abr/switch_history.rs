@@ -1,7 +1,10 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use crate::abr::{metrics::AbrMetrics, rule::{AbrRule, RepresentationInfo}};
+use crate::abr::{
+    metrics::AbrMetrics,
+    rule::{AbrRule, RepresentationInfo},
+};
 
 /// Minimum time between consecutive upward quality switches.
 const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(8);

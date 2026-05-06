@@ -1,5 +1,7 @@
+pub mod abandon_requests;
 pub mod buffer;
 pub mod decision;
+pub mod dropped_frames;
 pub mod insufficient_buffer;
 pub mod metrics;
 pub mod rule;
@@ -11,10 +13,9 @@ pub use metrics::AbrMetrics;
 pub use rule::{AbrRule, RepresentationInfo};
 
 use crate::abr::{
-    buffer::BufferOccupancyRule,
-    insufficient_buffer::InsufficientBufferRule,
-    switch_history::SwitchHistoryRule,
-    throughput::ThroughputRule,
+    abandon_requests::AbandonRequestsRule, buffer::BufferOccupancyRule,
+    dropped_frames::DroppedFramesRule, insufficient_buffer::InsufficientBufferRule,
+    switch_history::SwitchHistoryRule, throughput::ThroughputRule,
 };
 
 /// Aggregates multiple [`AbrRule`]s and returns a single [`QualityDecision`].
@@ -30,13 +31,15 @@ pub struct AbrController {
 }
 
 impl Default for AbrController {
-    /// Creates a controller with the standard four-rule pipeline.
+    /// Creates a controller with the standard rule pipeline.
     fn default() -> Self {
         Self {
             rules: vec![
                 Box::new(ThroughputRule::default()),
                 Box::new(BufferOccupancyRule::default()),
                 Box::new(InsufficientBufferRule::default()),
+                Box::new(DroppedFramesRule),
+                Box::new(AbandonRequestsRule),
             ],
             switch_history: SwitchHistoryRule::default(),
         }
@@ -82,6 +85,8 @@ impl AbrController {
                     reason = match rule.name() {
                         "InsufficientBufferRule" => AbrDecisionReason::InsufficientBuffer,
                         "BufferOccupancyRule" => AbrDecisionReason::BufferOccupancyBased,
+                        "DroppedFramesRule" => AbrDecisionReason::DroppedFrames,
+                        "AbandonRequestsRule" => AbrDecisionReason::RequestAbandoned,
                         _ => AbrDecisionReason::ThroughputBased,
                     };
                 }

@@ -46,9 +46,9 @@
 
 use async_trait::async_trait;
 // Conventional short aliases used throughout the gstreamer-rs ecosystem.
+use gst::prelude::*;
 use gstreamer as gst;
 use gstreamer_app as gst_app;
-use gst::prelude::*;
 
 use dash_rs::{
     error::DashError,
@@ -234,8 +234,7 @@ impl GstMediaSource {
     ///
     /// Calls [`gst::init`] if GStreamer has not been initialised yet.
     pub fn new() -> Result<Self, DashError> {
-        gst::init()
-            .map_err(|e| DashError::AppendFailed(format!("gst::init failed: {e}")))?;
+        gst::init().map_err(|e| DashError::AppendFailed(format!("gst::init failed: {e}")))?;
 
         // On macOS, VideoToolbox (`vtdec` / `vtdec_hw`) requires `codec_data`
         // to be present in the H.264 caps *before* its first frame.  For
@@ -345,9 +344,7 @@ impl MediaSource for GstMediaSource {
         let decodebin = gst::ElementFactory::make("decodebin")
             .name(format!("decodebin-{track_tag}"))
             .build()
-            .map_err(|e| {
-                DashError::AppendFailed(format!("failed to create decodebin: {e}"))
-            })?;
+            .map_err(|e| DashError::AppendFailed(format!("failed to create decodebin: {e}")))?;
 
         // ── Add to pipeline and link the static part ─────────────────────────
         self.pipeline

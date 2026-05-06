@@ -1,4 +1,7 @@
-use crate::abr::{metrics::AbrMetrics, rule::{AbrRule, RepresentationInfo}};
+use crate::abr::{
+    metrics::AbrMetrics,
+    rule::{AbrRule, RepresentationInfo},
+};
 
 /// Target buffer level in ms: the level we aim to maintain.
 const TARGET_BUFFER_MS: f64 = 12_000.0;
@@ -60,8 +63,7 @@ impl AbrRule for BufferOccupancyRule {
         }
 
         let min_bandwidth = representations[0].bandwidth as f64;
-        let buffer_norm =
-            (metrics.buffer_level_ms / self.max_buffer_ms).clamp(0.0, 1.0);
+        let buffer_norm = (metrics.buffer_level_ms / self.max_buffer_ms).clamp(0.0, 1.0);
 
         let mut best_index = 0;
         let mut best_score = f64::NEG_INFINITY;

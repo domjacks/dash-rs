@@ -74,8 +74,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
 
         let status = resp.status().as_u16();
         // Capture the final URL before consuming the response body.
-        let final_url =
-            Url::parse(resp.url().as_str()).unwrap_or_else(|_| request.url.clone());
+        let final_url = Url::parse(resp.url().as_str()).unwrap_or_else(|_| request.url.clone());
 
         if !resp.status().is_success() {
             return Err(FetchError::Http {
@@ -108,15 +107,15 @@ impl SegmentFetcher for HttpSegmentFetcher {
     }
 
     async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let resp = self
-            .client
-            .head(url.as_str())
-            .send()
-            .await
-            .map_err(|e| FetchError::Network {
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+        let resp =
+            self.client
+                .head(url.as_str())
+                .send()
+                .await
+                .map_err(|e| FetchError::Network {
+                    url: url.clone(),
+                    message: e.to_string(),
+                })?;
         Ok(resp.status().is_success())
     }
 
@@ -131,8 +130,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
 /// BBC R&D Big Buck Bunny MPEG-DASH test stream (common-init variant).
 /// Uses `SegmentTemplate` with `$Number$` addressing — compatible with the
 /// current `resolve_segment_url` implementation.
-const DEFAULT_MPD_URL: &str =
-    "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
+const DEFAULT_MPD_URL: &str = "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
 
 /// Number of media segments to fetch per track after the init segment.
 const SEGMENTS_TO_FETCH: u32 = 4;
@@ -212,8 +210,7 @@ async fn main() -> Result<(), DashError> {
 
     for seg in 1..=SEGMENTS_TO_FETCH {
         // Read throughput measured by the fetcher during the previous segment.
-        let throughput_bps =
-            f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+        let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
         // Simple buffer model: assume each segment is 4 seconds of content.
         let buffer_level_ms = (seg as f64) * 4_000.0;
         let metrics = AbrMetrics::new(throughput_bps, buffer_level_ms);
@@ -229,8 +226,7 @@ async fn main() -> Result<(), DashError> {
             .await?;
 
         // Re-read throughput after both fetches for the next iteration.
-        let measured_bps =
-            f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+        let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
 
         println!(
             "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps measured)",

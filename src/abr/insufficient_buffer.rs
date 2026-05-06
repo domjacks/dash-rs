@@ -1,4 +1,7 @@
-use crate::abr::{metrics::AbrMetrics, rule::{AbrRule, RepresentationInfo}};
+use crate::abr::{
+    metrics::AbrMetrics,
+    rule::{AbrRule, RepresentationInfo},
+};
 
 /// Buffer level below which this rule forces the lowest quality, in ms.
 const CRITICAL_BUFFER_THRESHOLD_MS: f64 = 2_000.0;

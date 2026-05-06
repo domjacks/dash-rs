@@ -13,6 +13,11 @@ pub enum AbrDecisionReason {
     SwitchHistoryThrottle,
     /// The quality was clamped to the lowest level due to a rule override.
     Override,
+    /// Down-switch forced because the decoder is dropping too many frames.
+    DroppedFrames,
+    /// Down-switch forced because the in-flight segment download was abandoned
+    /// for being too slow relative to the representation bitrate.
+    RequestAbandoned,
 }
 
 /// The output from [`crate::abr::AbrController`]: which representation index

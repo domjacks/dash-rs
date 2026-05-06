@@ -15,7 +15,9 @@ pub enum DashError {
 
     // --- Media source errors ---
     #[error("media source is not open (ready state: {state:?})")]
-    MediaSourceNotOpen { state: crate::media_source::ReadyState },
+    MediaSourceNotOpen {
+        state: crate::media_source::ReadyState,
+    },
 
     #[error("source buffer not found for mime type: {mime_type}")]
     SourceBufferNotFound { mime_type: String },
@@ -47,4 +49,18 @@ pub enum DashError {
     /// [`crate::session::DashSession::end_of_stream`] and stop the fetch loop.
     #[error("end of stream: no more segments for {media_type}")]
     EndOfStream { media_type: String },
+
+    /// Every `BaseURL` candidate for a segment was tried and all failed.
+    ///
+    /// The last underlying error is included for diagnostics.
+    #[error("all CDN base URLs failed for segment (last error: {last_error})")]
+    AllBaseUrlsFailed { last_error: String },
+
+    /// A segment fetch was abandoned because it was taking too long.
+    ///
+    /// Triggered when [`crate::session::DashSession::set_abandon_timeout_ms`]
+    /// is set and the fetch does not complete within the configured duration.
+    /// The caller should lower quality and retry.
+    #[error("segment fetch abandoned (too slow) for {media_type}")]
+    SegmentAbandoned { media_type: String },
 }

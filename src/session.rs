@@ -1,15 +1,15 @@
 use std::{sync::Arc, time::Instant};
 
-use dash_mpd::{AdaptationSet, Period, SegmentTemplate, MPD};
+use dash_mpd::{AdaptationSet, BaseURL, Period, SegmentTemplate, MPD};
 use url::Url;
 
 use crate::{
     abr::{AbrController, AbrMetrics, QualityDecision, RepresentationInfo},
     error::DashError,
-    fetch::{FetchRequest, RequestType, SegmentFetcher},
+    fetch::{FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     manifest::ManifestLoader,
     media_source::{
-        sink::SourceBufferSink,
+        sink::{SourceBufferSink, StreamInfo},
         Chunk, MediaSource,
     },
 };
@@ -135,6 +135,27 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// Wall-clock instant when the pipeline transitioned to Playing.  Set by
     /// [`Self::notify_playing`]; used for buffer-level estimation.
     playback_started_at: Option<Instant>,
+    /// True while the pipeline is in the Paused state.
+    paused: bool,
+    /// Wall-clock instant when the pipeline entered Paused.  Used to track
+    /// cumulative paused time so buffer-level estimates stay accurate.
+    paused_at: Option<Instant>,
+    /// Cumulative milliseconds spent in the Paused state since playback
+    /// started.  Subtracted from the elapsed wall-clock time in
+    /// [`Self::estimated_buffer_level_ms`].
+    total_paused_ms: f64,
+    /// When `true`, the fetch loop continues even while the pipeline is
+    /// paused — mirrors `scheduleWhilePaused` in dash.js's
+    /// `ScheduleController`.  Defaults to `false`.
+    schedule_while_paused: bool,
+    /// How much buffer (in seconds) to preserve behind the current playback
+    /// position when [`Self::prune_all_tracks`] is called.  Default 30 s.
+    buffer_to_keep_s: f64,
+    /// Optional maximum duration (in milliseconds) to wait for a single
+    /// segment fetch before returning [`DashError::SegmentAbandoned`].
+    /// `None` disables the timeout.  Mirrors `AbandonRequestsRule`'s
+    /// role in dash.js.
+    abandon_timeout_ms: Option<u64>,
 }
 
 // Re-export for convenience in the example.
@@ -187,10 +208,41 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             if !reps.is_empty() {
                 let mime = adaptation_mime_type(adaptation);
                 let sink_buf = media_source.add_source_buffer(&mime)?;
-                let sink = SourceBufferSink::new(sink_buf);
+                let mut sink = SourceBufferSink::new(sink_buf);
+
+                // Wire append window from period/stream boundaries.
+                let effective_duration = presentation_duration.or(period.duration);
+                let stream_info = StreamInfo {
+                    start: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                    duration: effective_duration.map(|d| d.as_secs_f64()),
+                };
+                sink.update_append_window(
+                    &stream_info,
+                    presentation_duration.map(|d| d.as_secs_f64()),
+                );
+
+                // Wire timestamp offset from SegmentTemplate@presentationTimeOffset.
+                let tmpl = adaptation
+                    .SegmentTemplate
+                    .as_ref()
+                    .or(period.SegmentTemplate.as_ref());
+                if let Some(t) = tmpl {
+                    if let Some(pto) = t.presentationTimeOffset {
+                        let ts = t.timescale.unwrap_or(1);
+                        sink.set_timestamp_offset(pto as f64 / ts as f64);
+                    }
+                }
+
                 let (start_number, seg_dur_ms, total_segments) =
                     extract_segment_timing(adaptation, period, presentation_duration);
-                Some(TrackState::new(MediaType::Video, reps, sink, start_number, seg_dur_ms, total_segments))
+                Some(TrackState::new(
+                    MediaType::Video,
+                    reps,
+                    sink,
+                    start_number,
+                    seg_dur_ms,
+                    total_segments,
+                ))
             } else {
                 None
             }
@@ -203,10 +255,41 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             if !reps.is_empty() {
                 let mime = adaptation_mime_type(adaptation);
                 let sink_buf = media_source.add_source_buffer(&mime)?;
-                let sink = SourceBufferSink::new(sink_buf);
+                let mut sink = SourceBufferSink::new(sink_buf);
+
+                // Wire append window from period/stream boundaries.
+                let effective_duration = presentation_duration.or(period.duration);
+                let stream_info = StreamInfo {
+                    start: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+                    duration: effective_duration.map(|d| d.as_secs_f64()),
+                };
+                sink.update_append_window(
+                    &stream_info,
+                    presentation_duration.map(|d| d.as_secs_f64()),
+                );
+
+                // Wire timestamp offset from SegmentTemplate@presentationTimeOffset.
+                let tmpl = adaptation
+                    .SegmentTemplate
+                    .as_ref()
+                    .or(period.SegmentTemplate.as_ref());
+                if let Some(t) = tmpl {
+                    if let Some(pto) = t.presentationTimeOffset {
+                        let ts = t.timescale.unwrap_or(1);
+                        sink.set_timestamp_offset(pto as f64 / ts as f64);
+                    }
+                }
+
                 let (start_number, seg_dur_ms, total_segments) =
                     extract_segment_timing(adaptation, period, presentation_duration);
-                Some(TrackState::new(MediaType::Audio, reps, sink, start_number, seg_dur_ms, total_segments))
+                Some(TrackState::new(
+                    MediaType::Audio,
+                    reps,
+                    sink,
+                    start_number,
+                    seg_dur_ms,
+                    total_segments,
+                ))
             } else {
                 None
             }
@@ -224,6 +307,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             audio_track,
             buffer_target_ms: 12_000.0,
             playback_started_at: None,
+            paused: false,
+            paused_at: None,
+            total_paused_ms: 0.0,
+            schedule_while_paused: false,
+            buffer_to_keep_s: 30.0,
+            abandon_timeout_ms: None,
         })
     }
 
@@ -285,6 +374,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             buffer_level_ms,
             latency_ms: 0.0,
             current_index,
+            dropped_frames: None,
+            total_decoded_frames: None,
+            effective_download_ratio: None,
         }
     }
 
@@ -292,13 +384,58 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Record that the pipeline has entered Playing state.
     ///
-    /// Call this immediately after your media source transitions to Playing so
-    /// that [`Self::estimated_buffer_level_ms`] can subtract elapsed playback
-    /// time from the pushed content duration — mirroring the way dash.js reads
-    /// `dashMetrics.getCurrentBufferLevel()` to decide whether to schedule the
-    /// next fetch.
+    /// - On the **first** call (before any pause): records the wall-clock
+    ///   instant that playback started so [`Self::estimated_buffer_level_ms`]
+    ///   can subtract elapsed playing time.
+    /// - On subsequent calls after a pause: accumulates the paused duration
+    ///   into `total_paused_ms` and marks the session as no longer paused.
+    ///
+    /// Mirrors the way dash.js reacts to `PLAYBACK_PLAYING` events in
+    /// `ScheduleController`.
     pub fn notify_playing(&mut self) {
-        self.playback_started_at = Some(Instant::now());
+        if self.paused {
+            // Resuming from pause: accumulate the time spent paused.
+            if let Some(paused_at) = self.paused_at.take() {
+                self.total_paused_ms += paused_at.elapsed().as_millis() as f64;
+            }
+            self.paused = false;
+        } else {
+            // First transition to Playing: record the start instant.
+            self.playback_started_at = Some(Instant::now());
+            self.total_paused_ms = 0.0;
+        }
+    }
+
+    /// Record that the pipeline has entered Paused state.
+    ///
+    /// Freezes the wall-clock used by [`Self::estimated_buffer_level_ms`] so
+    /// that buffer estimates do not drift while the player is paused.
+    /// Call [`Self::notify_playing`] to resume the clock.
+    ///
+    /// Mirrors the way dash.js reacts to `PLAYBACK_PAUSED` events in
+    /// `ScheduleController`.
+    pub fn notify_paused(&mut self) {
+        if !self.paused {
+            self.paused = true;
+            self.paused_at = Some(Instant::now());
+        }
+    }
+
+    /// Whether the session is currently tracking a paused pipeline.
+    pub fn is_paused(&self) -> bool {
+        self.paused
+    }
+
+    /// Whether the fetch loop should continue to run while the pipeline is
+    /// paused.  Mirrors `scheduleWhilePaused` in dash.js's
+    /// `ScheduleController`.  Default `false`.
+    pub fn schedule_while_paused(&self) -> bool {
+        self.schedule_while_paused
+    }
+
+    /// Set whether the fetch loop continues during pause.
+    pub fn set_schedule_while_paused(&mut self, v: bool) {
+        self.schedule_while_paused = v;
     }
 
     /// Estimated buffer level ahead of the current playback position, in
@@ -308,6 +445,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// This is a wall-clock approximation: it assumes the pipeline plays at
     /// exactly real-time speed, which is true for a non-live pipeline with
     /// correct timestamps.
+    ///
+    /// Time spent paused is subtracted so that pausing does not inflate the
+    /// reported buffer level.
     ///
     /// Returns `0.0` before any segments have been fetched or if the estimate
     /// would be negative (buffer empty / stall condition).
@@ -320,9 +460,43 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
         let elapsed_ms = self
             .playback_started_at
-            .map(|t| t.elapsed().as_millis() as f64)
+            .map(|started| {
+                let total_elapsed = started.elapsed().as_millis() as f64;
+                // Subtract time spent paused, including any ongoing pause.
+                let current_pause_ms = if self.paused {
+                    self.paused_at
+                        .map(|pa| pa.elapsed().as_millis() as f64)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                (total_elapsed - self.total_paused_ms - current_pause_ms).max(0.0)
+            })
             .unwrap_or(0.0);
         (pushed_ms - elapsed_ms).max(0.0)
+    }
+
+    /// Estimated wall-clock seconds elapsed since playback started, excluding
+    /// time spent paused.
+    ///
+    /// Useful as a coarse `current_time` value for [`Self::prune_all_tracks`]
+    /// when the caller does not have direct access to the renderer position
+    /// (e.g. from a background async task that owns the session but cannot
+    /// query GStreamer's pipeline position).
+    pub fn estimated_playback_position_s(&self) -> f64 {
+        self.playback_started_at
+            .map(|started| {
+                let total_elapsed = started.elapsed().as_millis() as f64;
+                let current_pause_ms = if self.paused {
+                    self.paused_at
+                        .map(|pa| pa.elapsed().as_millis() as f64)
+                        .unwrap_or(0.0)
+                } else {
+                    0.0
+                };
+                ((total_elapsed - self.total_paused_ms - current_pause_ms) / 1_000.0).max(0.0)
+            })
+            .unwrap_or(0.0)
     }
 
     /// The buffer fill target in milliseconds.
@@ -339,7 +513,81 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.buffer_target_ms = ms;
     }
 
+    /// How much buffer to keep behind the playback position when pruning.
+    pub fn buffer_to_keep_s(&self) -> f64 {
+        self.buffer_to_keep_s
+    }
 
+    /// Override the behind-playback buffer retention window.
+    pub fn set_buffer_to_keep_s(&mut self, s: f64) {
+        self.buffer_to_keep_s = s;
+    }
+
+    /// The segment-fetch abandon timeout in milliseconds, or `None` if
+    /// disabled.
+    pub fn abandon_timeout_ms(&self) -> Option<u64> {
+        self.abandon_timeout_ms
+    }
+
+    /// Set (or clear) the per-segment fetch timeout.
+    ///
+    /// When set, each segment fetch that does not complete within `ms`
+    /// milliseconds returns [`DashError::SegmentAbandoned`].  The caller
+    /// should then lower quality and retry at the next opportunity.
+    pub fn set_abandon_timeout_ms(&mut self, ms: Option<u64>) {
+        self.abandon_timeout_ms = ms;
+    }
+
+    // ── Buffer pruning ────────────────────────────────────────────────────────
+
+    /// Remove buffered data older than `current_time_s − buffer_to_keep_behind_s`
+    /// from all tracks.
+    ///
+    /// Call this periodically from the fetch loop (after each segment or on a
+    /// timer) to prevent unbounded memory growth.  Mirrors
+    /// `BufferController.pruneBuffer()` / `SourceBufferSink.remove()` in
+    /// dash.js.
+    ///
+    /// `current_time_s` — the current playback position in seconds.  Use
+    /// [`Self::estimated_playback_position_s`] if no renderer-provided value
+    /// is available.
+    ///
+    /// `buffer_to_keep_behind_s` — how many seconds of data to retain behind
+    /// the playback position (default comes from [`Self::buffer_to_keep_s`]).
+    ///
+    /// Does nothing (returns `Ok(())`) when `current_time_s − buffer_to_keep_behind_s ≤ 0`.
+    pub async fn prune_all_tracks(
+        &mut self,
+        current_time_s: f64,
+        buffer_to_keep_behind_s: f64,
+    ) -> Result<(), DashError> {
+        let prune_end = (current_time_s - buffer_to_keep_behind_s).max(0.0);
+        if prune_end <= 0.0 {
+            return Ok(());
+        }
+
+        if let Some(track) = self.video_track.as_mut() {
+            Self::prune_sink(&mut track.sink, prune_end).await?;
+        }
+        if let Some(track) = self.audio_track.as_mut() {
+            Self::prune_sink(&mut track.sink, prune_end).await?;
+        }
+        Ok(())
+    }
+
+    async fn prune_sink(sink: &mut SourceBufferSink, prune_end: f64) -> Result<(), DashError> {
+        let ranges: Vec<_> = sink.buffered();
+        for range in ranges {
+            if range.end <= prune_end {
+                sink.remove(range.start, range.end).await?;
+            } else if range.start < prune_end {
+                sink.remove(range.start, prune_end).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // ── ABR ───────────────────────────────────────────────────────────────────
 
     /// Run the ABR controller and return the recommended quality for the
     /// given media type without changing any state.
@@ -387,6 +635,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// The `metrics` parameter should reflect the most recent throughput and
     /// buffer measurements so the ABR rules can react.
+    ///
+    /// If [`Self::set_abandon_timeout_ms`] is configured and the fetch does
+    /// not complete in time, returns [`DashError::SegmentAbandoned`].
+    ///
+    /// Multiple `BaseURL` candidates at the `Period` and `AdaptationSet`
+    /// levels are tried in priority order (per DASH spec §5.10.1.3) with
+    /// weight-based random ordering within each priority tier.  If every
+    /// candidate fails, returns [`DashError::AllBaseUrlsFailed`].
     ///
     /// Returns the [`QualityDecision`] that was applied, or
     /// [`DashError::EndOfStream`] when all segments declared by
@@ -436,25 +692,98 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         }
 
-        // Build the segment URL.
-        let (segment_url, seg_number) = {
+        // Build the expanded segment path and collect CDN candidate base URLs.
+        // All borrows of `self` are released before the async fetch loop.
+        let (candidates, expanded_path, seg_number) = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
             let seg_num = track.segment_number;
-            let url = self.resolve_segment_url(&media_type, rep, seg_num)?;
-            (url, seg_num)
+
+            let period = &self.mpd.periods[0];
+            let adaptation = find_adaptation(period, &media_type).ok_or_else(|| {
+                DashError::NoRepresentations {
+                    media_type: media_type.to_string(),
+                }
+            })?;
+
+            let template = adaptation
+                .SegmentTemplate
+                .as_ref()
+                .or(period.SegmentTemplate.as_ref())
+                .ok_or(DashError::SegmentUrlUnresolvable)?;
+
+            let media_tmpl = template
+                .media
+                .as_deref()
+                .ok_or(DashError::SegmentUrlUnresolvable)?;
+
+            let path = expand_template(media_tmpl, &rep.id, rep.bandwidth, seg_num);
+            let candidates = collect_candidate_base_urls(&self.base_url, period, adaptation);
+            (candidates, path, seg_num)
         };
 
-        tracing::debug!(
-            media_type = %media_type,
-            segment_number = seg_number,
-            url = %segment_url,
-            "fetching segment"
-        );
+        // Fetch — try each CDN candidate in priority order.
+        let fetcher = Arc::clone(&self.fetcher);
+        let abandon_ms = self.abandon_timeout_ms;
+        let mt_str = media_type.to_string();
 
-        // Fetch.
-        let request = FetchRequest::new(segment_url.clone(), RequestType::MediaSegment);
-        let response = self.fetcher.fetch(request).await?;
+        let mut last_err: DashError = DashError::AllBaseUrlsFailed {
+            last_error: "no candidates".into(),
+        };
+        let mut opt_response: Option<FetchResponse> = None;
+
+        'candidates: for base in &candidates {
+            let segment_url = base
+                .join(&expanded_path)
+                .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+
+            tracing::debug!(
+                media_type = %media_type,
+                segment_number = seg_number,
+                url = %segment_url,
+                "fetching segment"
+            );
+
+            let request = FetchRequest::new(segment_url.clone(), RequestType::MediaSegment);
+
+            let fetch_result: Result<FetchResponse, DashError> = if let Some(ms) = abandon_ms {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(ms),
+                    fetcher.fetch(request),
+                )
+                .await
+                {
+                    Ok(Ok(resp)) => Ok(resp),
+                    Ok(Err(e)) => Err(e.into()),
+                    Err(_elapsed) => {
+                        return Err(DashError::SegmentAbandoned {
+                            media_type: mt_str.clone(),
+                        });
+                    }
+                }
+            } else {
+                fetcher.fetch(request).await.map_err(Into::into)
+            };
+
+            match fetch_result {
+                Ok(resp) => {
+                    opt_response = Some(resp);
+                    break 'candidates;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        url = %segment_url,
+                        error = %e,
+                        "segment fetch failed — trying next base URL"
+                    );
+                    last_err = DashError::AllBaseUrlsFailed {
+                        last_error: e.to_string(),
+                    };
+                }
+            }
+        }
+
+        let response = opt_response.ok_or(last_err)?;
 
         // Record throughput measurement.
         if let Some(bps) = response.throughput_bps() {
@@ -486,10 +815,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// Returns [`DashError::SegmentUrlUnresolvable`] if the manifest does not
     /// contain an `initialization` template for the requested track.
-    pub async fn fetch_init_segment(
-        &mut self,
-        media_type: MediaType,
-    ) -> Result<usize, DashError> {
+    pub async fn fetch_init_segment(&mut self, media_type: MediaType) -> Result<usize, DashError> {
         let init_url = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
@@ -507,12 +833,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let bytes_received = response.data.len();
 
         // Init segments carry no presentation timestamp; start/end are None.
-        let chunk = Chunk::new(
-            response.data,
-            None,
-            None,
-            format!("{}/init", media_type),
-        );
+        let chunk = Chunk::new(response.data, None, None, format!("{}/init", media_type));
 
         {
             let track = self.track_mut(&media_type)?;
@@ -556,56 +877,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         })
     }
 
-    /// Resolve the URL for the next segment of the given representation.
-    ///
-    /// Handles `SegmentTemplate` with `$Number$` / `$Number%0Nd$` addressing,
-    /// respecting `BaseURL` elements at Period and AdaptationSet level.
-    /// `$Time$`, `SegmentList`, and `SegmentBase` are not yet implemented.
-    fn resolve_segment_url(
-        &self,
-        media_type: &MediaType,
-        rep: &RepresentationInfo,
-        segment_number: u64,
-    ) -> Result<Url, DashError> {
-        let period = &self.mpd.periods[0];
-        let adaptation = period
-            .adaptations
-            .iter()
-            .find(|a| match media_type {
-                MediaType::Video => dash_mpd::is_video_adaptation(a),
-                MediaType::Audio => dash_mpd::is_audio_adaptation(a),
-            })
-            .ok_or_else(|| DashError::NoRepresentations {
-                media_type: media_type.to_string(),
-            })?;
-
-        // Walk SegmentTemplate from AdaptationSet → Period.
-        let template = adaptation
-            .SegmentTemplate
-            .as_ref()
-            .or(period.SegmentTemplate.as_ref());
-
-        if let Some(tmpl) = template {
-            let media_tmpl = tmpl
-                .media
-                .as_deref()
-                .ok_or(DashError::SegmentUrlUnresolvable)?;
-
-            let url_str =
-                expand_template(media_tmpl, &rep.id, rep.bandwidth, segment_number);
-
-            // Chain Period → AdaptationSet BaseURL, then resolve template path.
-            let base = resolve_adaptation_base_url(&self.base_url, period, adaptation);
-            let resolved = base
-                .join(&url_str)
-                .map_err(|_| DashError::SegmentUrlUnresolvable)?;
-
-            return Ok(resolved);
-        }
-
-        Err(DashError::SegmentUrlUnresolvable)
-    }
-
     /// Resolve the URL for the initialisation segment of the given
     /// representation.
     ///
@@ -620,14 +891,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         rep: &RepresentationInfo,
     ) -> Result<Url, DashError> {
         let period = &self.mpd.periods[0];
-        let adaptation = period
-            .adaptations
-            .iter()
-            .find(|a| match media_type {
-                MediaType::Video => dash_mpd::is_video_adaptation(a),
-                MediaType::Audio => dash_mpd::is_audio_adaptation(a),
-            })
-            .ok_or_else(|| DashError::NoRepresentations {
+        let adaptation =
+            find_adaptation(period, media_type).ok_or_else(|| DashError::NoRepresentations {
                 media_type: media_type.to_string(),
             })?;
 
@@ -700,7 +965,6 @@ fn extract_segment_timing(
 
     (start_number, seg_dur_ms, total_segments)
 }
-
 
 fn extract_representations(adaptation: &AdaptationSet) -> Vec<RepresentationInfo> {
     let mut reps: Vec<RepresentationInfo> = adaptation
@@ -813,17 +1077,93 @@ fn expand_template(tmpl: &str, rep_id: &str, bandwidth: u64, number: u64) -> Str
     out
 }
 
+/// Return a reference to the first adaptation set matching `media_type`
+/// within `period`.
+fn find_adaptation<'a>(period: &'a Period, media_type: &MediaType) -> Option<&'a AdaptationSet> {
+    period.adaptations.iter().find(|a| match media_type {
+        MediaType::Video => dash_mpd::is_video_adaptation(a),
+        MediaType::Audio => dash_mpd::is_audio_adaptation(a),
+    })
+}
+
+/// Collect candidate base URLs for the given adaptation set, sorted by
+/// priority ascending (lower number = higher priority per DASH spec §5.10.1.3)
+/// with weight-based random ordering within each priority tier
+/// (Efraimidis–Spirakis reservoir algorithm).
+///
+/// The list is guaranteed to contain at least the `mpd_base` URL as a
+/// fallback when neither `period` nor `adaptation` declare any `BaseURL`
+/// elements.
+fn collect_candidate_base_urls(
+    mpd_base: &Url,
+    period: &Period,
+    adaptation: &AdaptationSet,
+) -> Vec<Url> {
+    // Resolve period-level candidates against the manifest base URL.
+    let period_candidates: Vec<Url> = if period.BaseURL.is_empty() {
+        vec![mpd_base.clone()]
+    } else {
+        priority_weighted_order(&period.BaseURL)
+            .into_iter()
+            .filter_map(|b| mpd_base.join(&b.base).ok())
+            .collect()
+    };
+
+    // If adaptation declares no extra BaseURL elements, return as-is.
+    if adaptation.BaseURL.is_empty() {
+        return period_candidates;
+    }
+
+    // Combine: for each period candidate, try each adaptation-level BaseURL.
+    let adapt_ordered = priority_weighted_order(&adaptation.BaseURL);
+    period_candidates
+        .iter()
+        .flat_map(|pb| {
+            adapt_ordered
+                .iter()
+                .filter_map(move |ab| pb.join(&ab.base).ok())
+        })
+        .collect()
+}
+
+/// Sort a slice of `BaseURL` elements by priority ascending with
+/// weight-proportional random ordering within each same-priority tier.
+///
+/// Uses the Efraimidis–Spirakis algorithm: each item receives a score
+/// `U^(1/weight)` where U is uniform random; higher scores come first.
+/// This produces a correctly weighted random permutation within each tier.
+fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    let mut scored: Vec<(u64, f64, &BaseURL)> = bases
+        .iter()
+        .map(|b| {
+            let priority = b.priority.unwrap_or(1);
+            let weight = b.weight.unwrap_or(1).max(1) as f64;
+            // Avoid log(0): clamp U away from zero.
+            let u: f64 = rng.gen::<f64>().max(1e-10_f64);
+            let score = u.powf(1.0 / weight);
+            (priority, score, b)
+        })
+        .collect();
+
+    // Sort by priority ascending, then score descending within same priority.
+    scored.sort_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+    });
+
+    scored.into_iter().map(|(_, _, b)| b).collect()
+}
+
 /// Resolve the effective base URL for an adaptation set by chaining
 /// Period → AdaptationSet `BaseURL` elements against the MPD base URL.
 ///
 /// Each element is resolved with `Url::join` so relative values work
 /// correctly. Returns the MPD base URL unchanged when neither level
 /// provides a `BaseURL`.
-fn resolve_adaptation_base_url(
-    mpd_base: &Url,
-    period: &Period,
-    adaptation: &AdaptationSet,
-) -> Url {
+fn resolve_adaptation_base_url(mpd_base: &Url, period: &Period, adaptation: &AdaptationSet) -> Url {
     let mut base = mpd_base.clone();
 
     if let Some(period_base) = period.BaseURL.first() {
@@ -859,17 +1199,19 @@ mod tests {
     fn expand_zero_padded_number_width6() {
         // BBC R&D BBB uses %06d.
         assert_eq!(
-            expand_template("$RepresentationID$/$Number%06d$.m4s", "1920x1080p25", 4741120, 1),
+            expand_template(
+                "$RepresentationID$/$Number%06d$.m4s",
+                "1920x1080p25",
+                4741120,
+                1
+            ),
             "1920x1080p25/000001.m4s"
         );
     }
 
     #[test]
     fn expand_zero_padded_number_width3() {
-        assert_eq!(
-            expand_template("$Number%03d$.m4s", "id", 999, 7),
-            "007.m4s"
-        );
+        assert_eq!(expand_template("$Number%03d$.m4s", "id", 999, 7), "007.m4s");
     }
 
     #[test]
@@ -883,10 +1225,7 @@ mod tests {
     #[test]
     fn expand_unknown_identifier_preserved() {
         // $Time$ is not yet implemented; must not silently drop it.
-        assert_eq!(
-            expand_template("$Time$.m4s", "id", 100, 1),
-            "$Time$.m4s"
-        );
+        assert_eq!(expand_template("$Time$.m4s", "id", 100, 1), "$Time$.m4s");
     }
 
     #[test]

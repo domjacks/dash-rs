@@ -138,7 +138,8 @@ impl SourceBuffer for StubSourceBuffer {
                 end,
             });
             // Keep sorted ascending by start time (mirrors ExternalSourceBuffer.js).
-            self.chunks.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
+            self.chunks
+                .sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap());
         }
         // Init segments (no timing) are accepted but not tracked in time ranges.
 
@@ -242,10 +243,7 @@ impl MediaSource for StubMediaSource {
         Ok(())
     }
 
-    fn add_source_buffer(
-        &mut self,
-        mime_type: &str,
-    ) -> Result<Box<dyn SourceBuffer>, DashError> {
+    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
         if self.ready_state != ReadyState::Open {
             return Err(DashError::MediaSourceNotOpen {
                 state: self.ready_state.clone(),

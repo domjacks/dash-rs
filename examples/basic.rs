@@ -12,8 +12,8 @@ use std::sync::Arc;
 use dash_rs::{
     abr::AbrMetrics,
     fetch::stub::StubSegmentFetcher,
-    media_source::stub::StubMediaSource,
     manifest::MPD,
+    media_source::stub::StubMediaSource,
     session::{DashSession, MediaType},
     DashError,
 };
@@ -61,8 +61,7 @@ async fn main() -> Result<(), DashError> {
     // 2. Parse the MPD and construct a session directly from the parsed MPD.
     //    In a real application you would call `DashSession::from_url` instead.
     let base_url = Url::parse("https://example.com/").unwrap();
-    let mpd: MPD = dash_mpd::parse(EXAMPLE_MPD)
-        .map_err(DashError::ManifestParse)?;
+    let mpd: MPD = dash_mpd::parse(EXAMPLE_MPD).map_err(DashError::ManifestParse)?;
 
     let fetcher = Arc::new(StubSegmentFetcher);
     let mut session = DashSession::from_mpd(mpd, base_url, fetcher, media_source)?;
@@ -80,7 +79,11 @@ async fn main() -> Result<(), DashError> {
     }
     println!("=== Audio representations ===");
     for (i, rep) in session.audio_representations().iter().enumerate() {
-        println!("  [{i}] id={} bandwidth={}kbps", rep.id, rep.bandwidth / 1000);
+        println!(
+            "  [{i}] id={} bandwidth={}kbps",
+            rep.id,
+            rep.bandwidth / 1000
+        );
     }
 
     // 4. Simulate a short fetch loop — 5 segments per track.

@@ -1,4 +1,7 @@
-use crate::abr::{metrics::AbrMetrics, rule::{AbrRule, RepresentationInfo}};
+use crate::abr::{
+    metrics::AbrMetrics,
+    rule::{AbrRule, RepresentationInfo},
+};
 
 /// The fraction of measured throughput that must exceed a representation's
 /// bitrate before that representation is selected. A value of 0.9 means the
