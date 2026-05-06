@@ -65,8 +65,7 @@ use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     session::{DashSession, MediaType},
     DashError,
-};
-use gst_media_source::GstMediaSource;
+};use gst_media_source::GstMediaSource;
 use gstreamer as gst;
 use gst::prelude::*;
 use url::Url;
@@ -163,8 +162,6 @@ impl SegmentFetcher for HttpSegmentFetcher {
 const DEFAULT_MPD_URL: &str =
     "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
 
-const SEGMENTS_TO_FETCH: u32 = 8;
-
 /// Runs inside the tokio runtime on the background OS thread.
 async fn run_session(
     manifest_url: Url,
@@ -231,67 +228,107 @@ async fn run_session(
     // fetching eagerly whenever the buffer is not yet full.
     const SCHEDULE_POLL_MS: u64 = 500; // dash.js scheduleTimeout default
 
-    println!("\n=== Fetching {SEGMENTS_TO_FETCH} segments (buffer target: {:.0} s) ===",
+    println!("\n=== Fetching all segments (buffer target: {:.0} s) ===",
         session.buffer_target_ms() / 1_000.0);
     println!(
         "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:<10}  {}",
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
     );
 
-    for seg in 1..=SEGMENTS_TO_FETCH {
-        // ── Video: gate on buffer level ──────────────────────────────────────
-        loop {
-            let buf = session.estimated_buffer_level_ms(&MediaType::Video);
-            if buf < session.buffer_target_ms() {
-                break;
-            }
-            tracing::debug!(
-                buf_level_ms = buf as u64,
-                target_ms = session.buffer_target_ms() as u64,
-                "video buffer full — waiting"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
+    // Track completion independently per track.  EOS on one track must not
+    // short-circuit the other — mirrors dash.js calling mediaSource.endOfStream()
+    // only after ALL tracks have been exhausted.
+    let mut video_done = false;
+    let mut audio_done = false;
+    let mut seg: u32 = 0;
+
+    loop {
+        if video_done && audio_done {
+            break;
         }
 
-        let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        let vid_buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
-        let metrics = AbrMetrics::new(throughput_bps, vid_buf_ms);
+        seg += 1;
 
-        let t_video = Instant::now();
-        let video_decision = session
-            .fetch_next_segment(MediaType::Video, &metrics)
-            .await?;
-        let video_ms = t_video.elapsed().as_millis();
+        // ── Video: gate on buffer level, then fetch ──────────────────────────
+        // (type alias avoids repeating the tuple annotation)
+        let video_result: Option<(usize, String, u128)> = if !video_done {
+            loop {
+                let buf = session.estimated_buffer_level_ms(&MediaType::Video);
+                if buf < session.buffer_target_ms() {
+                    break;
+                }
+                tracing::debug!(
+                    buf_level_ms = buf as u64,
+                    target_ms = session.buffer_target_ms() as u64,
+                    "video buffer full — waiting"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
+            }
 
-        // ── Audio: gate on buffer level ──────────────────────────────────────
+            let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+            let vid_buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
+            let metrics = AbrMetrics::new(throughput_bps, vid_buf_ms);
+
+            let t_video = Instant::now();
+            match session.fetch_next_segment(MediaType::Video, &metrics).await {
+                Ok(d) => Some((d.index, format!("{:?}", d.reason), t_video.elapsed().as_millis())),
+                Err(DashError::EndOfStream { .. }) => {
+                    video_done = true;
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
+
+        // ── Audio: gate on buffer level, then fetch ──────────────────────────
         // dash.js slaves audio target to video buffer level + 1 s so that
         // audio and video stay in lock-step.
-        let audio_target_ms = session
-            .estimated_buffer_level_ms(&MediaType::Video)
-            .min(session.buffer_target_ms());
-        loop {
-            let buf = session.estimated_buffer_level_ms(&MediaType::Audio);
-            if buf < audio_target_ms + 1_000.0 {
-                break;
+        let audio_result: Option<(usize, String)> = if !audio_done {
+            let audio_target_ms = session
+                .estimated_buffer_level_ms(&MediaType::Video)
+                .min(session.buffer_target_ms());
+            loop {
+                let buf = session.estimated_buffer_level_ms(&MediaType::Audio);
+                if buf < audio_target_ms + 1_000.0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
-        }
 
-        let aud_buf_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
-        let audio_metrics = AbrMetrics::new(throughput_bps, aud_buf_ms);
-        let audio_decision = session
-            .fetch_next_segment(MediaType::Audio, &audio_metrics)
-            .await?;
+            let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+            let aud_buf_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
+            let audio_metrics = AbrMetrics::new(throughput_bps, aud_buf_ms);
+            match session.fetch_next_segment(MediaType::Audio, &audio_metrics).await {
+                Ok(d) => Some((d.index, format!("{:?}", d.reason))),
+                Err(DashError::EndOfStream { .. }) => {
+                    audio_done = true;
+                    None
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            None
+        };
 
         let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+        let vid_buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
+
+        let (vid_idx, vid_reason, video_ms) = video_result
+            .map(|(i, r, ms)| (i.to_string(), r, ms))
+            .unwrap_or_else(|| ("done".into(), "-".into(), 0));
+        let (aud_idx, aud_reason) = audio_result
+            .map(|(i, r)| (i.to_string(), r))
+            .unwrap_or_else(|| ("done".into(), "-".into()));
 
         println!(
             "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
             seg,
-            video_decision.index,
-            format!("{:?}", video_decision.reason),
-            audio_decision.index,
-            format!("{:?}", audio_decision.reason),
+            vid_idx,
+            vid_reason,
+            aud_idx,
+            aud_reason,
             vid_buf_ms / 1_000.0,
             video_ms,
             measured_bps / 1_000.0,

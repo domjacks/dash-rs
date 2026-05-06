@@ -51,6 +51,10 @@ struct TrackState {
     /// `SegmentTemplate@duration / SegmentTemplate@timescale * 1000`.
     /// Used for buffer-level estimation.
     segment_duration_ms: f64,
+    /// Total number of segments in this track, derived from
+    /// `MPD@mediaPresentationDuration / segment_duration_ms`.
+    /// `None` for live streams or manifests without a declared duration.
+    total_segments: Option<u64>,
     /// The `SourceBufferSink` wrapping the underlying buffer.
     sink: SourceBufferSink,
 }
@@ -62,6 +66,7 @@ impl TrackState {
         sink: SourceBufferSink,
         start_number: u64,
         segment_duration_ms: f64,
+        total_segments: Option<u64>,
     ) -> Self {
         Self {
             _media_type: media_type,
@@ -70,6 +75,7 @@ impl TrackState {
             segment_number: start_number,
             start_number,
             segment_duration_ms,
+            total_segments,
             sink,
         }
     }
@@ -162,6 +168,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         // Use the first period for now (multi-period support can be added later).
         let period = &mpd.periods[0];
+        let presentation_duration = mpd.mediaPresentationDuration;
 
         // Extract video and audio adaptation sets.
         // `period.adaptations` is a plain Vec (not Option<Vec>) in dash-mpd.
@@ -181,9 +188,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 let mime = adaptation_mime_type(adaptation);
                 let sink_buf = media_source.add_source_buffer(&mime)?;
                 let sink = SourceBufferSink::new(sink_buf);
-                let (start_number, seg_dur_ms) =
-                    extract_segment_timing(adaptation, period);
-                Some(TrackState::new(MediaType::Video, reps, sink, start_number, seg_dur_ms))
+                let (start_number, seg_dur_ms, total_segments) =
+                    extract_segment_timing(adaptation, period, presentation_duration);
+                Some(TrackState::new(MediaType::Video, reps, sink, start_number, seg_dur_ms, total_segments))
             } else {
                 None
             }
@@ -197,9 +204,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 let mime = adaptation_mime_type(adaptation);
                 let sink_buf = media_source.add_source_buffer(&mime)?;
                 let sink = SourceBufferSink::new(sink_buf);
-                let (start_number, seg_dur_ms) =
-                    extract_segment_timing(adaptation, period);
-                Some(TrackState::new(MediaType::Audio, reps, sink, start_number, seg_dur_ms))
+                let (start_number, seg_dur_ms, total_segments) =
+                    extract_segment_timing(adaptation, period, presentation_duration);
+                Some(TrackState::new(MediaType::Audio, reps, sink, start_number, seg_dur_ms, total_segments))
             } else {
                 None
             }
@@ -381,12 +388,32 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The `metrics` parameter should reflect the most recent throughput and
     /// buffer measurements so the ABR rules can react.
     ///
-    /// Returns the [`QualityDecision`] that was applied.
+    /// Returns the [`QualityDecision`] that was applied, or
+    /// [`DashError::EndOfStream`] when all segments declared by
+    /// `MPD@mediaPresentationDuration` have been fetched.
     pub async fn fetch_next_segment(
         &mut self,
         media_type: MediaType,
         metrics: &AbrMetrics,
     ) -> Result<QualityDecision, DashError> {
+        // Check whether all segments have been consumed.
+        {
+            let track = self.track(&media_type)?;
+            if let Some(total) = track.total_segments {
+                let fetched = track.segment_number.saturating_sub(track.start_number);
+                if fetched >= total {
+                    tracing::info!(
+                        media_type = %media_type,
+                        total_segments = total,
+                        "all segments fetched — signalling EndOfStream"
+                    );
+                    return Err(DashError::EndOfStream {
+                        media_type: media_type.to_string(),
+                    });
+                }
+            }
+        }
+
         // Run ABR.
         let decision = {
             let track = self.track(&media_type)?;
@@ -629,20 +656,28 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
 // ── Free helpers ──────────────────────────────────────────────────────────────
 
-/// Extract `(start_number, segment_duration_ms)` from the `SegmentTemplate`
-/// that governs `adaptation`, walking up to `period` if needed.
+/// Extract `(start_number, segment_duration_ms, total_segments)` from the
+/// `SegmentTemplate` that governs `adaptation`, walking up to `period` if
+/// needed.  `presentation_duration` is `MPD@mediaPresentationDuration`.
 ///
 /// `start_number` defaults to 1 when `@startNumber` is absent (DASH spec §5.3.9.2).
 /// `segment_duration_ms` defaults to 2 000 ms when `@duration` / `@timescale`
 /// are absent (safe fallback that keeps the buffer estimator conservative).
-fn extract_segment_timing(adaptation: &AdaptationSet, period: &Period) -> (u64, f64) {
+/// `total_segments` is derived from `presentation_duration` when set;
+/// falls back to `Period@duration` when the MPD-level attribute is absent;
+/// is `None` only when both are absent (e.g. live / dynamic stream).
+fn extract_segment_timing(
+    adaptation: &AdaptationSet,
+    period: &Period,
+    presentation_duration: Option<std::time::Duration>,
+) -> (u64, f64, Option<u64>) {
     let tmpl: Option<&SegmentTemplate> = adaptation
         .SegmentTemplate
         .as_ref()
         .or(period.SegmentTemplate.as_ref());
 
     let Some(t) = tmpl else {
-        return (1, 2_000.0);
+        return (1, 2_000.0, None);
     };
 
     let start_number = t.startNumber.unwrap_or(1);
@@ -653,7 +688,17 @@ fn extract_segment_timing(adaptation: &AdaptationSet, period: &Period) -> (u64, 
         _ => 2_000.0,
     };
 
-    (start_number, seg_dur_ms)
+    // Prefer MPD@mediaPresentationDuration; fall back to Period@duration so
+    // that streams which omit the top-level attribute but declare a period
+    // length still get a finite segment count.
+    let effective_duration = presentation_duration.or(period.duration);
+
+    let total_segments = effective_duration.map(|d| {
+        let total_ms = d.as_millis() as f64;
+        (total_ms / seg_dur_ms).ceil() as u64
+    });
+
+    (start_number, seg_dur_ms, total_segments)
 }
 
 

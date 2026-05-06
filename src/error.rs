@@ -38,4 +38,13 @@ pub enum DashError {
 
     #[error("invalid time range: start={start} end={end}")]
     InvalidTimeRange { start: f64, end: f64 },
+
+    /// All segments for this track have been fetched.
+    ///
+    /// Returned by [`crate::session::DashSession::fetch_next_segment`] once the
+    /// segment number advances past the total derived from
+    /// `MPD@mediaPresentationDuration`.  The caller should call
+    /// [`crate::session::DashSession::end_of_stream`] and stop the fetch loop.
+    #[error("end of stream: no more segments for {media_type}")]
+    EndOfStream { media_type: String },
 }
