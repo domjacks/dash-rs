@@ -364,6 +364,56 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         Ok(decision)
     }
 
+    /// Fetch and append the initialisation segment for the given media type.
+    ///
+    /// Must be called once per track before [`fetch_next_segment`] is invoked
+    /// so that a real decoder can parse codec parameters from the `moov` box.
+    /// Returns the number of bytes received.
+    ///
+    /// Returns [`DashError::SegmentUrlUnresolvable`] if the manifest does not
+    /// contain an `initialization` template for the requested track.
+    pub async fn fetch_init_segment(
+        &mut self,
+        media_type: MediaType,
+    ) -> Result<usize, DashError> {
+        let init_url = {
+            let track = self.track(&media_type)?;
+            let rep = &track.representations[track.current_index];
+            self.resolve_init_url(&media_type, rep)?
+        };
+
+        tracing::debug!(
+            media_type = %media_type,
+            url = %init_url,
+            "fetching init segment"
+        );
+
+        let request = FetchRequest::new(init_url, RequestType::InitializationSegment);
+        let response = self.fetcher.fetch(request).await?;
+        let bytes_received = response.data.len();
+
+        // Init segments carry no presentation timestamp; start/end are None.
+        let chunk = Chunk::new(
+            response.data,
+            None,
+            None,
+            format!("{}/init", media_type),
+        );
+
+        {
+            let track = self.track_mut(&media_type)?;
+            track.sink.append(chunk).await?;
+        }
+
+        tracing::info!(
+            media_type = %media_type,
+            bytes = bytes_received,
+            "init segment appended"
+        );
+
+        Ok(bytes_received)
+    }
+
     /// Signal that no more segments will be appended.
     pub async fn end_of_stream(&mut self) -> Result<(), DashError> {
         tracing::info!("signalling end of stream");
@@ -440,6 +490,54 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .map_err(|_| DashError::SegmentUrlUnresolvable)?;
 
             return Ok(resolved);
+        }
+
+        Err(DashError::SegmentUrlUnresolvable)
+    }
+
+    /// Resolve the URL for the initialisation segment of the given
+    /// representation.
+    ///
+    /// Handles the common `@initialization` attribute form of `SegmentTemplate`
+    /// (e.g. `initialization="video/$RepresentationID$/init.mp4"`).
+    /// Returns [`DashError::SegmentUrlUnresolvable`] when no initialisation
+    /// URL can be derived from the manifest.
+    fn resolve_init_url(
+        &self,
+        media_type: &MediaType,
+        rep: &RepresentationInfo,
+    ) -> Result<Url, DashError> {
+        let period = &self.mpd.periods[0];
+        let adaptation = period
+            .adaptations
+            .iter()
+            .find(|a| match media_type {
+                MediaType::Video => dash_mpd::is_video_adaptation(a),
+                MediaType::Audio => dash_mpd::is_audio_adaptation(a),
+            })
+            .ok_or_else(|| DashError::NoRepresentations {
+                media_type: media_type.to_string(),
+            })?;
+
+        // Walk SegmentTemplate from AdaptationSet → Period (same precedence
+        // as resolve_segment_url).
+        let template = adaptation
+            .SegmentTemplate
+            .as_ref()
+            .or_else(|| period.SegmentTemplate.as_ref());
+
+        if let Some(tmpl) = template {
+            // @initialization attribute — the most common form.
+            if let Some(init_tmpl) = tmpl.initialization.as_deref() {
+                let url_str = init_tmpl
+                    .replace("$RepresentationID$", &rep.id)
+                    .replace("$Bandwidth$", &rep.bandwidth.to_string());
+
+                return self
+                    .base_url
+                    .join(&url_str)
+                    .map_err(|_| DashError::SegmentUrlUnresolvable);
+            }
         }
 
         Err(DashError::SegmentUrlUnresolvable)

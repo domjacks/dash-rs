@@ -21,8 +21,13 @@ cargo test --test media_source
 # Doc-tests only
 cargo test --doc
 
-# The end-to-end example (no network required)
+# Stub end-to-end example (no network required)
 cargo run --example basic
+
+# Real HTTP fetch example (requires internet access)
+cargo run --example http_fetch
+# Override the manifest URL
+cargo run --example http_fetch -- https://your-stream/manifest.mpd
 
 # Lint
 cargo clippy -- -D warnings
@@ -171,7 +176,8 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Session coordinator | `src/session.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
-| End-to-end example | `examples/basic.rs` |
+| Stub end-to-end example | `examples/basic.rs` |
+| Real HTTP fetch example | `examples/http_fetch.rs` |
 
 ---
 
@@ -197,7 +203,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 
-- Real HTTP `SegmentFetcher` (planned as optional `fetch-http` feature).
+- Promoted `SegmentFetcher` implementation for HTTP (currently inline in `examples/http_fetch.rs`; planned as a first-class optional `fetch-http` crate feature).
 - Live / dynamic MPD refresh (`ManifestUpdater`).
 - `SegmentList` and `SegmentBase` (byte-range) segment addressing.
 - `$Time$` template variable in `SegmentTemplate`.
