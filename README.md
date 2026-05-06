@@ -219,9 +219,11 @@ cargo test --test media_source
 cargo test --doc
 ```
 
-Expected output (all 27 tests pass):
+Expected output (all 33 tests pass):
 
 ```
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured
+
 running 11 tests
 test buffer_rule_abstains_when_no_buffer ... ok
 test buffer_rule_returns_some_when_buffer_present ... ok
@@ -254,24 +256,113 @@ test stub_source_buffer_merges_adjacent_ranges ... ok
 test stub_source_buffer_remove_clears_range ... ok
 
 test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured
+
+running 2 doc-tests
+test src/session.rs - session::DashSession (line 93) - compile ... ok
+test src/lib.rs - (line 18) - compile ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured
 ```
 
 ---
 
-## Running the example
+## Running the examples
 
-The `basic` example parses a synthetic multi-bitrate MPD, simulates 5 fetch
-iterations with improving network conditions, and prints each quality decision.
-No network access is required.
+### `basic` — no network required
+
+Parses a synthetic multi-bitrate MPD, simulates 5 fetch iterations with
+improving network conditions, and prints each quality decision. No network
+access or external dependencies are required.
 
 ```bash
 cargo run --example basic
 ```
 
-Enable `tracing` debug output (shown by default in the example):
+Enable `tracing` debug output:
 
 ```bash
 RUST_LOG=debug cargo run --example basic
+```
+
+### `http_fetch` — real HTTP, no media output
+
+Fetches the BBC R&D Big Buck Bunny stream over HTTP and prints per-segment ABR
+decisions to stdout. Requires internet access. No media sink is involved —
+segments are fetched and discarded; this example exercises `DashSession` and
+the full ABR pipeline end-to-end without any rendering dependency.
+
+```bash
+# Uses the BBC R&D Big Buck Bunny manifest by default
+cargo run --example http_fetch
+
+# Override the manifest URL
+cargo run --example http_fetch -- https://your-stream/manifest.mpd
+```
+
+Expected output (excerpt):
+
+```
+Loaded manifest: https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd
+Video representations (sorted by bandwidth):
+  [0]   256kbps  320x180
+  [1]   512kbps  512x288
+  ...
+
+=== Fetching 8 segments ===
+  seg   vid-idx  vid-reason    aud-idx  aud-reason    video fetch
+  1     2        Throughput    0        Throughput     312 ms  (3842 kbps)
+  2     3        Throughput    0        Throughput      89 ms  (5201 kbps)
+  ...
+```
+
+### `gstreamer_player` — full AV playback (`sink-gstreamer` feature)
+
+Fetches and plays back the BBC R&D Big Buck Bunny stream using GStreamer as the
+media sink. Requires GStreamer ≥ 1.14 and a display.
+
+**Prerequisites:**
+
+```bash
+# macOS
+brew install gstreamer protobuf
+
+# Debian / Ubuntu
+apt-get install gstreamer1.0-tools gstreamer1.0-plugins-good \
+                gstreamer1.0-plugins-bad gstreamer1.0-libav \
+                protobuf-compiler
+```
+
+On macOS, if `cargo build` cannot find GStreamer headers, prepend the framework
+`bin` directory so its `pkg-config` is found first:
+
+```bash
+export PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/bin:$PATH"
+```
+
+**Run:**
+
+```bash
+# Default stream (BBC R&D Big Buck Bunny)
+cargo run --features sink-gstreamer --example gstreamer_player
+
+# Override the manifest URL
+cargo run --features sink-gstreamer --example gstreamer_player -- https://your-stream/manifest.mpd
+```
+
+Expected output (excerpt):
+
+```
+Loaded manifest: https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd
+Pipeline playing.
+
+=== Fetching 8 segments (buffer target: 12 s) ===
+  seg   vid-idx  vid-reason    aud-idx  aud-reason    buf-est     video fetch
+  1     2        Throughput    0        Throughput       0.0 s     312 ms  (3842 kbps)
+  2     3        Throughput    0        Throughput       3.8 s      89 ms  (5201 kbps)
+  ...
+
+All segments fetched — waiting for pipeline EOS…
+Done.
 ```
 
 ---
@@ -299,7 +390,7 @@ tracing_subscriber::fmt()
 ```
 DashSession
 ├── ManifestLoader ──── SegmentFetcher (trait) ←── StubSegmentFetcher
-│       └── dash-mpd (MPD parse)
+│       └── dash-mpd (MPD parse)                └── (your HttpFetcher, etc.)
 ├── AbrController
 │   ├── ThroughputRule
 │   ├── BufferOccupancyRule
@@ -307,6 +398,7 @@ DashSession
 │   └── SwitchHistoryRule
 └── SourceBufferSink (per track)
         └── SourceBuffer (trait) ←── StubSourceBuffer
+                                 └── GstSourceBuffer  (sink-gstreamer feature)
                                  └── (your implementation)
 ```
 
@@ -321,9 +413,9 @@ Data flow per segment:
 
 ## What's not yet implemented
 
-- Real HTTP fetching (bring your own `SegmentFetcher`, or wait for the planned `fetch-http` feature).
 - Live / dynamic MPD refresh (`ManifestUpdater`).
 - `SegmentList` and `SegmentBase` (byte-range) addressing — only `SegmentTemplate` with `$Number$` is currently supported.
+- `$Time$` template variable in `SegmentTemplate`.
 - Multi-period playback.
 - Subtitle / text track handling.
 - DRM / Encrypted Media Extensions.

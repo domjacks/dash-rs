@@ -117,7 +117,47 @@ There is no explicit queue struct.  Concurrent callers must not interleave
 `await` points across two `append` calls on the same sink.  Use a single
 `async` task or a mutex if multiple producers exist.
 
-### `DashSession::from_mpd` uses the first `Period` only
+### `DashSession` buffer scheduling API
+
+`DashSession` exposes a dash.js `ScheduleController`-style buffer-level gate:
+
+| Method | Description |
+|---|---|
+| `notify_playing()` | Call immediately after `media_source.set_playing()`. Starts the wall-clock used by `estimated_buffer_level_ms`. |
+| `estimated_buffer_level_ms(media_type)` | Returns `(segments_fetched × segment_duration_ms) − elapsed_playing_ms`, clamped to 0. |
+| `buffer_target_ms()` | Default 12 000 ms (matches `bufferTimeDefault` in dash.js `ScheduleController`). |
+| `set_buffer_target_ms(ms)` | Override the target. |
+
+The fetch loop pattern mirrors dash.js:
+
+```rust
+session.media_source_mut().set_playing()?;
+session.notify_playing();
+
+loop {
+    while session.estimated_buffer_level_ms(&MediaType::Video) >= session.buffer_target_ms() {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    session.fetch_next_segment(MediaType::Video, &metrics).await?;
+}
+```
+
+`estimated_buffer_level_ms` is a wall-clock approximation — it assumes real-time
+playback speed.  It is meaningless before `notify_playing()` is called (returns 0).
+`segment_duration_ms` is extracted from `SegmentTemplate.duration / timescale × 1000`
+at session construction time (`extract_segment_timing()` in `src/session.rs`).
+
+### `TrackState` segment timing fields
+
+`TrackState` carries two timing fields populated from the MPD:
+
+- `start_number: u64` — `SegmentTemplate@startNumber` (default 1).
+- `segment_duration_ms: f64` — `SegmentTemplate.duration / timescale × 1000` (default 2 000 ms if absent).
+
+`segments_fetched` is computed as `segment_number − start_number` (not a separate counter).
+`segment_number` advances by 1 on every successful `fetch_next_segment` call.
+
+### `DashSession` uses the first `Period` only
 
 Multi-period support is not yet implemented.  Passing an MPD with multiple
 periods will not error, but only the first period's tracks are used.
@@ -195,6 +235,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
 | Session coordinator | `src/session.rs` |
+| Segment timing extraction | `extract_segment_timing()` in `src/session.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
@@ -218,6 +259,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `SwitchHistoryRule.js` | `abr::switch_history::SwitchHistoryRule` |
 | `AbrController.js` | `abr::AbrController` |
 | `MediaPlayer.js` + `StreamProcessor.js` | `session::DashSession` |
+| `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` |
 
 ---
 
@@ -225,7 +267,6 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 The following features from dash.js have no Rust equivalent yet.  PRs welcome.
 
-- Promoted `SegmentFetcher` implementation for HTTP (currently inline in `examples/http_fetch.rs`; planned as a first-class optional `fetch-http` crate feature).
 - Live / dynamic MPD refresh (`ManifestUpdater`).
 - `SegmentList` and `SegmentBase` (byte-range) segment addressing.
 - `$Time$` template variable in `SegmentTemplate`.
