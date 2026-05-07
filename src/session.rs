@@ -702,27 +702,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///    last manifest load or refresh (or the manifest has never been fetched
     ///    over the network, i.e. the session was built via [`Self::from_mpd`]).
     ///
-    /// For the common pattern call this at the top of the fetch loop:
-    ///
-    /// ```no_run
-    /// # use dash_rs::session::{DashSession, MediaType};
-    /// # use dash_rs::fetch::stub::StubSegmentFetcher;
-    /// # use dash_rs::media_source::stub::StubMediaSource;
-    /// # use dash_rs::abr::AbrMetrics;
-    /// # async fn example(mut session: DashSession<StubSegmentFetcher, StubMediaSource>) -> Result<(), dash_rs::error::DashError> {
-    /// # let metrics = AbrMetrics::new(5_000_000.0, 8_000.0);
-    /// loop {
-    ///     if session.should_refresh_manifest() {
-    ///         session.refresh_manifest().await?;
-    ///     }
-    ///     match session.fetch_next_segment(MediaType::Video, &metrics).await {
-    ///         Ok(_) => {}
-    ///         Err(dash_rs::error::DashError::EndOfStream { .. }) => break,
-    ///         Err(e) => return Err(e),
-    ///     }
-    /// }
-    /// # Ok(()) }
-    /// ```
+    /// [`Self::fetch_next_segment`] calls this automatically at the start of
+    /// every invocation and triggers [`Self::refresh_manifest`] when needed, so
+    /// callers do not need to poll this method themselves. It is exposed
+    /// publicly for tests and for advanced callers that drive manifest refresh
+    /// from a separate task.
     pub fn should_refresh_manifest(&self) -> bool {
         if !self.is_live() {
             return false;
@@ -734,6 +718,22 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             // Never refreshed (session built via from_mpd without a network fetch).
             None => true,
             Some(last) => last.elapsed().as_millis() as u64 >= period_ms,
+        }
+    }
+
+    /// Refresh the live manifest if [`Self::should_refresh_manifest`] returns
+    /// `true`. Failure is non-fatal: a warning is logged and the existing
+    /// manifest is kept. This is the internal driver called automatically by
+    /// [`Self::fetch_next_segment`]; external callers rarely need it.
+    async fn refresh_manifest_if_due(&mut self) {
+        if self.should_refresh_manifest() {
+            match self.refresh_manifest().await {
+                Ok(()) => tracing::info!("live manifest refreshed"),
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "manifest refresh failed; continuing with stale manifest"
+                ),
+            }
         }
     }
 
@@ -869,6 +869,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The `metrics` parameter should reflect the most recent throughput and
     /// buffer measurements so the ABR rules can react.
     ///
+    /// For **live streams**, the manifest is refreshed automatically at the
+    /// start of each call when `MPD@minimumUpdatePeriod` has elapsed — mirrors
+    /// the behaviour of dash.js's `ManifestUpdater`. The application does not
+    /// need to call [`Self::should_refresh_manifest`] or
+    /// [`Self::refresh_manifest`] itself.
+    ///
     /// If [`Self::set_abandon_timeout_ms`] is configured and the fetch does
     /// not complete in time, returns [`DashError::SegmentAbandoned`].
     ///
@@ -885,6 +891,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         media_type: MediaType,
         metrics: &AbrMetrics,
     ) -> Result<QualityDecision, DashError> {
+        // Auto-refresh the live manifest when minimumUpdatePeriod has elapsed.
+        // Mirrors dash.js ManifestUpdater — the application never needs to call
+        // should_refresh_manifest / refresh_manifest directly.
+        self.refresh_manifest_if_due().await;
+
         // Check whether all segments have been consumed.
         {
             let track = self.track(&media_type)?;

@@ -23,7 +23,6 @@ use std::{
 use async_trait::async_trait;
 use bytes::Bytes;
 use dash_rs::{
-    abr::AbrMetrics,
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     media_source::stub::StubMediaSource,
     session::{DashSession, MediaType},
@@ -211,9 +210,11 @@ async fn main() -> Result<(), DashError> {
     for seg in 1..=SEGMENTS_TO_FETCH {
         // Read throughput measured by the fetcher during the previous segment.
         let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
+        // Use current_metrics() so SwitchHistoryRule sees the real current_index.
+        let mut metrics = session.current_metrics(MediaType::Video);
+        metrics.throughput_bps = throughput_bps;
         // Simple buffer model: assume each segment is 4 seconds of content.
-        let buffer_level_ms = (seg as f64) * 4_000.0;
-        let metrics = AbrMetrics::new(throughput_bps, buffer_level_ms);
+        metrics.buffer_level_ms = (seg as f64) * 4_000.0;
 
         let t_video = Instant::now();
         let video_decision = session
@@ -222,7 +223,12 @@ async fn main() -> Result<(), DashError> {
         let video_ms = t_video.elapsed().as_millis();
 
         let audio_decision = session
-            .fetch_next_segment(MediaType::Audio, &metrics)
+            .fetch_next_segment(MediaType::Audio, &{
+                let mut m = session.current_metrics(MediaType::Audio);
+                m.throughput_bps = throughput_bps;
+                m.buffer_level_ms = (seg as f64) * 4_000.0;
+                m
+            })
             .await?;
 
         // Re-read throughput after both fetches for the next iteration.
