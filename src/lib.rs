@@ -49,6 +49,7 @@ pub mod manifest;
 pub mod media_source;
 pub mod mp4;
 pub mod session;
+pub mod util;
 
 // Top-level re-exports for the most commonly used types.
 pub use abr::{AbrController, AbrMetrics, QualityDecision};

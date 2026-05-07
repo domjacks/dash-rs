@@ -18,11 +18,13 @@
 //! | `mpd` | `merge_segment_templates`, `extract_segment_timing`, `find_adaptation`, etc. |
 //! | `timeline` | [`find_timeline_segment`], `count_timeline_segments` — `$Time$` / SegmentTimeline walking |
 //! | `segment_url` | [`expand_template`], `collect_candidate_base_urls`, `resolve_effective_base_url` |
+//! | `utc` | `resolve_utc_timing`, `query_http_utc` — `UTCTiming` clock-sync |
 
 mod live;
 mod mpd;
 mod segment_url;
 mod timeline;
+mod utc;
 
 use std::{
     collections::HashMap,
@@ -210,6 +212,14 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// `InitCache.js` equivalent).  A cache miss triggers a live fetch that
     /// also populates the cache entry for future switches.
     init_cache: HashMap<String, bytes::Bytes>,
+    /// Signed offset in seconds applied to the wall clock before live-edge
+    /// segment calculations: `adjusted_now = SystemTime::now() + utc_clock_offset_s`.
+    ///
+    /// Set to `server_time − client_time` by [`Self::from_url`] after querying
+    /// the first successful `UTCTiming` element in the manifest.  Stays `0.0`
+    /// when no `UTCTiming` is present, all elements fail, or the session was
+    /// constructed via [`Self::from_mpd`] (no network access allowed).
+    utc_clock_offset_s: f64,
 }
 
 // Re-export for convenience in examples.
@@ -220,23 +230,50 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Fetch the manifest at `url`, parse it, initialise source buffers on
     /// `media_source`, and return a ready-to-use session.
+    ///
+    /// If the manifest contains `UTCTiming` elements, the first successful one
+    /// is queried to compute a signed clock offset that corrects live-edge
+    /// calculations for any skew between the client and server wall clocks.
     pub async fn from_url(url: &Url, fetcher: F, media_source: M) -> Result<Self, DashError> {
         let fetcher = Arc::new(fetcher);
         let loader = ManifestLoader::new(Arc::clone(&fetcher));
         let (mpd, base_url) = loader.load(url).await?;
 
-        let mut session = Self::from_mpd(mpd, base_url, fetcher, media_source)?;
+        // Compute UTC clock offset before constructing the session so that
+        // live-edge snapping inside `from_mpd` can use the corrected time.
+        let client_now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let utc_offset = utc::resolve_utc_timing(&mpd, &fetcher, client_now_s).await;
+
+        let mut session = Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, utc_offset)?;
         session.last_manifest_refresh = Some(Instant::now());
         Ok(session)
     }
 
     /// Build a session from an already-parsed [`MPD`], without performing any
     /// network requests.
+    ///
+    /// The UTC clock offset is set to `0.0` — the system wall clock is used
+    /// as-is for live-edge snapping.  Use [`Self::from_url`] to get automatic
+    /// `UTCTiming` resolution.
     pub fn from_mpd(
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
+        media_source: M,
+    ) -> Result<Self, DashError> {
+        Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, 0.0)
+    }
+
+    /// Internal constructor shared by [`Self::from_url`] and [`Self::from_mpd`].
+    fn from_mpd_with_utc(
+        mpd: MPD,
+        base_url: Url,
+        fetcher: Arc<F>,
         mut media_source: M,
+        utc_clock_offset_s: f64,
     ) -> Result<Self, DashError> {
         if mpd.periods.is_empty() {
             return Err(DashError::EmptyManifest);
@@ -352,10 +389,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let spd_s: Option<f64> = mpd.suggestedPresentationDelay.map(|d| d.as_secs_f64());
         if is_dynamic {
             if let Some(ast) = ast_s {
+                // Apply the UTC clock offset so that the live-edge calculation
+                // uses the server's time rather than the (potentially skewed)
+                // client wall clock.
                 let now_s = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0);
+                    .unwrap_or(0.0)
+                    + utc_clock_offset_s;
                 if let Some(ref mut track) = video_track {
                     let seg = compute_live_edge_segment(
                         ast,
@@ -367,6 +408,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     tracing::info!(
                         media_type = "video",
                         segment_number = seg,
+                        utc_offset_s = utc_clock_offset_s,
                         "live stream: snapped to live-edge segment"
                     );
                     track.segment_number = seg;
@@ -383,6 +425,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     tracing::info!(
                         media_type = "audio",
                         segment_number = seg,
+                        utc_offset_s = utc_clock_offset_s,
                         "live stream: snapped to live-edge segment"
                     );
                     track.segment_number = seg;
@@ -412,6 +455,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             minimum_update_period_ms: mpd_minimum_update_period_ms,
             last_manifest_refresh: None,
             init_cache: HashMap::new(),
+            utc_clock_offset_s,
         })
     }
 
@@ -420,6 +464,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The parsed MPD manifest.
     pub fn mpd(&self) -> &MPD {
         &self.mpd
+    }
+
+    /// Signed clock offset applied to live-edge calculations:
+    /// `adjusted_now = SystemTime::now() + utc_clock_offset_s`.
+    ///
+    /// Set by [`Self::from_url`] after querying the first successful
+    /// `UTCTiming` element in the manifest.  `0.0` when no `UTCTiming` is
+    /// present or the session was built via [`Self::from_mpd`].
+    pub fn utc_clock_offset_s(&self) -> f64 {
+        self.utc_clock_offset_s
     }
 
     /// Shared reference to the underlying [`MediaSource`].

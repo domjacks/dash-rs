@@ -36,6 +36,12 @@ pub enum RequestType {
     InitializationSegment,
     /// A regular media segment.
     MediaSegment,
+    /// A UTC clock-synchronisation endpoint (`UTCTiming` element).
+    ///
+    /// Used by `urn:mpeg:dash:utc:http-xsdate:2014` and
+    /// `urn:mpeg:dash:utc:http-iso:2014` schemes.  The response body is
+    /// expected to contain a UTC datetime string.
+    ClockSync,
 }
 
 /// A request for a single network resource.

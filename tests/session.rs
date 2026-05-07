@@ -908,3 +908,175 @@ async fn timeline_repeat_attribute_produces_correct_times() {
         "expected EndOfStream after repeat segments exhausted, got {result:?}"
     );
 }
+
+// ── UTCTiming ─────────────────────────────────────────────────────────────────
+
+/// Build a live MPD that embeds a `UTCTiming` element with the given scheme
+/// and value.
+fn live_mpd_with_utc_timing(scheme_id: &str, value: &str) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     minimumUpdatePeriod="PT4S"
+     mediaPresentationDuration="PT30S">
+  <UTCTiming schemeIdUri="{scheme_id}" value="{value}"/>
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+    )
+}
+
+/// A `SegmentFetcher` that serves the initial manifest from a queue and,
+/// for `ClockSync` requests, returns a fixed datetime body supplied at
+/// construction time.
+struct UtcMockFetcher {
+    manifest_queue: Arc<Mutex<VecDeque<Bytes>>>,
+    clock_body: Bytes,
+}
+
+impl UtcMockFetcher {
+    fn new(manifest: &str, clock_body: &str) -> Self {
+        let mut q = VecDeque::new();
+        q.push_back(Bytes::from(manifest.to_string()));
+        Self {
+            manifest_queue: Arc::new(Mutex::new(q)),
+            clock_body: Bytes::from(clock_body.to_string()),
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentFetcher for UtcMockFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        let data = match request.request_type {
+            RequestType::Manifest => self
+                .manifest_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default(),
+            RequestType::ClockSync => self.clock_body.clone(),
+            _ => Bytes::new(),
+        };
+        let len = data.len() as u64;
+        Ok(FetchResponse {
+            final_url: request.url,
+            data,
+            transfer_duration_ms: 1,
+            bytes_received: len,
+        })
+    }
+
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+        Ok(true)
+    }
+
+    fn abort(&self) {}
+}
+
+/// A `direct` UTCTiming element with a known fixed datetime sets
+/// `utc_clock_offset_s` to approximately `fixed_time − SystemTime::now()`.
+#[tokio::test]
+async fn utc_direct_scheme_sets_offset() {
+    // Use a fixed point well in the past: 2000-01-01T00:00:00Z = 946 684 800 s.
+    const SERVER_TIME: f64 = 946_684_800.0;
+    let xml = live_mpd_with_utc_timing(
+        "urn:mpeg:dash:utc:direct:2014",
+        "2000-01-01T00:00:00Z",
+    );
+
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let client_now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let expected_offset = SERVER_TIME - client_now_s;
+    let actual_offset = session.utc_clock_offset_s();
+
+    // Allow 2 s of tolerance for test execution time.
+    assert!(
+        (actual_offset - expected_offset).abs() < 2.0,
+        "expected offset ≈ {expected_offset:.1}, got {actual_offset:.1}"
+    );
+    // Must be a large negative number (server is ~24 years behind).
+    assert!(
+        actual_offset < -700_000_000.0,
+        "offset should be a large negative value; got {actual_offset}"
+    );
+}
+
+/// An `http-xsdate` UTCTiming element causes a `ClockSync` fetch through the
+/// `SegmentFetcher`.  The mock fetcher returns a known datetime body and the
+/// computed offset must match `body_time − client_now`.
+#[tokio::test]
+async fn utc_http_xsdate_scheme_fetches_via_fetcher() {
+    // Server time: 2000-01-01T00:00:00Z = 946 684 800 s.
+    const SERVER_TIME: f64 = 946_684_800.0;
+    let xml = live_mpd_with_utc_timing(
+        "urn:mpeg:dash:utc:http-xsdate:2014",
+        "http://time.example.com/now",
+    );
+
+    let fetcher = UtcMockFetcher::new(&xml, "2000-01-01T00:00:00Z");
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let client_now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+    let expected_offset = SERVER_TIME - client_now_s;
+    let actual_offset = session.utc_clock_offset_s();
+
+    assert!(
+        (actual_offset - expected_offset).abs() < 2.0,
+        "expected offset ≈ {expected_offset:.1}, got {actual_offset:.1}"
+    );
+}
+
+/// When only unsupported schemes (`ntp`, `http-head`) are present the offset
+/// stays at `0.0` and the session is still constructed successfully.
+#[tokio::test]
+async fn utc_unsupported_schemes_fall_back_to_zero() {
+    // Build an MPD with two UTCTiming elements that are both unsupported.
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     minimumUpdatePeriod="PT4S"
+     mediaPresentationDuration="PT30S">
+  <UTCTiming schemeIdUri="urn:mpeg:dash:utc:ntp:2014" value="time.example.com"/>
+  <UTCTiming schemeIdUri="urn:mpeg:dash:utc:http-head:2014" value="http://time.example.com/head"/>
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let fetcher = MockFetcher::with_manifests(&[xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        session.utc_clock_offset_s(),
+        0.0,
+        "unsupported UTCTiming schemes must leave offset at 0.0"
+    );
+}

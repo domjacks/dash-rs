@@ -277,9 +277,11 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | SegmentTimeline / `$Time$` walking | `src/session/timeline.rs` |
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
 | Live-edge segment calculation | `src/session/live.rs` |
+| UTC clock sync (`resolve_utc_timing`, `query_http_utc`) | `src/session/utc.rs` |
+| XS datetime parser (`parse_xs_datetime`) | `src/util.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
-| Live-stream API + SegmentTimeline tests | `tests/session.rs` |
+| Live-stream API + SegmentTimeline + UTCTiming tests | `tests/session.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
@@ -327,7 +329,6 @@ implementation priority.  PRs welcome.
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
 | In-band DASH events (`emsg`) | `EventController.js` | Parse the `emsg` ISO BMFF box from each fetched segment (after `parse_sidx` in `fetch_next_segment`). Expose a callback or channel on `DashSession` for timed event dispatch. |
-| UTCTiming / live clock sync | `TimeSyncController.js` | `SystemTime::now()` is used naively for live-edge snapping. Parse `UTCTiming` elements from the MPD and query the endpoint before calling `compute_live_edge_segment`. |
 | Content steering server | `ContentSteeringController.js` | Static CDN failover exists. Parse `<ContentSteering>` from the MPD; spawn a refresh task that polls the steering server and updates the ordered base-URL list in `DashSession`. |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | New file `src/abr/l2a.rs`. Implements the Lyapunov optimisation tuned for low-latency streams. Register in `AbrController::default()`. |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` / `LearningAbrController.js` | New file `src/abr/lolp.rs`. Requires a QoE evaluator and an online weight-selector; more complex than other rules. |
