@@ -581,8 +581,266 @@ async fn timeline_vod_fetches_in_time_order() {
     assert_eq!(times, vec![0u64, 270_000, 540_000], "unexpected $Time$ sequence");
 }
 
-/// After all three SegmentTimeline segments have been fetched, the next call
-/// must return `DashError::EndOfStream`.
+/// A live MPD with a specific `startNumber` value, used to test the
+/// sliding-window behaviour when `startNumber` advances between manifest
+/// refreshes.
+fn live_mpd_with_start_number(start_number: u64) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     minimumUpdatePeriod="PT4S"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="{start_number}" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+    )
+}
+
+/// A static VOD MPD with two representations (v1 low-bitrate, v2 high-bitrate)
+/// and representation-specific init/media URLs so tests can distinguish them
+/// in the recorded URL list.
+const MULTI_REP_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$-$RepresentationID$.m4s"
+                       initialization="init-$RepresentationID$.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="100000"/>
+      <Representation id="v2" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+// ── init segment caching ──────────────────────────────────────────────────────
+
+/// After `fetch_init_segment` for rep v1 and a subsequent quality switch to
+/// v2 (cache miss → network fetch of v2 init), switching back to v1 must
+/// re-append the v1 init from the in-memory cache without a second network
+/// request.  Total init fetches per representation: exactly one each.
+#[tokio::test]
+async fn init_cache_hit_avoids_duplicate_network_fetch() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MULTI_REP_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Explicitly fetch init for rep v1 (index 0) → populates cache.
+    session
+        .fetch_init_segment(MediaType::Video)
+        .await
+        .expect("fetch_init_segment v1 failed");
+
+    // High-throughput fetch → ABR switches up to v2 (index 1).
+    // Cache miss for v2: triggers a network fetch of init-v2.mp4.
+    let high_metrics = AbrMetrics {
+        throughput_bps: 10_000_000.0,
+        buffer_level_ms: 5_000.0,
+        current_index: Some(0),
+        ..AbrMetrics::new(10_000_000.0, 5_000.0)
+    };
+    session
+        .fetch_next_segment(MediaType::Video, &high_metrics)
+        .await
+        .expect("fetch segment 1 (switch up to v2) failed");
+
+    // Critically-low buffer → InsufficientBufferRule forces index 0, overriding
+    // the SwitchHistoryRule cooldown.  Cache HIT for v1: no second network
+    // request for init-v1.mp4.
+    let low_buf_metrics = AbrMetrics {
+        throughput_bps: 0.0,
+        buffer_level_ms: 0.0,
+        current_index: Some(1),
+        ..AbrMetrics::new(0.0, 0.0)
+    };
+    session
+        .fetch_next_segment(MediaType::Video, &low_buf_metrics)
+        .await
+        .expect("fetch segment 2 (switch back to v1) failed");
+
+    let urls = recorded.lock().unwrap();
+    let init_v1_count = urls.iter().filter(|u| u.contains("init-v1")).count();
+    let init_v2_count = urls.iter().filter(|u| u.contains("init-v2")).count();
+
+    assert_eq!(
+        init_v1_count, 1,
+        "init-v1 should be fetched exactly once (second visit uses cache); got URLs: {urls:?}"
+    );
+    assert_eq!(
+        init_v2_count, 1,
+        "init-v2 should be fetched exactly once (cache miss on first switch); got URLs: {urls:?}"
+    );
+}
+
+/// When a quality switch occurs but the init segment for the new
+/// representation was never explicitly fetched, `fetch_next_segment` must
+/// perform a live network fetch and also populate the cache for future
+/// switches.
+#[tokio::test]
+async fn init_cache_miss_fetches_and_caches() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MULTI_REP_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // No explicit fetch_init_segment call — cache is empty.
+    // High-throughput fetch switches to v2; init-v2.mp4 is not cached, so
+    // it must be fetched from the network exactly once.
+    let high_metrics = AbrMetrics {
+        throughput_bps: 10_000_000.0,
+        buffer_level_ms: 5_000.0,
+        current_index: Some(0),
+        ..AbrMetrics::new(10_000_000.0, 5_000.0)
+    };
+    session
+        .fetch_next_segment(MediaType::Video, &high_metrics)
+        .await
+        .expect("fetch segment 1 (switch up to v2) failed");
+
+    // Now switch back to v1 (critically-low buffer).  Since v1 was never
+    // fetched, this is also a cache miss → a network fetch of init-v1.mp4.
+    let low_buf_metrics = AbrMetrics {
+        throughput_bps: 0.0,
+        buffer_level_ms: 0.0,
+        current_index: Some(1),
+        ..AbrMetrics::new(0.0, 0.0)
+    };
+    session
+        .fetch_next_segment(MediaType::Video, &low_buf_metrics)
+        .await
+        .expect("fetch segment 2 (switch back to v1) failed");
+
+    // Switch up to v2 again with high throughput.  Now v2 IS cached — no new
+    // init-v2.mp4 network request.
+    let high_metrics2 = AbrMetrics {
+        throughput_bps: 10_000_000.0,
+        buffer_level_ms: 5_000.0,
+        current_index: Some(0),
+        ..AbrMetrics::new(10_000_000.0, 5_000.0)
+    };
+    session
+        .fetch_next_segment(MediaType::Video, &high_metrics2)
+        .await
+        .expect("fetch segment 3 (switch back to v2, cached) failed");
+
+    let urls = recorded.lock().unwrap();
+    let init_v1_count = urls.iter().filter(|u| u.contains("init-v1")).count();
+    let init_v2_count = urls.iter().filter(|u| u.contains("init-v2")).count();
+
+    assert_eq!(
+        init_v1_count, 1,
+        "init-v1 must be fetched exactly once (cached after first miss); got URLs: {urls:?}"
+    );
+    assert_eq!(
+        init_v2_count, 1,
+        "init-v2 must be fetched exactly once (cached after first miss); got URLs: {urls:?}"
+    );
+}
+
+// ── startNumber sliding-window live ───────────────────────────────────────────
+
+/// When a manifest refresh advances `startNumber` past the current
+/// `segment_number`, the next fetch must target the new `startNumber` (the
+/// session has "fallen behind" the live DVR window).
+#[tokio::test]
+async fn sliding_window_snaps_segment_number_when_behind_window() {
+    let xml_v1 = live_mpd_with_start_number(1);
+    // startNumber jumps to 10; segment_number will be at 4 after 3 fetches.
+    let xml_v2 = live_mpd_with_start_number(10);
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[&xml_v1, &xml_v2], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    // Fetch 3 segments → segment_number = 4.
+    for _ in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .expect("segment fetch failed");
+    }
+
+    // Refresh: startNumber advances to 10.  segment_number (4) < 10 → snap.
+    session.refresh_manifest().await.expect("refresh failed");
+
+    // Post-snap, the next fetch must request seg-10.m4s.
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("fetch after sliding-window snap failed");
+
+    let urls = recorded.lock().unwrap();
+    let last_media_url = urls
+        .iter()
+        .rev()
+        .find(|u| u.contains("seg-"))
+        .expect("no media segment URL recorded");
+
+    assert!(
+        last_media_url.contains("/seg-10.m4s"),
+        "after sliding-window snap expected seg-10.m4s; got {last_media_url}"
+    );
+}
+
+/// When `startNumber` advances but `segment_number` is already inside the new
+/// window, only `start_number` is updated — `segment_number` is NOT changed.
+#[tokio::test]
+async fn sliding_window_no_snap_when_segment_number_inside_window() {
+    let xml_v1 = live_mpd_with_start_number(1);
+    // startNumber advances by 1 only; segment_number (4 after 3 fetches) is
+    // well inside the new window.
+    let xml_v2 = live_mpd_with_start_number(2);
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[&xml_v1, &xml_v2], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    // Fetch 3 segments → segment_number = 4.
+    for _ in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .expect("segment fetch failed");
+    }
+
+    // Refresh: startNumber advances to 2.  segment_number (4) ≥ 2 → no snap.
+    session.refresh_manifest().await.expect("refresh failed");
+
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("fetch after no-snap refresh failed");
+
+    let urls = recorded.lock().unwrap();
+    let last_media_url = urls
+        .iter()
+        .rev()
+        .find(|u| u.contains("seg-"))
+        .expect("no media segment URL recorded");
+
+    assert!(
+        last_media_url.contains("/seg-4.m4s"),
+        "segment_number should not be snapped when ahead of new startNumber; got {last_media_url}"
+    );
+}
 #[tokio::test]
 async fn timeline_vod_eos_after_all_segments() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));

@@ -25,6 +25,7 @@ mod segment_url;
 mod timeline;
 
 use std::{
+    collections::HashMap,
     sync::Arc,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -201,6 +202,14 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     minimum_update_period_ms: Option<u64>,
     /// Wall-clock instant of the most recent manifest load or refresh.
     last_manifest_refresh: Option<Instant>,
+    /// Cache of initialisation segment bytes, keyed by `"{media_type}/{rep_id}"`.
+    ///
+    /// Populated by [`Self::fetch_init_segment`].  On a quality switch inside
+    /// [`Self::fetch_next_segment`], the new representation's init segment is
+    /// re-appended from this cache without a network round-trip (dash.js
+    /// `InitCache.js` equivalent).  A cache miss triggers a live fetch that
+    /// also populates the cache entry for future switches.
+    init_cache: HashMap<String, bytes::Bytes>,
 }
 
 // Re-export for convenience in examples.
@@ -402,6 +411,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             abandon_timeout_ms: None,
             minimum_update_period_ms: mpd_minimum_update_period_ms,
             last_manifest_refresh: None,
+            init_cache: HashMap::new(),
         })
     }
 
@@ -671,7 +681,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         if let Some(period) = new_mpd.periods.first() {
             if let Some(track) = self.video_track.as_mut() {
                 if let Some(adaptation) = find_adaptation(period, &MediaType::Video) {
-                    let (_, _, new_total) =
+                    let (new_start, _, new_total) =
                         extract_segment_timing(adaptation, period, presentation_duration);
                     if new_total != track.total_segments {
                         tracing::info!(
@@ -682,11 +692,30 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                         );
                         track.total_segments = new_total;
                     }
+                    // Sliding-window: live DVR window may have moved forward.
+                    if new_start > track.start_number {
+                        tracing::info!(
+                            media_type = "video",
+                            old = track.start_number,
+                            new = new_start,
+                            "manifest refresh: startNumber advanced (sliding window)"
+                        );
+                        track.start_number = new_start;
+                        if track.segment_number < new_start {
+                            tracing::warn!(
+                                media_type = "video",
+                                segment_number = track.segment_number,
+                                new_start_number = new_start,
+                                "segment_number behind live window — snapping to new startNumber"
+                            );
+                            track.segment_number = new_start;
+                        }
+                    }
                 }
             }
             if let Some(track) = self.audio_track.as_mut() {
                 if let Some(adaptation) = find_adaptation(period, &MediaType::Audio) {
-                    let (_, _, new_total) =
+                    let (new_start, _, new_total) =
                         extract_segment_timing(adaptation, period, presentation_duration);
                     if new_total != track.total_segments {
                         tracing::info!(
@@ -696,6 +725,25 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                             "manifest refresh: segment count updated"
                         );
                         track.total_segments = new_total;
+                    }
+                    // Sliding-window: live DVR window may have moved forward.
+                    if new_start > track.start_number {
+                        tracing::info!(
+                            media_type = "audio",
+                            old = track.start_number,
+                            new = new_start,
+                            "manifest refresh: startNumber advanced (sliding window)"
+                        );
+                        track.start_number = new_start;
+                        if track.segment_number < new_start {
+                            tracing::warn!(
+                                media_type = "audio",
+                                segment_number = track.segment_number,
+                                new_start_number = new_start,
+                                "segment_number behind live window — snapping to new startNumber"
+                            );
+                            track.segment_number = new_start;
+                        }
                     }
                 }
             }
@@ -812,7 +860,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         };
 
         // Apply quality switch if needed.
-        {
+        let quality_switched = {
             let track = self.track_mut(&media_type)?;
             if decision.index != track.current_index {
                 tracing::info!(
@@ -824,6 +872,42 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 );
                 track.current_index = decision.index;
                 self.abr.record_switch();
+                true
+            } else {
+                false
+            }
+        };
+
+        // On a quality switch, re-append the init segment so the decoder
+        // sees the correct codec configuration.  Use the cache (populated by
+        // `fetch_init_segment`) to avoid a network round-trip; fall back to a
+        // live fetch (which also populates the cache) on a cache miss.
+        if quality_switched {
+            let (new_rep_id, mt_str) = {
+                let track = self.track(&media_type)?;
+                (
+                    track.representations[track.current_index].id.clone(),
+                    media_type.to_string(),
+                )
+            };
+            let cache_key = format!("{}/{}", mt_str, new_rep_id);
+            let cached = self.init_cache.get(&cache_key).cloned();
+            if let Some(data) = cached {
+                tracing::debug!(
+                    media_type = %media_type,
+                    rep_id = %new_rep_id,
+                    "quality switch: re-appending init segment from cache"
+                );
+                let chunk = Chunk::new(data, None, None, format!("{}/init", media_type));
+                let track = self.track_mut(&media_type)?;
+                track.sink.append(chunk).await?;
+            } else {
+                tracing::debug!(
+                    media_type = %media_type,
+                    rep_id = %new_rep_id,
+                    "quality switch: init segment not cached, fetching"
+                );
+                self.fetch_init_segment(media_type.clone()).await?;
             }
         }
 
@@ -986,11 +1070,17 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     }
 
     /// Fetch and append the initialisation segment for the given media type.
+    ///
+    /// The fetched bytes are stored in the internal init-segment cache
+    /// (`init_cache`).  Subsequent quality switches inside
+    /// [`Self::fetch_next_segment`] will re-append from the cache without
+    /// touching the network.
     pub async fn fetch_init_segment(&mut self, media_type: MediaType) -> Result<usize, DashError> {
-        let init_url = {
+        let (init_url, rep_id) = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
-            self.resolve_init_url(&media_type, rep)?
+            let url = self.resolve_init_url(&media_type, rep)?;
+            (url, rep.id.clone())
         };
 
         tracing::debug!(
@@ -1002,6 +1092,10 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let request = FetchRequest::new(init_url, RequestType::InitializationSegment);
         let response = self.fetcher.fetch(request).await?;
         let bytes_received = response.data.len();
+
+        // Populate the cache so quality-switch re-appends are free.
+        let cache_key = format!("{}/{}", media_type, rep_id);
+        self.init_cache.insert(cache_key, response.data.clone());
 
         let chunk = Chunk::new(response.data, None, None, format!("{}/init", media_type));
 

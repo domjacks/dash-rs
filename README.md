@@ -385,7 +385,6 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 
 | Feature | dash.js equivalent | Notes |
 |---|---|---|
-| Init segment caching | `InitCache.js` | Every quality switch requires the caller to call `fetch_init_segment` again manually |
 | In-band DASH events (`emsg`) | `EventController.js` | No `emsg` box parsing or timed-event dispatch |
 | UTCTiming / live clock sync | `TimeSyncController.js` | Wall-clock via `SystemTime::now()` is used; no `UTCTiming` endpoint queries |
 | Content steering server | `ContentSteeringController.js` | Static weighted-random BaseURL failover exists; no dynamic steering server polling |
@@ -395,7 +394,6 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 | `<ServiceDescription>` | `ServiceDescriptionController.js` | Target latency and playback-rate bounds are ignored |
 | ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Not implemented |
 | Catch-up playback rate control | `CatchupController.js` | No library-level API to adjust playback rate for latency catch-up |
-| `startNumber` sliding-window live | `SegmentsUtils.js` | Not handled during `refresh_manifest`; noted in its doc comment |
 | MPD Patch (`<Patch>`) | `PatchManifestModel.js` | `PatchLocation` in manifest is ignored |
 
 ### Tier 3 — Metrics, DRM, text, thumbnails

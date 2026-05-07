@@ -326,7 +326,6 @@ implementation priority.  PRs welcome.
 
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
-| Init segment caching | `InitCache.js` | Every quality switch currently requires the caller to call `fetch_init_segment` again manually. Cache `(media_type, representation_id) → Bytes` inside `DashSession`; re-append from cache on quality switch without a network round-trip. |
 | In-band DASH events (`emsg`) | `EventController.js` | Parse the `emsg` ISO BMFF box from each fetched segment (after `parse_sidx` in `fetch_next_segment`). Expose a callback or channel on `DashSession` for timed event dispatch. |
 | UTCTiming / live clock sync | `TimeSyncController.js` | `SystemTime::now()` is used naively for live-edge snapping. Parse `UTCTiming` elements from the MPD and query the endpoint before calling `compute_live_edge_segment`. |
 | Content steering server | `ContentSteeringController.js` | Static CDN failover exists. Parse `<ContentSteering>` from the MPD; spawn a refresh task that polls the steering server and updates the ordered base-URL list in `DashSession`. |
@@ -336,7 +335,6 @@ implementation priority.  PRs welcome.
 | `<ServiceDescription>` | `ServiceDescriptionController.js` | Parse target latency and playback-rate bounds. Expose `target_latency_ms()` and `playback_rate_range()` on `DashSession`. |
 | ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Parse the `prft` box from fMP4 segments to measure producer-to-consumer latency. Expose the measurement alongside `AbrMetrics`. |
 | Catch-up playback rate control | `CatchupController.js` | Add `set_playback_rate(f64)` to the `MediaSource` trait. `DashSession` computes the catch-up rate from `target_latency − actual_latency` and calls it. |
-| `startNumber` sliding-window live | `SegmentsUtils.js` | `refresh_manifest` doc comment explicitly notes this is unhandled. On refresh, if `startNumber` advances, update `start_number` and prune any buffered segment numbers that are now behind the window. |
 | MPD Patch (`<Patch>`) | `PatchManifestModel.js`, `ManifestUpdater.js` | Parse `PatchLocation` from the manifest. In `refresh_manifest_if_due`, if a patch URL is present, fetch and apply the XPath patch operations instead of re-fetching the full MPD. |
 
 ### Tier 3 — Metrics, DRM, text, thumbnails
