@@ -1278,8 +1278,7 @@ async fn emsg_no_subscriber_does_not_panic() {
 
 /// Multiple `emsg` boxes in a single segment each produce an independent event.
 #[tokio::test]
-async fn emsg_two_events_in_one_segment() {
-    let mut emsg_bytes = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
+async fn emsg_two_events_in_one_segment() {    let mut emsg_bytes = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
     emsg_bytes.extend_from_slice(&make_emsg_v1("urn:b", "", 1000, 2000, 500, 2, b"second"));
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
@@ -1464,5 +1463,125 @@ async fn current_metrics_audio_and_video_independent() {
         session.current_metrics(MediaType::Audio).throughput_bps,
         0.0,
         "audio EMA must remain 0 until an audio segment is fetched"
+    );
+}
+
+// ── SegmentList integration tests ─────────────────────────────────────────────
+
+/// A minimal VOD MPD that uses `<SegmentList>` with three explicit
+/// `<SegmentURL>` entries.  No `<SegmentTemplate>` is present so the
+/// SegmentList addressing path is triggered.
+const SEGMENTLIST_VOD_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT6S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <Representation id="v1" bandwidth="500000">
+        <SegmentList duration="2" timescale="1">
+          <Initialization sourceURL="init-v1.mp4"/>
+          <SegmentURL media="seg-v1-1.m4s"/>
+          <SegmentURL media="seg-v1-2.m4s"/>
+          <SegmentURL media="seg-v1-3.m4s"/>
+        </SegmentList>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// A `SegmentList` VOD stream fetches the three declared `<SegmentURL>`
+/// entries in declaration order and then returns `EndOfStream`.
+#[tokio::test]
+async fn segmentlist_vod_fetches_in_order() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[SEGMENTLIST_VOD_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+
+    // All three segments should succeed.
+    for i in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .unwrap_or_else(|e| panic!("segment {i} fetch failed: {e}"));
+    }
+
+    let urls = recorded.lock().unwrap();
+    // Filter to media segments only (exclude any init fetches).
+    let media_urls: Vec<&String> = urls.iter().filter(|u| u.contains("seg-v1")).collect();
+
+    assert_eq!(media_urls.len(), 3, "expected 3 segment fetches; got {urls:?}");
+
+    // Verify the URLs are fetched in declaration order.
+    for (i, expected_suffix) in ["seg-v1-1.m4s", "seg-v1-2.m4s", "seg-v1-3.m4s"]
+        .iter()
+        .enumerate()
+    {
+        assert!(
+            media_urls[i].ends_with(expected_suffix),
+            "segment {i}: expected URL ending in {expected_suffix}, got {}",
+            media_urls[i]
+        );
+    }
+}
+
+/// After all `<SegmentURL>` entries have been fetched, the next call must
+/// return `DashError::EndOfStream`.
+#[tokio::test]
+async fn segmentlist_eos_after_all_urls() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[SEGMENTLIST_VOD_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+
+    // Consume all three segments.
+    for _ in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .expect("segment fetch should succeed");
+    }
+
+    // Fourth call must signal EOS.
+    let result = session.fetch_next_segment(MediaType::Video, &metrics).await;
+    assert!(
+        matches!(result, Err(DashError::EndOfStream { .. })),
+        "expected EndOfStream after all SegmentURL entries consumed, got {result:?}"
+    );
+}
+
+/// `fetch_init_segment` resolves the init URL from
+/// `SegmentList.Initialization.sourceURL` and performs a network fetch.
+#[tokio::test]
+async fn segmentlist_init_segment_resolved() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[SEGMENTLIST_VOD_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    session
+        .fetch_init_segment(MediaType::Video)
+        .await
+        .expect("fetch_init_segment must succeed for a SegmentList stream");
+
+    let urls = recorded.lock().unwrap();
+    let init_url = urls
+        .iter()
+        .find(|u| u.contains("init-v1.mp4"))
+        .unwrap_or_else(|| panic!("expected an init-v1.mp4 fetch; got {urls:?}"));
+
+    assert!(
+        init_url.ends_with("init-v1.mp4"),
+        "init URL should resolve to init-v1.mp4; got {init_url}"
     );
 }

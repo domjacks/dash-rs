@@ -6,7 +6,7 @@
 //! Mirrors `MpdHelper.js`, `DashManifestModel.js`, and parts of
 //! `TemplateSegmentsGetter.js` in dash.js.
 
-use dash_mpd::{AdaptationSet, Period, Representation, SegmentTemplate};
+use dash_mpd::{AdaptationSet, Period, Representation, SegmentList, SegmentTemplate};
 
 use crate::abr::RepresentationInfo;
 use super::MediaType;
@@ -207,6 +207,81 @@ pub(super) fn adaptation_mime_type(adaptation: &AdaptationSet) -> String {
     }
 
     "application/octet-stream".to_owned()
+}
+
+/// Merge `SegmentList` attributes across the DASH element hierarchy.
+///
+/// Resolution order: Representation (most specific) → AdaptationSet → Period.
+/// `duration`, `timescale`, and `Initialization` are inherited from the nearest
+/// parent that defines them; `segment_urls` are taken from the **innermost**
+/// level that declares a non-empty list (they are never concatenated across
+/// levels).
+///
+/// Returns `None` when no `SegmentList` is present at any level.
+pub(super) fn merge_segment_lists(
+    repr: Option<&Representation>,
+    adaptation: &AdaptationSet,
+    period: &Period,
+) -> Option<SegmentList> {
+    let sources: [Option<&SegmentList>; 3] = [
+        repr.and_then(|r| r.SegmentList.as_ref()),
+        adaptation.SegmentList.as_ref(),
+        period.SegmentList.as_ref(),
+    ];
+
+    if sources.iter().all(|s| s.is_none()) {
+        return None;
+    }
+
+    let mut merged = SegmentList::default();
+    for sl in sources.iter().flatten() {
+        if merged.duration.is_none() {
+            merged.duration = sl.duration;
+        }
+        if merged.timescale.is_none() {
+            merged.timescale = sl.timescale;
+        }
+        if merged.Initialization.is_none() {
+            merged.Initialization.clone_from(&sl.Initialization);
+        }
+        // Take segment_urls from the innermost non-empty list only.
+        if merged.segment_urls.is_empty() && !sl.segment_urls.is_empty() {
+            merged.segment_urls.clone_from(&sl.segment_urls);
+        }
+    }
+
+    Some(merged)
+}
+
+/// Extract `(start_number, segment_duration_ms, total_segments)` for a track
+/// that uses `SegmentList` addressing.
+///
+/// `start_number` is always `0` for `SegmentList` streams because the
+/// addressing is index-based (`segment_urls[segment_number]`), not
+/// number-based.  `total_segments` is `segment_urls.len()` (or `None` when
+/// the merged list is empty).
+pub(super) fn extract_segment_list_timing(
+    adaptation: &AdaptationSet,
+    period: &Period,
+) -> (u64, f64, Option<u64>) {
+    let first_repr = adaptation.representations.first();
+    let Some(sl) = merge_segment_lists(first_repr, adaptation, period) else {
+        return (0, 2_000.0, None);
+    };
+
+    let seg_dur_ms = match (sl.duration, sl.timescale) {
+        (Some(dur), Some(ts)) => dur as f64 / ts as f64 * 1_000.0,
+        (Some(dur), None) => dur as f64 * 1_000.0, // timescale defaults to 1
+        _ => 2_000.0,
+    };
+
+    let total = if sl.segment_urls.is_empty() {
+        None
+    } else {
+        Some(sl.segment_urls.len() as u64)
+    };
+
+    (0, seg_dur_ms, total)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

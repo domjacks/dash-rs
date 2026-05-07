@@ -186,11 +186,14 @@ overrides it when present.  `segment_number` is clamped to at least
 Multi-period support is not yet implemented.  Passing an MPD with multiple
 periods will not error, but only the first period's tracks are used.
 
-### Segment URL resolution handles `SegmentTemplate` with `$Number$` and `$Time$`
+### Segment URL resolution handles `SegmentTemplate` with `$Number$` and `$Time$`, and `SegmentList`
 
 `SegmentTemplate` addressing via `$Number$` (fixed-duration segments) and
-`$Time$` (SegmentTimeline) are both supported.  `SegmentList` and byte-range
-`SegmentBase` are not yet implemented.  `resolve_segment_url` returns
+`$Time$` (SegmentTimeline) are both supported.  `SegmentList` (explicit
+`<SegmentURL>` elements) is also supported — `segment_urls[segment_number]`
+is looked up on each fetch and the URL is resolved against the CDN base-URL
+chain.  Byte-range `SegmentList` entries (`@mediaRange`) and `SegmentBase`
+are not yet implemented.  `resolve_segment_url` returns
 `DashError::SegmentUrlUnresolvable` for manifests that use those forms.
 
 ---
@@ -321,7 +324,6 @@ implementation priority.  PRs welcome.
 
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
-| SegmentList | `ListSegmentsGetter.js` | No code path exists. Add a new dispatch arm in `fetch_next_segment` after `merge_segment_templates`. |
 | SegmentBase (byte-range) | `SegmentBaseGetter.js`, `SegmentBaseLoader.js` | `FetchRequest::byte_range` field exists but is never set. Fetch the `sidx`/index, walk byte ranges, set the field. |
 | Multi-period playback | `StreamController.js` / `Stream.js` | `from_mpd` and `fetch_next_segment` currently hardcode `periods[0]`. Need period switching, `Period@duration`-based EOS detection, and `TrackState` re-initialisation on period boundary. |
 | XLink resolution | `XlinkLoader.js` / `XlinkController.js` | `xlink:href` on `Period`, `AdaptationSet`, etc. are ignored by `dash-mpd`. Add a pre-processing pass that fetches and inlines remote elements before session construction. |

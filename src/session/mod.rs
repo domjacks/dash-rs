@@ -52,8 +52,8 @@ use crate::{
 use self::{
     live::compute_live_edge_segment,
     mpd::{
-        adaptation_mime_type, extract_representations, extract_segment_timing, find_adaptation,
-        merge_segment_templates,
+        adaptation_mime_type, extract_representations, extract_segment_list_timing,
+        extract_segment_timing, find_adaptation, merge_segment_lists, merge_segment_templates,
     },
     segment_url::{collect_candidate_base_urls, expand_template, resolve_effective_base_url},
     timeline::find_timeline_segment,
@@ -157,6 +157,24 @@ const EVENT_CHANNEL_CAPACITY: usize = 64;
 /// can be refined once real download timing data is available.
 const THROUGHPUT_EMA_ALPHA: f64 = 0.3;
 
+// ── AddressingMode ────────────────────────────────────────────────────────────
+
+/// How segment URLs are constructed for a given track.
+///
+/// Determined at session construction from the MPD hierarchy and drives the
+/// URL-building branch inside [`DashSession::fetch_next_segment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AddressingMode {
+    /// `SegmentTemplate` with `$Number$` substitution (fixed-duration segments).
+    Number,
+    /// `SegmentTemplate` with `SegmentTimeline` / `$Time$` substitution.
+    Timeline,
+    /// Explicit `<SegmentList>` with `<SegmentURL>` elements.  The segment
+    /// index into `segment_urls` is `segment_number` (which starts at 0 for
+    /// SegmentList tracks).
+    List,
+}
+
 // ── TrackState ────────────────────────────────────────────────────────────────
 
 /// Per-track playback and buffer state maintained by [`DashSession`].
@@ -189,9 +207,8 @@ struct TrackState {
     total_segments: Option<u64>,
     /// The `SourceBufferSink` wrapping the underlying buffer.
     sink: SourceBufferSink,
-    /// When `true`, the track uses SegmentTimeline / `$Time$` addressing.
-    /// When `false` (default), `$Number$` addressing is used.
-    uses_timeline: bool,
+    /// How segment URLs are constructed for this track.
+    addressing_mode: AddressingMode,
     /// For `$Time$` addressing: the start time (in timescale ticks) of the
     /// **next** segment to fetch.  `None` means start from the first entry in
     /// the current timeline.  Ignored when `uses_timeline` is `false`.
@@ -222,7 +239,7 @@ impl TrackState {
         start_number: u64,
         segment_duration_ms: f64,
         total_segments: Option<u64>,
-        uses_timeline: bool,
+        addressing_mode: AddressingMode,
     ) -> Self {
         Self {
             _media_type: media_type,
@@ -234,7 +251,7 @@ impl TrackState {
             segment_duration_ms,
             total_segments,
             sink,
-            uses_timeline,
+            addressing_mode,
             next_segment_time: None,
             throughput_ema_bps: 0.0,
             last_transfer_ms: 0.0,
@@ -418,12 +435,21 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
                 let (start_number, seg_dur_ms, total_segments) =
                     extract_segment_timing(adaptation, period, presentation_duration);
-                let uses_timeline = merge_segment_templates(
-                    adaptation.representations.first(),
-                    adaptation,
-                    period,
-                )
-                .is_some_and(|t| t.SegmentTimeline.is_some());
+                // Determine addressing mode — SegmentList takes priority when
+                // no SegmentTemplate is present at any level.
+                let first_repr = adaptation.representations.first();
+                let has_segment_list =
+                    merge_segment_lists(first_repr, adaptation, period).is_some();
+                let tmpl = merge_segment_templates(first_repr, adaptation, period);
+                let (start_number, seg_dur_ms, total_segments, addressing_mode) =
+                    if has_segment_list && tmpl.is_none() {
+                        let (sn, sd, ts) = extract_segment_list_timing(adaptation, period);
+                        (sn, sd, ts, AddressingMode::List)
+                    } else if tmpl.is_some_and(|t| t.SegmentTimeline.is_some()) {
+                        (start_number, seg_dur_ms, total_segments, AddressingMode::Timeline)
+                    } else {
+                        (start_number, seg_dur_ms, total_segments, AddressingMode::Number)
+                    };
                 Some(TrackState::new(
                     MediaType::Video,
                     reps,
@@ -431,7 +457,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     start_number,
                     seg_dur_ms,
                     total_segments,
-                    uses_timeline,
+                    addressing_mode,
                 ))
             } else {
                 None
@@ -467,12 +493,19 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
                 let (start_number, seg_dur_ms, total_segments) =
                     extract_segment_timing(adaptation, period, presentation_duration);
-                let uses_timeline = merge_segment_templates(
-                    adaptation.representations.first(),
-                    adaptation,
-                    period,
-                )
-                .is_some_and(|t| t.SegmentTimeline.is_some());
+                let first_repr = adaptation.representations.first();
+                let has_segment_list =
+                    merge_segment_lists(first_repr, adaptation, period).is_some();
+                let tmpl = merge_segment_templates(first_repr, adaptation, period);
+                let (start_number, seg_dur_ms, total_segments, addressing_mode) =
+                    if has_segment_list && tmpl.is_none() {
+                        let (sn, sd, ts) = extract_segment_list_timing(adaptation, period);
+                        (sn, sd, ts, AddressingMode::List)
+                    } else if tmpl.is_some_and(|t| t.SegmentTimeline.is_some()) {
+                        (start_number, seg_dur_ms, total_segments, AddressingMode::Timeline)
+                    } else {
+                        (start_number, seg_dur_ms, total_segments, AddressingMode::Number)
+                    };
                 Some(TrackState::new(
                     MediaType::Audio,
                     reps,
@@ -480,7 +513,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     start_number,
                     seg_dur_ms,
                     total_segments,
-                    uses_timeline,
+                    addressing_mode,
                 ))
             } else {
                 None
@@ -1104,7 +1137,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
             let seg_num = track.segment_number;
-            let uses_timeline = track.uses_timeline;
+            let addressing_mode = track.addressing_mode.clone();
             let next_seg_time = track.next_segment_time;
 
             let period = &self.mpd.periods[0];
@@ -1119,6 +1152,52 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .iter()
                 .find(|r| r.id.as_deref() == Some(rep.id.as_str()));
 
+            let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+
+            if addressing_mode == AddressingMode::List {
+                // ─ SegmentList addressing ────────────────────────────────────
+                let sl = merge_segment_lists(repr_obj, adaptation, period)
+                    .ok_or(DashError::SegmentUrlUnresolvable)?;
+
+                // `seg_num` is used as a direct 0-based index (start_number is 0).
+                let seg_idx = seg_num as usize;
+                let seg_url_entry =
+                    sl.segment_urls.get(seg_idx).ok_or_else(|| {
+                        tracing::info!(
+                            media_type = %media_type,
+                            seg_idx,
+                            "SegmentList exhausted — signalling EndOfStream"
+                        );
+                        DashError::EndOfStream {
+                            media_type: media_type.to_string(),
+                        }
+                    })?;
+
+                // `mediaRange` (byte-range SegmentList) is not yet supported.
+                if seg_url_entry.mediaRange.is_some() {
+                    tracing::warn!(
+                        media_type = %media_type,
+                        seg_idx,
+                        "SegmentList entry uses mediaRange (byte-range); not yet supported"
+                    );
+                    return Err(DashError::SegmentUrlUnresolvable);
+                }
+
+                let media_url_str = seg_url_entry
+                    .media
+                    .as_deref()
+                    .ok_or(DashError::SegmentUrlUnresolvable)?;
+
+                let candidates = collect_candidate_base_urls(
+                    &self.base_url,
+                    &self.mpd.base_url,
+                    period,
+                    adaptation,
+                    repr_base_urls,
+                );
+                (candidates, media_url_str.to_owned(), seg_num, None)
+            } else {
+            // ─ SegmentTemplate addressing (Number or Timeline) ───────────────
             let merged = merge_segment_templates(repr_obj, adaptation, period)
                 .ok_or(DashError::SegmentUrlUnresolvable)?;
 
@@ -1127,7 +1206,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .as_deref()
                 .ok_or(DashError::SegmentUrlUnresolvable)?;
 
-            let (path, timeline_info) = if uses_timeline {
+            let (path, timeline_info) = if addressing_mode == AddressingMode::Timeline {
                 let tl = merged
                     .SegmentTimeline
                     .as_ref()
@@ -1150,7 +1229,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 (p, None)
             };
 
-            let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
             let candidates = collect_candidate_base_urls(
                 &self.base_url,
                 &self.mpd.base_url,
@@ -1159,6 +1237,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 repr_base_urls,
             );
             (candidates, path, seg_num, timeline_info)
+            } // end SegmentTemplate branch
         };
 
         // Fetch — try each CDN candidate in priority order.
@@ -1416,6 +1495,23 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 );
                 return base
                     .join(&url_str)
+                    .map_err(|_| DashError::SegmentUrlUnresolvable);
+            }
+        }
+
+        // SegmentList: check Initialization.sourceURL at any hierarchy level.
+        if let Some(sl) = merge_segment_lists(repr_obj, adaptation, period) {
+            if let Some(src) = sl.Initialization.as_ref().and_then(|i| i.sourceURL.as_deref()) {
+                let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+                let base = resolve_effective_base_url(
+                    &self.base_url,
+                    &self.mpd.base_url,
+                    period,
+                    adaptation,
+                    repr_base_urls,
+                );
+                return base
+                    .join(src)
                     .map_err(|_| DashError::SegmentUrlUnresolvable);
             }
         }
