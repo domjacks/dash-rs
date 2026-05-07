@@ -146,6 +146,17 @@ pub struct DashEvent {
 /// [`tokio::sync::broadcast::error::RecvError::Lagged`].
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// Smoothing factor for the per-track throughput exponential moving average.
+///
+/// `α = 0.3` weights the newest sample at 30 % and the accumulated history at
+/// 70 %, giving a half-life of roughly 1.9 segments.  This is intentionally
+/// somewhat reactive: the first few segments after a network change will shift
+/// the estimate meaningfully, while random per-segment variance is smoothed
+/// out.  dash.js uses a pair of EWMAs (3 s and 8 s half-lives) and takes the
+/// minimum; a single EMA with `α = 0.3` is a pragmatic starting point that
+/// can be refined once real download timing data is available.
+const THROUGHPUT_EMA_ALPHA: f64 = 0.3;
+
 // ── TrackState ────────────────────────────────────────────────────────────────
 
 /// Per-track playback and buffer state maintained by [`DashSession`].
@@ -185,6 +196,22 @@ struct TrackState {
     /// **next** segment to fetch.  `None` means start from the first entry in
     /// the current timeline.  Ignored when `uses_timeline` is `false`.
     next_segment_time: Option<u64>,
+    /// Exponential moving average of measured download throughput in bits per
+    /// second, updated after every successful media-segment fetch.
+    ///
+    /// `0.0` until the first segment has been fetched.  The smoothing factor
+    /// is [`THROUGHPUT_EMA_ALPHA`].  Seeded directly from the first sample
+    /// rather than from zero, to avoid the EMA taking many segments to climb
+    /// out of a low initial value.
+    throughput_ema_bps: f64,
+    /// Transfer duration of the most recently completed media-segment fetch,
+    /// in milliseconds.
+    ///
+    /// Used as a proxy for network latency in [`AbrMetrics::latency_ms`].
+    /// Note: this is the total transfer time (bytes on the wire), not a pure
+    /// round-trip time measurement.  It will be `0.0` until the first segment
+    /// has been fetched.
+    last_transfer_ms: f64,
 }
 
 impl TrackState {
@@ -209,6 +236,8 @@ impl TrackState {
             sink,
             uses_timeline,
             next_segment_time: None,
+            throughput_ema_bps: 0.0,
+            last_transfer_ms: 0.0,
         }
     }
 }
@@ -600,24 +629,33 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Build an [`AbrMetrics`] snapshot for the given media type using the
     /// current session state.
+    ///
+    /// `throughput_bps` is the per-track exponential moving average of
+    /// measured download throughput, updated after every successful
+    /// [`Self::fetch_next_segment`] call.  It is `0.0` before the first
+    /// segment has been fetched.
+    ///
+    /// `latency_ms` is the transfer duration of the most recent fetch (total
+    /// bytes-on-the-wire time, not a pure round-trip time).
     pub fn current_metrics(&self, media_type: MediaType) -> AbrMetrics {
         let track = match media_type {
             MediaType::Video => self.video_track.as_ref(),
             MediaType::Audio => self.audio_track.as_ref(),
         };
 
-        let (buffer_level_ms, current_index) = if let Some(t) = track {
-            let buffered = t.sink.buffered();
-            let level = buffered.last().map(|r| r.end * 1_000.0).unwrap_or(0.0);
-            (level, Some(t.current_index))
-        } else {
-            (0.0, None)
-        };
+        let (buffer_level_ms, current_index, throughput_bps, latency_ms) =
+            if let Some(t) = track {
+                let buffered = t.sink.buffered();
+                let level = buffered.last().map(|r| r.end * 1_000.0).unwrap_or(0.0);
+                (level, Some(t.current_index), t.throughput_ema_bps, t.last_transfer_ms)
+            } else {
+                (0.0, None, 0.0, 0.0)
+            };
 
         AbrMetrics {
-            throughput_bps: 0.0,
+            throughput_bps,
             buffer_level_ms,
-            latency_ms: 0.0,
+            latency_ms,
             current_index,
             dropped_frames: None,
             total_decoded_frames: None,
@@ -1186,8 +1224,27 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         let response = opt_response.ok_or(last_err)?;
 
-        if let Some(bps) = response.throughput_bps() {
-            tracing::debug!(throughput_bps = bps, "measured throughput");
+        // Update per-track throughput EMA and transfer latency from this response.
+        {
+            let track = self.track_mut(&media_type)?;
+            track.last_transfer_ms = response.transfer_duration_ms as f64;
+            if let Some(bps) = response.throughput_bps() {
+                if track.throughput_ema_bps == 0.0 {
+                    // First sample: seed the EMA directly so it does not spend
+                    // many segments climbing out of an artificially low value.
+                    track.throughput_ema_bps = bps;
+                } else {
+                    track.throughput_ema_bps = THROUGHPUT_EMA_ALPHA * bps
+                        + (1.0 - THROUGHPUT_EMA_ALPHA) * track.throughput_ema_bps;
+                }
+            }
+            tracing::debug!(
+                media_type = %media_type,
+                segment_number = seg_number,
+                throughput_bps = track.throughput_ema_bps,
+                transfer_ms = track.last_transfer_ms,
+                "throughput EMA updated"
+            );
         }
 
         let sidx = parse_sidx(&response.data);

@@ -1304,3 +1304,165 @@ async fn emsg_two_events_in_one_segment() {
     // No third event.
     assert!(events.try_recv().is_err());
 }
+
+// ── current_metrics() throughput tests ───────────────────────────────────────
+
+/// A fetcher that serves a known payload with controllable timing metadata so
+/// we can verify the EMA calculation precisely.
+struct TimedSegmentFetcher {
+    manifest_xml: Bytes,
+    /// Bytes returned for every media / init segment fetch.
+    segment_data: Bytes,
+    /// `transfer_duration_ms` reported for every media / init segment fetch.
+    transfer_duration_ms: u64,
+}
+
+impl TimedSegmentFetcher {
+    fn new(manifest_xml: &str, segment_bytes: usize, transfer_duration_ms: u64) -> Self {
+        Self {
+            manifest_xml: Bytes::from(manifest_xml.to_string()),
+            segment_data: Bytes::from(vec![0u8; segment_bytes]),
+            transfer_duration_ms,
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentFetcher for TimedSegmentFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        let (data, transfer_ms) = if request.request_type == RequestType::Manifest {
+            (self.manifest_xml.clone(), 1)
+        } else {
+            (self.segment_data.clone(), self.transfer_duration_ms)
+        };
+        let len = data.len() as u64;
+        Ok(FetchResponse {
+            final_url: request.url,
+            data,
+            transfer_duration_ms: transfer_ms,
+            bytes_received: len,
+        })
+    }
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+        Ok(true)
+    }
+    fn abort(&self) {}
+}
+
+/// After fetching one segment with known size and transfer time,
+/// `current_metrics()` must return a non-zero throughput equal to the first
+/// sample (EMA seeded directly from the first measurement) and `latency_ms`
+/// equal to the transfer duration.
+#[tokio::test]
+async fn current_metrics_throughput_nonzero_after_first_fetch() {
+    // 125 000 bytes in 1 000 ms → 1 000 000 bps (1 Mbps).
+    let bytes = 125_000usize;
+    let duration_ms = 1_000u64;
+    let expected_bps = (bytes as f64 * 8.0) / (duration_ms as f64 / 1_000.0);
+
+    let fetcher = TimedSegmentFetcher::new(STATIC_MPD, bytes, duration_ms);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Before any fetch: throughput must be 0.
+    assert_eq!(session.current_metrics(MediaType::Video).throughput_bps, 0.0);
+    assert_eq!(session.current_metrics(MediaType::Video).latency_ms, 0.0);
+
+    session
+        .fetch_next_segment(MediaType::Video, &default_metrics())
+        .await
+        .unwrap();
+
+    let m = session.current_metrics(MediaType::Video);
+    assert!(
+        (m.throughput_bps - expected_bps).abs() < 1.0,
+        "expected ~{expected_bps} bps after first fetch, got {}",
+        m.throughput_bps
+    );
+    assert_eq!(m.latency_ms, duration_ms as f64);
+}
+
+/// After multiple fetches the EMA must converge toward the steady-state value
+/// and must never remain at 0.0.
+#[tokio::test]
+async fn current_metrics_throughput_ema_updates_each_fetch() {
+    // 250 000 bytes in 500 ms → 4 000 000 bps (4 Mbps).
+    let bytes = 250_000usize;
+    let duration_ms = 500u64;
+    let sample_bps = (bytes as f64 * 8.0) / (duration_ms as f64 / 1_000.0);
+
+    let fetcher = TimedSegmentFetcher::new(STATIC_MPD, bytes, duration_ms);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Fetch 5 segments (VOD has 15 total at 2 s each).
+    for _ in 0..5 {
+        session
+            .fetch_next_segment(MediaType::Video, &default_metrics())
+            .await
+            .unwrap();
+    }
+
+    let m = session.current_metrics(MediaType::Video);
+
+    // After seeding on the first sample all subsequent samples are identical,
+    // so the EMA should equal the sample value exactly.
+    assert!(
+        (m.throughput_bps - sample_bps).abs() < 1.0,
+        "EMA should converge to {sample_bps} bps when all samples are equal, got {}",
+        m.throughput_bps
+    );
+    assert!(m.throughput_bps > 0.0, "throughput must be non-zero after fetches");
+    assert_eq!(m.latency_ms, duration_ms as f64);
+}
+
+/// `current_metrics()` for audio returns independent throughput from the
+/// video track — the two tracks maintain separate EMAs.
+#[tokio::test]
+async fn current_metrics_audio_and_video_independent() {
+    const AUDIO_VIDEO_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="video-$Number$.m4s" initialization="video-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="audio-$Number$.m4s" initialization="audio-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let fetcher = TimedSegmentFetcher::new(AUDIO_VIDEO_MPD, 50_000, 200);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Before any fetches both tracks report 0.
+    assert_eq!(session.current_metrics(MediaType::Video).throughput_bps, 0.0);
+    assert_eq!(session.current_metrics(MediaType::Audio).throughput_bps, 0.0);
+
+    // Fetch only the video track.
+    session
+        .fetch_next_segment(MediaType::Video, &default_metrics())
+        .await
+        .unwrap();
+
+    // Video should now be non-zero; audio must still be 0.
+    assert!(session.current_metrics(MediaType::Video).throughput_bps > 0.0);
+    assert_eq!(
+        session.current_metrics(MediaType::Audio).throughput_bps,
+        0.0,
+        "audio EMA must remain 0 until an audio segment is fetched"
+    );
+}
