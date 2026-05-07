@@ -6,7 +6,7 @@
 //! Mirrors `MpdHelper.js`, `DashManifestModel.js`, and parts of
 //! `TemplateSegmentsGetter.js` in dash.js.
 
-use dash_mpd::{AdaptationSet, Period, Representation, SegmentList, SegmentTemplate};
+use dash_mpd::{AdaptationSet, Period, Representation, SegmentBase, SegmentList, SegmentTemplate};
 
 use crate::abr::RepresentationInfo;
 use super::MediaType;
@@ -151,7 +151,7 @@ pub(super) fn extract_segment_timing(
         let count = count_timeline_segments(&tl.segments);
         if count > 0 { Some(count) } else { None }
     } else {
-        let effective_duration = presentation_duration.or(period.duration);
+        let effective_duration = period.duration.or(presentation_duration);
         effective_duration.map(|d| {
             let total_ms = d.as_millis() as f64;
             (total_ms / seg_dur_ms).ceil() as u64
@@ -282,6 +282,36 @@ pub(super) fn extract_segment_list_timing(
     };
 
     (0, seg_dur_ms, total)
+}
+
+/// Walk the element hierarchy (Representation → AdaptationSet → Period) for
+/// the first `SegmentBase` element, returning a reference to it.
+///
+/// Returns `None` when no `SegmentBase` is found at any level.
+pub(super) fn find_segment_base<'a>(
+    repr: Option<&'a Representation>,
+    adaptation: &'a AdaptationSet,
+    period: &'a Period,
+) -> Option<&'a SegmentBase> {
+    repr.and_then(|r| r.SegmentBase.as_ref())
+        .or(adaptation.SegmentBase.as_ref())
+        .or(period.SegmentBase.as_ref())
+}
+
+/// Return the relative media-file path for a `SegmentBase` track.
+///
+/// For `SegmentBase`, the media file *is* the `BaseURL` element at the
+/// representation (or adaptation) level.  Returns an empty string when no
+/// `BaseURL` is declared — callers should treat the effective base URL itself
+/// as the media file.
+pub(super) fn segment_base_media_path(
+    repr: Option<&Representation>,
+    adaptation: &AdaptationSet,
+) -> String {
+    repr.and_then(|r| r.BaseURL.first())
+        .or_else(|| adaptation.BaseURL.first())
+        .map(|b| b.base.clone())
+        .unwrap_or_default()
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

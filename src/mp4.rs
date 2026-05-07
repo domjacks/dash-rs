@@ -380,7 +380,39 @@ pub fn parse_sidx(data: &[u8]) -> Option<SidxInfo> {
     parse_sidx_fullbox(&box_data[fullbox_start..])
 }
 
-// ── Internal helpers ──────────────────────────────────────────────────────────
+/// Presentation-time and byte-range information for a single subsegment entry
+/// from a `sidx` box.
+///
+/// Used by `SegmentBase` addressing to issue exact byte-range `GET` requests
+/// for each segment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SidxEntry {
+    /// Byte offset of this subsegment from the start of the media file.
+    pub byte_offset: u64,
+    /// Byte length (referenced_size, lower 31 bits) of this subsegment.
+    pub byte_length: u32,
+    /// Presentation start time in seconds.
+    pub start_s: f64,
+    /// Presentation end time (exclusive) in seconds.
+    pub end_s: f64,
+}
+
+/// Parse a `sidx` box and return one [`SidxEntry`] per reference entry,
+/// with byte offsets absolute within the media file.
+///
+/// `data` is the raw bytes of the range fetched for `SegmentBase@indexRange`
+/// (e.g. `Range: bytes=0-999`).  `index_end_offset` is the first byte in the
+/// media file that lies **after** the fetched range (i.e.
+/// `indexRange_end + 1`).  For the common case where the `indexRange` ends
+/// exactly at the last byte of the `sidx` box, the first subsegment begins at
+/// `index_end_offset + first_offset` (where `first_offset` is a field inside
+/// the `sidx` box itself).
+///
+/// Returns `None` when the `sidx` is absent, malformed, or has zero entries.
+pub fn parse_sidx_entries(data: &[u8], index_end_offset: u64) -> Option<Vec<SidxEntry>> {
+    let (box_data, fullbox_start) = find_box(data, *b"sidx")?;
+    parse_sidx_entries_fullbox(&box_data[fullbox_start..], index_end_offset)
+}
 
 /// Walk the flat top-level box list starting at byte 0 and return
 /// `(box_slice, fullbox_offset)` for the first box whose type matches
@@ -558,6 +590,82 @@ fn parse_sidx_fullbox(data: &[u8]) -> Option<SidxInfo> {
     })
 }
 
+/// Parse the FullBox payload of a `sidx` box and return per-entry byte-range
+/// and timing information for `SegmentBase` addressing.
+///
+/// `data` starts at the `version` byte (same contract as
+/// [`parse_sidx_fullbox`]).  `index_end_offset` is the first byte in the
+/// media file that lies after the last byte of the fetched index range.
+fn parse_sidx_entries_fullbox(data: &[u8], index_end_offset: u64) -> Option<Vec<SidxEntry>> {
+    if data.len() < 24 {
+        return None;
+    }
+
+    let version = data[0];
+    let timescale = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+    if timescale == 0 {
+        return None;
+    }
+
+    let (earliest_presentation_time, first_offset, refs_start): (u64, u64, usize) =
+        if version == 0 {
+            let ept = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as u64;
+            let fo = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as u64;
+            (ept, fo, 24)
+        } else {
+            if data.len() < 32 {
+                return None;
+            }
+            let ept = u64::from_be_bytes([
+                data[12], data[13], data[14], data[15],
+                data[16], data[17], data[18], data[19],
+            ]);
+            let fo = u64::from_be_bytes([
+                data[20], data[21], data[22], data[23],
+                data[24], data[25], data[26], data[27],
+            ]);
+            (ept, fo, 32)
+        };
+
+    let rc_off = refs_start - 2;
+    let reference_count = u16::from_be_bytes([data[rc_off], data[rc_off + 1]]) as usize;
+    if reference_count == 0 {
+        return None;
+    }
+
+    let refs_end = refs_start.checked_add(reference_count.checked_mul(12)?)?;
+    if data.len() < refs_end {
+        return None;
+    }
+
+    let ts = timescale as f64;
+    let mut entries = Vec::with_capacity(reference_count);
+    let mut current_byte: u64 = index_end_offset + first_offset;
+    let mut current_time: u64 = earliest_presentation_time;
+
+    for i in 0..reference_count {
+        let off = refs_start + i * 12;
+        // reference_type (1 bit) + referenced_size (31 bits).
+        let word0 = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let referenced_size = word0 & 0x7FFF_FFFF;
+        let subseg_dur =
+            u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
+                as u64;
+
+        entries.push(SidxEntry {
+            byte_offset: current_byte,
+            byte_length: referenced_size,
+            start_s: current_time as f64 / ts,
+            end_s: (current_time + subseg_dur) as f64 / ts,
+        });
+
+        current_byte += referenced_size as u64;
+        current_time += subseg_dur;
+    }
+
+    Some(entries)
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -571,8 +679,7 @@ mod tests {
     ///   ept(4) first_offset(4) reserved(2) ref_count(2)
     ///   [ ref_type_and_size(4) duration(4) sap(4) ] × ref_count
     fn make_sidx_v0(timescale: u32, ept: u32, durations: &[u32]) -> Vec<u8> {
-        let ref_count = durations.len() as u16;
-        let size: u32 = 32 + 12 * ref_count as u32;
+        let ref_count = durations.len() as u16;        let size: u32 = 32 + 12 * ref_count as u32;
         let mut buf = Vec::with_capacity(size as usize);
 
         buf.extend_from_slice(&size.to_be_bytes());

@@ -181,19 +181,29 @@ overrides it when present.  `segment_number` is clamped to at least
 `start_number`.  The helper is `compute_live_edge_segment()` in
 `src/session/live.rs`.
 
-### `DashSession` uses the first `Period` only
+### Multi-period playback
 
-Multi-period support is not yet implemented.  Passing an MPD with multiple
-periods will not error, but only the first period's tracks are used.
+`DashSession` transparently advances through all `Period` elements at period
+boundaries.  When `fetch_next_segment` exhausts the current period's segments,
+it calls `try_advance_period` internally: tracks are reinitialised from the new
+period, init segments are re-fetched, and fetching resumes — all without the
+caller seeing an `EndOfStream` error.  `EndOfStream` is only returned after the
+last period is exhausted.
 
-### Segment URL resolution handles `SegmentTemplate` with `$Number$` and `$Time$`, and `SegmentList`
+`period_count()` returns the total number of periods; `current_period_index()`
+returns the zero-based index of the period currently being fetched.
+
+### Segment URL resolution handles `SegmentTemplate` with `$Number$` and `$Time$`, `SegmentList`, and `SegmentBase`
 
 `SegmentTemplate` addressing via `$Number$` (fixed-duration segments) and
 `$Time$` (SegmentTimeline) are both supported.  `SegmentList` (explicit
 `<SegmentURL>` elements) is also supported — `segment_urls[segment_number]`
 is looked up on each fetch and the URL is resolved against the CDN base-URL
-chain.  Byte-range `SegmentList` entries (`@mediaRange`) and `SegmentBase`
-are not yet implemented.  `resolve_segment_url` returns
+chain.  `SegmentBase` (byte-range addressing) is also supported — the `sidx`
+index is fetched lazily on the first `fetch_next_segment` call using the
+`indexRange` byte range, and each subsegment is then fetched as a byte-range
+`GET` against the media file.  Byte-range `SegmentList` entries (`@mediaRange`)
+and `SegmentBase` are not yet implemented.  `resolve_segment_url` returns
 `DashError::SegmentUrlUnresolvable` for manifests that use those forms.
 
 ---
@@ -276,13 +286,15 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
 | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
+| Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
 | MPD helpers (`merge_segment_templates`, `extract_segment_timing`, etc.) | `src/session/mpd.rs` |
 | SegmentTimeline / `$Time$` walking | `src/session/timeline.rs` |
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
 | Live-edge segment calculation | `src/session/live.rs` |
 | UTC clock sync (`resolve_utc_timing`, `query_http_utc`) | `src/session/utc.rs` |
+| XLink pre-processing (`resolve_xlinks`, Period + AdaptationSet) | `src/session/xlink.rs` |
 | XS datetime parser (`parse_xs_datetime`) | `src/util.rs` |
-| ISO BMFF box parsing (`sidx`, `emsg`) | `src/mp4.rs` |
+| ISO BMFF box parsing (`sidx` timing, `sidx` byte-range index, `emsg`) | `src/mp4.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
 | Live-stream API + SegmentTimeline + UTCTiming + emsg tests | `tests/session.rs` |
@@ -301,6 +313,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `SourceBufferSink.js` | `media_source::sink::SourceBufferSink` |
 | `FragmentLoader.js` / `URLLoader.js` | `fetch::SegmentFetcher` trait + `fetch::stub::StubSegmentFetcher` |
 | `ManifestLoader.js` | `manifest::ManifestLoader` |
+| `XlinkController.js` / `XlinkLoader.js` | `session::xlink::resolve_xlinks` (called automatically inside `DashSession::from_url`) |
 | `ThroughputRule.js` | `abr::throughput::ThroughputRule` |
 | `BolaRule.js` | `abr::buffer::BufferOccupancyRule` |
 | `InsufficientBufferRule.js` | `abr::insufficient_buffer::InsufficientBufferRule` |
@@ -310,8 +323,11 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `AbrController.js` | `abr::AbrController` |
 | `ManifestUpdater.js` | `session::DashSession::refresh_manifest_if_due` (called automatically inside `fetch_next_segment`) |
 | `MediaPlayer.js` + `StreamProcessor.js` | `session::DashSession` |
+| `StreamController.js` / `Stream.js` | `session::DashSession::try_advance_period` (called automatically inside `fetch_next_segment`) |
 | `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` |
 | `EventController.js` | `session::DashEvent` + `DashSession::subscribe_events` (broadcast channel; events dispatched by `fetch_next_segment`) |
+| `ServiceDescriptionController.js` | `DashSession::target_latency_ms()` + `playback_rate_range()` |
+| `AbrController.setMaxAllowedBitrateFor()` | `DashSession::set_max_bitrate(media_type, bps)` / `clear_max_bitrate` / `max_bitrate` |
 
 ---
 
@@ -322,21 +338,18 @@ implementation priority.  PRs welcome.
 
 ### Tier 1 — Core stream compatibility (blocks many real-world streams)
 
-| Feature | dash.js equivalent | Implementation notes |
-|---|---|---|
-| SegmentBase (byte-range) | `SegmentBaseGetter.js`, `SegmentBaseLoader.js` | `FetchRequest::byte_range` field exists but is never set. Fetch the `sidx`/index, walk byte ranges, set the field. |
-| Multi-period playback | `StreamController.js` / `Stream.js` | `from_mpd` and `fetch_next_segment` currently hardcode `periods[0]`. Need period switching, `Period@duration`-based EOS detection, and `TrackState` re-initialisation on period boundary. |
-| XLink resolution | `XlinkLoader.js` / `XlinkController.js` | `xlink:href` on `Period`, `AdaptationSet`, etc. are ignored by `dash-mpd`. Add a pre-processing pass that fetches and inlines remote elements before session construction. |
+All Tier 1 features are now implemented.  No outstanding items.
 
 ### Tier 2 — Important for live streams and ABR quality
 
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
 | Content steering server | `ContentSteeringController.js` | Static CDN failover exists. Parse `<ContentSteering>` from the MPD; spawn a refresh task that polls the steering server and updates the ordered base-URL list in `DashSession`. |
+| Gap controller (stall recovery) | `GapController.js` | Monitor playback position against buffer level; when a decoded-buffer gap stalls the player, seek forward past it to resume. Add a `GapController` struct that `DashSession` ticks on each `fetch_next_segment` call; expose `on_stall(position_ms, buffer_level_ms) -> Option<SeekTarget>`. No stall-detection or auto-recovery exists today. |
+| MPD `<Location>` element | `LocationSelector.js` | `<Location>` elements list alternative manifest URLs. When the primary URL fails in `ManifestLoader::load` or `refresh_manifest_if_due`, retry each `Location` URL in order before returning an error. Parsed `Location` URLs should be stored as `Vec<Url>` in `DashSession`. |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | New file `src/abr/l2a.rs`. Implements the Lyapunov optimisation tuned for low-latency streams. Register in `AbrController::default()`. |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` / `LearningAbrController.js` | New file `src/abr/lolp.rs`. Requires a QoE evaluator and an online weight-selector; more complex than other rules. |
 | Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Requires `SegmentFetcher` to support progressive byte delivery (streaming body). `FetchResponse` currently holds complete `Bytes`; need a `Stream<Item=Bytes>` variant or callback. |
-| `<ServiceDescription>` | `ServiceDescriptionController.js` | Parse target latency and playback-rate bounds. Expose `target_latency_ms()` and `playback_rate_range()` on `DashSession`. |
 | ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Parse the `prft` box from fMP4 segments to measure producer-to-consumer latency. Expose the measurement alongside `AbrMetrics`. |
 | Catch-up playback rate control | `CatchupController.js` | Add `set_playback_rate(f64)` to the `MediaSource` trait. `DashSession` computes the catch-up rate from `target_latency − actual_latency` and calls it. |
 | MPD Patch (`<Patch>`) | `PatchManifestModel.js`, `ManifestUpdater.js` | Parse `PatchLocation` from the manifest. In `refresh_manifest_if_due`, if a patch URL is present, fetch and apply the XPath patch operations instead of re-fetching the full MPD. |
@@ -351,7 +364,6 @@ implementation priority.  PRs welcome.
 | Subtitle / text tracks | `TextController.js` / `TTMLParser.js` / `VTTParser.js` | Add `MediaType::Text`. In `from_mpd`, find text `AdaptationSet`s and create a third `TrackState`. Need a `TextParser` trait with TTML and VTT implementations. |
 | Thumbnails / trick play | `ThumbnailController.js` / `ThumbnailTracks.js` | Parse thumbnail `AdaptationSet` (role=`thumbnail`). Add `DashSession::thumbnail_at(time_s)` that returns a sprite-sheet tile URL and crop rect. |
 | DRM / Content Protection | `streaming/protection/` | Add a `ContentProtection` descriptor to `RepresentationInfo`. Expose a `DrmKeyProvider` trait. `DashSession` calls it when a `pssh` box is encountered. Platform-specific EME/CDM integration belongs in examples. |
-| Representation bitrate cap API | `AbrController.setMaxAllowedBitrateFor()` | Add `DashSession::set_max_bitrate(media_type, bps)`. Inject a capping rule into `AbrController` that enforces it. |
 | Codec capability filtering | `Capabilities.js` / `CapabilitiesFilter.js` | Add a `CodecCapabilities` trait. `DashSession::from_mpd` calls `capabilities.is_supported(mime)` and filters representations before `TrackState` is built. GStreamer implementation belongs in the example. |
 | Offline download | `src/offline/` | Native equivalent: a download coordinator that writes segments to a directory with a manifest index. Out of scope until the above tiers are complete. |
 

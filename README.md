@@ -362,9 +362,10 @@ DashSession
 Data flow per segment:
 
 1. `AbrController::select` picks a `QualityDecision` from `AbrMetrics`.
-2. `DashSession` resolves the segment URL from the MPD `SegmentTemplate`.
+2. `DashSession` resolves the segment URL from the MPD `SegmentTemplate` for the current period.
 3. `SegmentFetcher::fetch` retrieves the bytes.
 4. `SourceBufferSink::append` forwards the `Chunk` to the `SourceBuffer`.
+5. At period boundaries, `fetch_next_segment` transparently advances to the next `Period` and re-fetches init segments before continuing.
 
 ---
 
@@ -374,12 +375,7 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 
 ### Tier 1 — Core stream compatibility (blocks many real-world streams)
 
-| Feature | dash.js equivalent | Notes |
-|---|---|---|
-| SegmentList | `ListSegmentsGetter.js` | Not implemented |
-| SegmentBase (byte-range) | `SegmentBaseGetter.js` | `FetchRequest::byte_range` field exists but is never set |
-| Multi-period playback | `StreamController.js` / `Stream.js` | First `Period` only; no error on multi-period MPDs |
-| XLink resolution | `XlinkLoader.js` / `XlinkController.js` | `xlink:href` attributes in the MPD are silently ignored |
+All Tier 1 features are now implemented.  No outstanding items.
 
 ### Tier 2 — Important for live streams and ABR quality
 
@@ -389,7 +385,6 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | Not implemented |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` | Not implemented |
 | Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Fetcher receives whole segments only; no progressive streaming |
-| `<ServiceDescription>` | `ServiceDescriptionController.js` | Target latency and playback-rate bounds are ignored |
 | ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Not implemented |
 | Catch-up playback rate control | `CatchupController.js` | No library-level API to adjust playback rate for latency catch-up |
 | MPD Patch (`<Patch>`) | `PatchManifestModel.js` | `PatchLocation` in manifest is ignored |
@@ -404,6 +399,5 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 | Subtitle / text tracks | `TextController.js` / `TTMLParser.js` | `MediaType` has only `Video` and `Audio`; no text type |
 | Thumbnails / trick play | `ThumbnailController.js` | Not implemented |
 | DRM / Content Protection | `streaming/protection/` | No DRM variants in `DashError`; no crypto code |
-| Representation bitrate cap API | `AbrController.setMaxAllowedBitrateFor()` | No API to cap ABR to a user-specified max bitrate |
 | Codec capability filtering | `Capabilities.js` / `CapabilitiesFilter.js` | Environment-specific; not implemented |
 | Offline download | `src/offline/` | Browser-specific (IndexedDB); native equivalent would differ |

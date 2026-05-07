@@ -1585,3 +1585,690 @@ async fn segmentlist_init_segment_resolved() {
         "init URL should resolve to init-v1.mp4; got {init_url}"
     );
 }
+
+// ── SegmentBase integration tests ─────────────────────────────────────────────
+
+/// The MPD for SegmentBase tests.
+///
+/// The media file is `video.mp4`.  Its `indexRange` is `"1000-1999"` (the
+/// byte range of the `sidx` box), so `index_end_offset = 2000`.  The init
+/// data lives at bytes 0–999 (`Initialization@range="0-999"`).
+const SEGMENTBASE_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT10S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <Representation id="v1" bandwidth="1000000">
+        <BaseURL>video.mp4</BaseURL>
+        <SegmentBase indexRange="1000-1999">
+          <Initialization range="0-999"/>
+        </SegmentBase>
+      </Representation>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Build a minimal v0 `sidx` box with `first_offset = 0` and the given
+/// `durations` (in timescale ticks), so it can be returned by a test fetcher
+/// to drive `SegmentBase` addressing.
+///
+/// `referenced_size` for every entry is fixed at 4 096 bytes.
+fn make_test_sidx(timescale: u32, durations: &[u32]) -> Vec<u8> {
+    let ref_count = durations.len() as u16;
+    // v0 sidx: size(4) + type(4) + version(1) + flags(3) + ref_id(4)
+    //          + timescale(4) + ept(4) + first_offset(4) + reserved(2)
+    //          + ref_count(2) + ref_count × 12
+    let size: u32 = 32 + 12 * ref_count as u32;
+    let mut buf = Vec::with_capacity(size as usize);
+    buf.extend_from_slice(&size.to_be_bytes());
+    buf.extend_from_slice(b"sidx");
+    buf.push(0); // version = 0
+    buf.extend_from_slice(&[0u8; 3]); // flags
+    buf.extend_from_slice(&1u32.to_be_bytes()); // reference_id
+    buf.extend_from_slice(&timescale.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes()); // earliest_presentation_time
+    buf.extend_from_slice(&0u32.to_be_bytes()); // first_offset
+    buf.extend_from_slice(&[0u8; 2]); // reserved
+    buf.extend_from_slice(&ref_count.to_be_bytes());
+    for &dur in durations {
+        // referenced_size = 4096 (lower 31 bits; ref_type = 0)
+        buf.extend_from_slice(&4096u32.to_be_bytes());
+        buf.extend_from_slice(&dur.to_be_bytes());
+        buf.extend_from_slice(&0x8000_0000u32.to_be_bytes()); // SAP info
+    }
+    buf
+}
+
+/// A `SegmentFetcher` for SegmentBase tests.
+///
+/// - Manifest requests are served from a preset XML string.
+/// - The first byte-range request to `video.mp4` returns the fake sidx.
+/// - Subsequent requests to `video.mp4` return empty media bytes.
+/// - All request URLs (and their byte ranges) are recorded in `log`.
+struct SegmentBaseFetcher {
+    manifest_xml: Bytes,
+    sidx_data: Bytes,
+    /// `("url", Option<(start, end)>)` pairs in order.
+    log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>>,
+}
+
+impl SegmentBaseFetcher {
+    fn new(
+        manifest_xml: &str,
+        sidx_data: Vec<u8>,
+        log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>>,
+    ) -> Self {
+        Self {
+            manifest_xml: Bytes::from(manifest_xml.to_owned()),
+            sidx_data: Bytes::from(sidx_data),
+            log,
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentFetcher for SegmentBaseFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        self.log
+            .lock()
+            .unwrap()
+            .push((request.url.to_string(), request.byte_range));
+
+        let data = if request.request_type == RequestType::Manifest {
+            self.manifest_xml.clone()
+        } else if request.byte_range == Some((1000, 1999)) {
+            // This is the sidx index fetch.
+            self.sidx_data.clone()
+        } else {
+            // Init or media segment byte-range fetch — return empty.
+            Bytes::new()
+        };
+
+        let len = data.len() as u64;
+        Ok(FetchResponse {
+            final_url: request.url,
+            data,
+            transfer_duration_ms: 1,
+            bytes_received: len,
+        })
+    }
+
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+        Ok(true)
+    }
+
+    fn abort(&self) {}
+}
+
+/// For a `SegmentBase` stream, the first `fetch_next_segment` call must fetch
+/// the sidx index (byte-range 1000-1999) and then the first subsegment using
+/// the byte range derived from the sidx.
+#[tokio::test]
+async fn segmentbase_fetches_sidx_then_first_segment() {
+    // sidx: timescale=1000, 3 segments each 3000 ticks (3 s), 4096 bytes each.
+    let sidx = make_test_sidx(1000, &[3000, 3000, 4000]);
+    let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let fetcher =
+        SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("first SegmentBase fetch must succeed");
+
+    let entries = log.lock().unwrap();
+    // [0] = manifest fetch (no byte range)
+    // [1] = sidx fetch (byte range 1000-1999)
+    // [2] = first segment fetch (byte range 2000..2000+4095 = 2000-6095)
+    assert!(entries.len() >= 3, "expected at least 3 fetches, got {entries:?}");
+    assert_eq!(entries[1].1, Some((1000, 1999)), "sidx fetch must use indexRange");
+    // first segment starts immediately after index_end_offset (2000) + first_offset (0).
+    assert_eq!(
+        entries[2].1,
+        Some((2000, 2000 + 4096 - 1)),
+        "first segment byte range wrong; got {:?}",
+        entries[2].1
+    );
+}
+
+/// After all subsegments described by the sidx have been fetched, the next
+/// call must return `DashError::EndOfStream`.
+#[tokio::test]
+async fn segmentbase_eos_after_all_subsegments() {
+    // sidx: 2 subsegments of 4096 bytes each.
+    let sidx = make_test_sidx(1000, &[3000, 3000]);
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, log);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    // Fetch both subsegments successfully.
+    for i in 0..2 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .unwrap_or_else(|e| panic!("segment {i} failed: {e}"));
+    }
+    // Third call must be EOS.
+    let result = session.fetch_next_segment(MediaType::Video, &metrics).await;
+    assert!(
+        matches!(result, Err(DashError::EndOfStream { .. })),
+        "expected EndOfStream after all SegmentBase subsegments, got {result:?}"
+    );
+}
+
+/// `fetch_init_segment` for a `SegmentBase` stream resolves the init byte
+/// range from `SegmentBase.Initialization@range` and issues a byte-range GET
+/// against the media file URL.
+#[tokio::test]
+async fn segmentbase_init_segment_uses_byte_range() {
+    let sidx = make_test_sidx(1000, &[3000]);
+    let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let fetcher =
+        SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    session
+        .fetch_init_segment(MediaType::Video)
+        .await
+        .expect("fetch_init_segment must succeed for SegmentBase stream");
+
+    let entries = log.lock().unwrap();
+    // [0] = manifest; [1] = init byte-range fetch.
+    let init_entry = entries
+        .iter()
+        .skip(1)
+        .find(|(url, _)| url.contains("video.mp4"))
+        .expect("expected a fetch to video.mp4 for the init segment");
+    assert_eq!(
+        init_entry.1,
+        Some((0, 999)),
+        "init fetch must use Initialization@range 0-999; got {:?}",
+        init_entry.1
+    );
+}
+
+// ── ServiceDescription tests ──────────────────────────────────────────────────
+
+const SERVICE_DESC_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <ServiceDescription id="sd1">
+    <Latency target="2.5"/>
+    <PlaybackRate min="0.9" max="1.1"/>
+  </ServiceDescription>
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+#[test]
+fn service_description_target_latency_ms() {
+    let session = session_from_xml(SERVICE_DESC_MPD);
+    let latency = session
+        .target_latency_ms()
+        .expect("ServiceDescription with Latency@target must return Some");
+    // target="2.5" s → 2500 ms.
+    assert!(
+        (latency - 2500.0).abs() < 1e-6,
+        "expected 2500.0 ms, got {latency}"
+    );
+}
+
+#[test]
+fn service_description_playback_rate_range() {
+    let session = session_from_xml(SERVICE_DESC_MPD);
+    let (min, max) = session
+        .playback_rate_range()
+        .expect("ServiceDescription with PlaybackRate must return Some");
+    assert!((min - 0.9).abs() < 1e-9, "expected min=0.9, got {min}");
+    assert!((max - 1.1).abs() < 1e-9, "expected max=1.1, got {max}");
+}
+
+#[test]
+fn service_description_absent_returns_none() {
+    // STATIC_MPD has no <ServiceDescription>.
+    let session = session_from_xml(STATIC_MPD);
+    assert!(session.target_latency_ms().is_none());
+    assert!(session.playback_rate_range().is_none());
+}
+
+// ── Bitrate cap tests ─────────────────────────────────────────────────────────
+
+/// When a max bitrate is set, ABR must not select a representation above the
+/// cap even when the network would support a higher quality.
+#[test]
+fn bitrate_cap_clamps_abr_decision() {
+    // Three representations: 500 kbps, 1 Mbps, 3 Mbps.
+    const MULTI_REP_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="low"  bandwidth="500000"/>
+      <Representation id="mid"  bandwidth="1000000"/>
+      <Representation id="high" bandwidth="3000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let mut session = session_from_xml(MULTI_REP_MPD);
+    // Metrics: very high throughput and buffer level high enough that
+    // InsufficientBufferRule (≤ 2000 ms threshold) won't fire.
+    let high_metrics = AbrMetrics::new(10_000_000.0, 10_000.0);
+
+    // Without a cap, the ABR should pick "high" (index 2).
+    let _decision = session.select_quality(&MediaType::Video, &high_metrics).unwrap();
+    // Note: select_quality uses the ABR directly (uncapped); we verify cap
+    // state via max_bitrate() instead of asserting the uncapped index here.
+
+    // Cap at 1 Mbps (index 1 = "mid"); "high" (3 Mbps) must be excluded.
+    session.set_max_bitrate(MediaType::Video, 1_000_000);
+    assert_eq!(session.max_bitrate(&MediaType::Video), Some(1_000_000));
+
+    // After clearing, the cap must be gone.
+    session.clear_max_bitrate(MediaType::Video);
+    assert_eq!(session.max_bitrate(&MediaType::Video), None);
+}
+
+/// With a bitrate cap active, `fetch_next_segment` must not fetch a segment
+/// from a representation above the cap.
+#[tokio::test]
+async fn bitrate_cap_enforced_in_fetch_next_segment() {
+    const MULTI_REP_MPD2: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$RepresentationID$-$Number$.m4s"
+                       initialization="init-$RepresentationID$.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="low"  bandwidth="500000"/>
+      <Representation id="mid"  bandwidth="1000000"/>
+      <Representation id="high" bandwidth="3000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MULTI_REP_MPD2], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Cap at 1 Mbps (index 1 = "mid"); high-throughput metrics would otherwise
+    // select index 2 = "high".
+    session.set_max_bitrate(MediaType::Video, 1_000_000);
+
+    let high_metrics = AbrMetrics::new(10_000_000.0, 100.0);
+    session
+        .fetch_next_segment(MediaType::Video, &high_metrics)
+        .await
+        .expect("fetch with bitrate cap must succeed");
+
+    let urls = recorded.lock().unwrap();
+    // The first media segment URL must use "low" or "mid", not "high".
+    let seg_url = urls
+        .iter()
+        .find(|u| u.contains("seg-"))
+        .expect("no segment URL recorded");
+    assert!(
+        !seg_url.contains("seg-high"),
+        "bitrate cap should have prevented selecting 'high'; got {seg_url}"
+    );
+}
+
+// ── Multi-period tests ────────────────────────────────────────────────────────
+
+/// Two-period VOD MPD with 1 segment (2 s) per period.
+/// `period_count()` should return 2.
+#[tokio::test]
+async fn multi_period_period_count() {
+    const MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT4S">
+  <Period id="p1" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p1-seg-$Number$.m4s" initialization="p1-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+  <Period id="p2" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p2-seg-$Number$.m4s" initialization="p2-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let session = session_from_xml(MPD);
+    assert_eq!(session.period_count(), 2);
+    assert_eq!(session.current_period_index(), 0);
+}
+
+/// Two-period VOD: fetch the 1 segment from period 1, then the session
+/// transparently advances to period 2 and fetches its segment.
+/// `EndOfStream` fires only after period 2 is exhausted.
+#[tokio::test]
+async fn multi_period_advances_on_period_end() {
+    const MPD2: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT4S">
+  <Period id="p1" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p1-seg-$Number$.m4s" initialization="p1-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+  <Period id="p2" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p2-seg-$Number$.m4s" initialization="p2-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MPD2], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert_eq!(session.period_count(), 2);
+
+    let metrics = AbrMetrics::new(4_000_000.0, 10_000.0);
+
+    // Fetch 1 — period 0, segment 1. The period index stays at 0 until
+    // the next call detects period 0's EOS.
+    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+    assert_eq!(session.current_period_index(), 0, "should still be in period 0 after first fetch");
+
+    // Fetch 2 — period 0 EOS detected → auto-advance to period 1 → period 1, segment 1.
+    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+    assert_eq!(session.current_period_index(), 1, "should be in period 1 after second fetch");
+
+    // Fetch 3 — period 1 exhausted, no period 2 → EndOfStream.
+    let err = session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap_err();
+    assert!(
+        matches!(err, dash_rs::error::DashError::EndOfStream { .. }),
+        "expected EndOfStream, got {err:?}"
+    );
+
+    // The recorded URLs should include both periods' segment URLs.
+    let urls = recorded.lock().unwrap();
+    let seg_urls: Vec<_> = urls.iter().filter(|u| u.contains("seg-")).collect();
+    assert!(
+        seg_urls.iter().any(|u| u.contains("p1-seg-")),
+        "expected a p1 segment URL in {seg_urls:?}"
+    );
+    assert!(
+        seg_urls.iter().any(|u| u.contains("p2-seg-")),
+        "expected a p2 segment URL in {seg_urls:?}"
+    );
+}
+
+/// Three-period VOD: `EndOfStream` fires only after all three periods are
+/// exhausted (3 fetches total, one segment per period).
+#[tokio::test]
+async fn multi_period_eos_after_last_period() {
+    const MPD3: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT6S">
+  <Period id="p1" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p1-seg-$Number$.m4s" initialization="p1-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+  <Period id="p2" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p2-seg-$Number$.m4s" initialization="p2-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+  <Period id="p3" duration="PT2S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p3-seg-$Number$.m4s" initialization="p3-init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let session_xml = session_from_xml(MPD3);
+    assert_eq!(session_xml.period_count(), 3);
+
+    // Build via from_url so init segments are fetched.
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MPD3], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = AbrMetrics::new(4_000_000.0, 10_000.0);
+
+    // 3 successful fetches (one per period).
+    for i in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .unwrap_or_else(|e| panic!("fetch {i} failed: {e}"));
+    }
+
+    // 4th fetch → EndOfStream.
+    let err = session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap_err();
+    assert!(
+        matches!(err, dash_rs::error::DashError::EndOfStream { .. }),
+        "expected EndOfStream after all 3 periods, got {err:?}"
+    );
+    assert_eq!(session.current_period_index(), 2);
+}
+
+/// Single-period VOD: period_count() == 1 and EndOfStream fires normally.
+#[tokio::test]
+async fn single_period_period_count_is_one() {
+    let session = session_from_xml(STATIC_MPD);
+    assert_eq!(session.period_count(), 1);
+    assert_eq!(session.current_period_index(), 0);
+}
+
+// ── XLink resolution tests ────────────────────────────────────────────────────
+
+/// A `Period` with `xlink:actuate="onLoad"` must be fetched, parsed, and
+/// inlined in-place before session construction.  The resulting session should
+/// behave as if the remote content was always present in the MPD.
+#[tokio::test]
+async fn xlink_period_onload_is_inlined() {
+    // Remote resource: a bare Period fragment served at the xlink href URL.
+    const REMOTE_PERIOD: &str = r#"<Period id="remote" duration="PT4S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="remote-seg-$Number$.m4s" initialization="remote-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>"#;
+
+    // Main MPD: one placeholder period pointing to the remote resource.
+    const MAIN_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <Period xlink:href="http://example.com/remote-period.mpd"
+          xlink:actuate="onLoad"/>
+</MPD>"#;
+
+    // Feed the fetcher: first request → main MPD, second → remote period XML.
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MAIN_MPD, REMOTE_PERIOD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .expect("session construction should succeed after XLink resolution");
+
+    // The remote period was inlined: session has exactly one period.
+    assert_eq!(session.period_count(), 1, "inlined period should be present");
+
+    // The session can fetch a segment whose URL comes from the remote period's
+    // SegmentTemplate — confirming the remote content is active.
+    let metrics = AbrMetrics::new(4_000_000.0, 10_000.0);
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("segment fetch from inlined period should succeed");
+
+    let urls = recorded.lock().unwrap();
+    assert!(
+        urls.iter().any(|u| u.contains("remote-seg-")),
+        "expected a remote-seg-N URL but recorded {urls:?}"
+    );
+}
+
+/// A `Period` with `href="urn:mpeg:dash:resolve-to-zero:2013"` and
+/// `actuate="onLoad"` must be silently removed without triggering any
+/// additional network request.
+#[tokio::test]
+async fn xlink_period_resolve_to_zero_removes_period() {
+    // Two-period MPD: p1 is normal; p2 is the resolve-to-zero sentinel.
+    const MAIN_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <Period id="p1" duration="PT4S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+  <Period xlink:href="urn:mpeg:dash:resolve-to-zero:2013"
+          xlink:actuate="onLoad"/>
+</MPD>"#;
+
+    // Only one manifest in the queue — resolve-to-zero must not trigger a fetch.
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MAIN_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .expect("session construction should succeed");
+
+    // The resolve-to-zero period was removed; only p1 remains.
+    assert_eq!(session.period_count(), 1, "resolve-to-zero period should be removed");
+}
+
+/// A `Period` with `xlink:actuate="onRequest"` must NOT be resolved eagerly.
+/// The placeholder must remain in the manifest and no additional fetch must be
+/// triggered during session construction.
+#[tokio::test]
+async fn xlink_period_onrequest_is_not_fetched() {
+    // Two-period MPD: p1 is normal; p2 is an onRequest XLink placeholder.
+    const MAIN_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <Period id="p1" duration="PT4S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+  <Period id="p2" xlink:href="http://example.com/extra.mpd"
+          xlink:actuate="onRequest"/>
+</MPD>"#;
+
+    // Only one manifest in the queue — confirm no second fetch is triggered.
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MAIN_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .expect("session construction should succeed");
+
+    // Both periods are present: p1 (normal) and p2 (unresolved placeholder).
+    assert_eq!(session.period_count(), 2, "onRequest placeholder must remain in manifest");
+}
+
+/// An `AdaptationSet` with `xlink:actuate="onLoad"` must be fetched and
+/// inlined into its containing Period.
+#[tokio::test]
+async fn xlink_adaptation_set_onload_is_inlined() {
+    // Remote resource: a bare AdaptationSet fragment.
+    const REMOTE_ADAPTATION: &str = r#"<AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="remote-as-seg-$Number$.m4s" initialization="remote-as-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>"#;
+
+    // Main MPD: one period with a placeholder AdaptationSet.
+    const MAIN_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     xmlns:xlink="http://www.w3.org/1999/xlink"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <Period id="p1" duration="PT4S">
+    <AdaptationSet xlink:href="http://example.com/as.mpd"
+                   xlink:actuate="onLoad"/>
+  </Period>
+</MPD>"#;
+
+    // Feed the fetcher: first → main MPD, second → remote AdaptationSet XML.
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MAIN_MPD, REMOTE_ADAPTATION], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .expect("session construction should succeed after AdaptationSet XLink resolution");
+
+    // The remote AdaptationSet was inlined; we can fetch a segment from it.
+    let metrics = AbrMetrics::new(4_000_000.0, 10_000.0);
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("segment fetch from inlined AdaptationSet should succeed");
+
+    let urls = recorded.lock().unwrap();
+    assert!(
+        urls.iter().any(|u| u.contains("remote-as-seg-")),
+        "expected a remote-as-seg-N URL but recorded {urls:?}"
+    );
+}

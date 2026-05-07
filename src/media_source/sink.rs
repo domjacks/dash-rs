@@ -152,6 +152,19 @@ impl SourceBufferSink {
         Ok(())
     }
 
+    /// Change the MIME type / codec of the underlying buffer.
+    ///
+    /// Mirrors `SourceBufferSink.changeType()` in dash.js.  Called when the
+    /// codec configuration changes at an MPD period boundary.
+    pub async fn change_type(&mut self, mime: &str) -> Result<(), DashError> {
+        tracing::debug!(
+            old_mime = self.inner.mime_type(),
+            new_mime = mime,
+            "changing source buffer MIME type"
+        );
+        self.inner.change_type(mime).await
+    }
+
     /// Remove buffered data in the time range `[start, end)`.
     ///
     /// Mirrors `SourceBufferSink.remove()`.

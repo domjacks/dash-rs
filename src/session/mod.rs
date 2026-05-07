@@ -25,6 +25,7 @@ mod mpd;
 mod segment_url;
 mod timeline;
 mod utc;
+mod xlink;
 
 use std::{
     collections::HashMap,
@@ -33,7 +34,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use dash_mpd::{MPD, Representation};
+use dash_mpd::{AdaptationSet, MPD, Period, Representation};
 use tokio::sync::broadcast;
 use url::Url;
 
@@ -46,14 +47,15 @@ use crate::{
         sink::{SourceBufferSink, StreamInfo},
         Chunk, MediaSource,
     },
-    mp4::{parse_all_emsg, parse_sidx},
+    mp4::{parse_all_emsg, parse_sidx, parse_sidx_entries, SidxEntry},
 };
 
 use self::{
     live::compute_live_edge_segment,
     mpd::{
         adaptation_mime_type, extract_representations, extract_segment_list_timing,
-        extract_segment_timing, find_adaptation, merge_segment_lists, merge_segment_templates,
+        extract_segment_timing, find_adaptation, find_segment_base, merge_segment_lists,
+        merge_segment_templates, segment_base_media_path,
     },
     segment_url::{collect_candidate_base_urls, expand_template, resolve_effective_base_url},
     timeline::find_timeline_segment,
@@ -173,6 +175,133 @@ enum AddressingMode {
     /// index into `segment_urls` is `segment_number` (which starts at 0 for
     /// SegmentList tracks).
     List,
+    /// `SegmentBase` byte-range addressing.
+    ///
+    /// `media_url` is the relative path of the media file (typically a
+    /// `BaseURL` element value; empty when the effective base URL is the file
+    /// itself).  `index_range` is `(start, end_inclusive)` of the `sidx` box
+    /// inside the media file.  `init_range` is the optional
+    /// `SegmentBase.Initialization@range` — when `None`, a `SegmentBase`
+    /// `Initialization.sourceURL` (if present) or the entire file is used.
+    Base {
+        media_url: String,
+        index_range: (u64, u64),
+        init_range: Option<(u64, u64)>,
+    },
+}
+
+// ── TrackReinit ───────────────────────────────────────────────────────────────
+
+/// Computed data needed to reinitialise a [`TrackState`] when crossing an
+/// MPD `Period` boundary.
+///
+/// All fields are derived from the new period's `AdaptationSet` before any
+/// mutable borrows are taken, so the immutable borrow on the [`MPD`] can be
+/// released before tracks are mutated.
+struct TrackReinit {
+    representations: Vec<RepresentationInfo>,
+    mime: String,
+    start_number: u64,
+    seg_dur_ms: f64,
+    total_segments: Option<u64>,
+    addressing_mode: AddressingMode,
+    /// `presentationTimeOffset` converted to seconds (0.0 when absent).
+    timestamp_offset_s: f64,
+}
+
+/// Compute a [`TrackReinit`] from the given adaptation set and period.
+///
+/// This is a pure function with no side effects.  It replicates the
+/// addressing-mode logic from [`DashSession::from_mpd_with_utc`] so that
+/// period transitions can reuse the same code path.
+fn compute_track_reinit(
+    adaptation: &AdaptationSet,
+    period: &Period,
+    presentation_duration: Option<std::time::Duration>,
+) -> TrackReinit {
+    let representations = extract_representations(adaptation);
+    let mime = adaptation_mime_type(adaptation);
+    let first_repr = adaptation.representations.first();
+
+    let (start_number_tmpl, seg_dur_ms_tmpl, total_tmpl) =
+        extract_segment_timing(adaptation, period, presentation_duration);
+
+    let tmpl = merge_segment_templates(first_repr, adaptation, period);
+    let has_segment_list = merge_segment_lists(first_repr, adaptation, period).is_some();
+
+    let timestamp_offset_s = tmpl.as_ref()
+        .and_then(|t| {
+            let pto = t.presentationTimeOffset?;
+            let ts = t.timescale.unwrap_or(1);
+            Some(pto as f64 / ts as f64)
+        })
+        .unwrap_or(0.0);
+
+    let (start_number, seg_dur_ms, total_segments, addressing_mode) =
+        if let Some(ref t) = tmpl {
+            if t.SegmentTimeline.is_some() {
+                (start_number_tmpl, seg_dur_ms_tmpl, total_tmpl, AddressingMode::Timeline)
+            } else {
+                (start_number_tmpl, seg_dur_ms_tmpl, total_tmpl, AddressingMode::Number)
+            }
+        } else if has_segment_list {
+            let (sn, sd, ts) = extract_segment_list_timing(adaptation, period);
+            (sn, sd, ts, AddressingMode::List)
+        } else if let Some(sb) = find_segment_base(first_repr, adaptation, period) {
+            let media_url = segment_base_media_path(first_repr, adaptation);
+            let index_range = sb.indexRange.as_deref()
+                .and_then(parse_byte_range)
+                .unwrap_or((0, 0));
+            let init_range = sb.Initialization.as_ref()
+                .and_then(|i| i.range.as_deref())
+                .and_then(parse_byte_range);
+            (0, seg_dur_ms_tmpl, None, AddressingMode::Base {
+                media_url,
+                index_range,
+                init_range,
+            })
+        } else {
+            (start_number_tmpl, seg_dur_ms_tmpl, total_tmpl, AddressingMode::Number)
+        };
+
+    TrackReinit {
+        representations,
+        mime,
+        start_number,
+        seg_dur_ms,
+        total_segments,
+        addressing_mode,
+        timestamp_offset_s,
+    }
+}
+
+/// Apply a [`TrackReinit`] to an existing [`TrackState`] in-place.
+///
+/// Updates the MIME type (via `change_type` if it changed), append window,
+/// timestamp offset, and all timing/addressing fields.  Intentionally
+/// preserves `throughput_ema_bps`, `last_transfer_ms`, and `current_index`
+/// for ABR continuity across period boundaries.
+async fn apply_track_reinit(
+    track: &mut TrackState,
+    ri: &TrackReinit,
+    stream_info: &StreamInfo,
+    media_source_duration: Option<f64>,
+) -> Result<(), DashError> {
+    if track.sink.mime_type() != ri.mime {
+        track.sink.change_type(&ri.mime).await?;
+    }
+    track.sink.update_append_window(stream_info, media_source_duration);
+    track.sink.set_timestamp_offset(ri.timestamp_offset_s);
+    track.representations = ri.representations.clone();
+    track.segment_number = ri.start_number;
+    track.start_number = ri.start_number;
+    track.initial_segment_number = ri.start_number;
+    track.segment_duration_ms = ri.seg_dur_ms;
+    track.total_segments = ri.total_segments;
+    track.addressing_mode = ri.addressing_mode.clone();
+    track.next_segment_time = None;
+    track.segment_byte_ranges = None;
+    Ok(())
 }
 
 // ── TrackState ────────────────────────────────────────────────────────────────
@@ -229,6 +358,11 @@ struct TrackState {
     /// round-trip time measurement.  It will be `0.0` until the first segment
     /// has been fetched.
     last_transfer_ms: f64,
+    /// Subsegment byte-range table for `AddressingMode::Base` tracks.
+    ///
+    /// Populated lazily on the first [`DashSession::fetch_next_segment`] call
+    /// by fetching and parsing the `sidx` index.  `None` until populated.
+    segment_byte_ranges: Option<Vec<SidxEntry>>,
 }
 
 impl TrackState {
@@ -255,6 +389,7 @@ impl TrackState {
             next_segment_time: None,
             throughput_ema_bps: 0.0,
             last_transfer_ms: 0.0,
+            segment_byte_ranges: None,
         }
     }
 }
@@ -297,6 +432,12 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     abr: AbrController,
     video_track: Option<TrackState>,
     audio_track: Option<TrackState>,
+    /// Index of the MPD `Period` currently being fetched (0-based).
+    ///
+    /// Advances automatically at period boundaries inside
+    /// [`Self::fetch_next_segment`].  See [`Self::period_count`] and
+    /// [`Self::current_period_index`].
+    current_period_index: usize,
     /// Buffer target in milliseconds.  Fetch is gated until estimated buffer
     /// level drops below this value — mirrors `bufferTimeDefault` (12 s) in
     /// dash.js's `ScheduleController`.
@@ -343,10 +484,27 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// are present, sends are silently dropped (the `broadcast` channel
     /// discards messages when there are zero receivers).
     event_tx: broadcast::Sender<DashEvent>,
+    /// Optional maximum bitrate cap for video, in bits per second.
+    ///
+    /// When set, [`Self::fetch_next_segment`] clamps the ABR decision to the
+    /// highest representation whose bandwidth is at or below this limit.
+    video_max_bitrate_bps: Option<u64>,
+    /// Optional maximum bitrate cap for audio, in bits per second.
+    audio_max_bitrate_bps: Option<u64>,
 }
 
 // Re-export for convenience in examples.
 pub use crate::session::MediaType as SessionMediaType;
+
+// ── Private helpers (module-level) ────────────────────────────────────────────
+
+/// Parse a DASH byte-range string of the form `"start-end"` (both inclusive)
+/// into `(start, end)`.  Returns `None` when the string is absent or
+/// malformed.
+fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
+    let (start, end) = s.split_once('-')?;
+    Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
+}
 
 impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     // ── Constructors ──────────────────────────────────────────────────────────
@@ -361,6 +519,10 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let fetcher = Arc::new(fetcher);
         let loader = ManifestLoader::new(Arc::clone(&fetcher));
         let (mpd, base_url) = loader.load(url).await?;
+
+        // Resolve any eager XLink references (xlink:actuate="onLoad") so that
+        // the rest of session construction sees a fully self-contained MPD.
+        let mpd = xlink::resolve_xlinks(mpd, &base_url, &*fetcher).await?;
 
         // Compute UTC clock offset before constructing the session so that
         // live-edge snapping inside `from_mpd` can use the corrected time.
@@ -409,13 +571,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let audio_adaptation = find_adaptation(period, &MediaType::Audio);
 
         let mut video_track = if let Some(adaptation) = video_adaptation {
-            let reps = extract_representations(adaptation);
-            if !reps.is_empty() {
-                let mime = adaptation_mime_type(adaptation);
-                let sink_buf = media_source.add_source_buffer(&mime)?;
+            let reinit = compute_track_reinit(adaptation, period, presentation_duration);
+            if !reinit.representations.is_empty() {
+                let sink_buf = media_source.add_source_buffer(&reinit.mime)?;
                 let mut sink = SourceBufferSink::new(sink_buf);
 
-                let effective_duration = presentation_duration.or(period.duration);
+                let effective_duration = period.duration.or(presentation_duration);
                 let stream_info = StreamInfo {
                     start: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
                     duration: effective_duration.map(|d| d.as_secs_f64()),
@@ -424,40 +585,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     &stream_info,
                     presentation_duration.map(|d| d.as_secs_f64()),
                 );
+                sink.set_timestamp_offset(reinit.timestamp_offset_s);
 
-                let first_repr = adaptation.representations.first();
-                if let Some(merged) = merge_segment_templates(first_repr, adaptation, period) {
-                    if let Some(pto) = merged.presentationTimeOffset {
-                        let ts = merged.timescale.unwrap_or(1);
-                        sink.set_timestamp_offset(pto as f64 / ts as f64);
-                    }
-                }
-
-                let (start_number, seg_dur_ms, total_segments) =
-                    extract_segment_timing(adaptation, period, presentation_duration);
-                // Determine addressing mode — SegmentList takes priority when
-                // no SegmentTemplate is present at any level.
-                let first_repr = adaptation.representations.first();
-                let has_segment_list =
-                    merge_segment_lists(first_repr, adaptation, period).is_some();
-                let tmpl = merge_segment_templates(first_repr, adaptation, period);
-                let (start_number, seg_dur_ms, total_segments, addressing_mode) =
-                    if has_segment_list && tmpl.is_none() {
-                        let (sn, sd, ts) = extract_segment_list_timing(adaptation, period);
-                        (sn, sd, ts, AddressingMode::List)
-                    } else if tmpl.is_some_and(|t| t.SegmentTimeline.is_some()) {
-                        (start_number, seg_dur_ms, total_segments, AddressingMode::Timeline)
-                    } else {
-                        (start_number, seg_dur_ms, total_segments, AddressingMode::Number)
-                    };
                 Some(TrackState::new(
                     MediaType::Video,
-                    reps,
+                    reinit.representations,
                     sink,
-                    start_number,
-                    seg_dur_ms,
-                    total_segments,
-                    addressing_mode,
+                    reinit.start_number,
+                    reinit.seg_dur_ms,
+                    reinit.total_segments,
+                    reinit.addressing_mode,
                 ))
             } else {
                 None
@@ -467,13 +604,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         };
 
         let mut audio_track = if let Some(adaptation) = audio_adaptation {
-            let reps = extract_representations(adaptation);
-            if !reps.is_empty() {
-                let mime = adaptation_mime_type(adaptation);
-                let sink_buf = media_source.add_source_buffer(&mime)?;
+            let reinit = compute_track_reinit(adaptation, period, presentation_duration);
+            if !reinit.representations.is_empty() {
+                let sink_buf = media_source.add_source_buffer(&reinit.mime)?;
                 let mut sink = SourceBufferSink::new(sink_buf);
 
-                let effective_duration = presentation_duration.or(period.duration);
+                let effective_duration = period.duration.or(presentation_duration);
                 let stream_info = StreamInfo {
                     start: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
                     duration: effective_duration.map(|d| d.as_secs_f64()),
@@ -482,38 +618,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     &stream_info,
                     presentation_duration.map(|d| d.as_secs_f64()),
                 );
+                sink.set_timestamp_offset(reinit.timestamp_offset_s);
 
-                let first_repr = adaptation.representations.first();
-                if let Some(merged) = merge_segment_templates(first_repr, adaptation, period) {
-                    if let Some(pto) = merged.presentationTimeOffset {
-                        let ts = merged.timescale.unwrap_or(1);
-                        sink.set_timestamp_offset(pto as f64 / ts as f64);
-                    }
-                }
-
-                let (start_number, seg_dur_ms, total_segments) =
-                    extract_segment_timing(adaptation, period, presentation_duration);
-                let first_repr = adaptation.representations.first();
-                let has_segment_list =
-                    merge_segment_lists(first_repr, adaptation, period).is_some();
-                let tmpl = merge_segment_templates(first_repr, adaptation, period);
-                let (start_number, seg_dur_ms, total_segments, addressing_mode) =
-                    if has_segment_list && tmpl.is_none() {
-                        let (sn, sd, ts) = extract_segment_list_timing(adaptation, period);
-                        (sn, sd, ts, AddressingMode::List)
-                    } else if tmpl.is_some_and(|t| t.SegmentTimeline.is_some()) {
-                        (start_number, seg_dur_ms, total_segments, AddressingMode::Timeline)
-                    } else {
-                        (start_number, seg_dur_ms, total_segments, AddressingMode::Number)
-                    };
                 Some(TrackState::new(
                     MediaType::Audio,
-                    reps,
+                    reinit.representations,
                     sink,
-                    start_number,
-                    seg_dur_ms,
-                    total_segments,
-                    addressing_mode,
+                    reinit.start_number,
+                    reinit.seg_dur_ms,
+                    reinit.total_segments,
+                    reinit.addressing_mode,
                 ))
             } else {
                 None
@@ -585,6 +699,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             abr: AbrController::default(),
             video_track,
             audio_track,
+            current_period_index: 0,
             buffer_target_ms: 12_000.0,
             playback_started_at: None,
             paused: false,
@@ -598,6 +713,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             init_cache: HashMap::new(),
             utc_clock_offset_s,
             event_tx,
+            video_max_bitrate_bps: None,
+            audio_max_bitrate_bps: None,
         })
     }
 
@@ -608,6 +725,19 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         &self.mpd
     }
 
+    /// The number of `Period` elements in the manifest.
+    pub fn period_count(&self) -> usize {
+        self.mpd.periods.len()
+    }
+
+    /// Zero-based index of the `Period` currently being fetched.
+    ///
+    /// Starts at `0` and advances automatically at period boundaries inside
+    /// [`Self::fetch_next_segment`].
+    pub fn current_period_index(&self) -> usize {
+        self.current_period_index
+    }
+
     /// Signed clock offset applied to live-edge calculations:
     /// `adjusted_now = SystemTime::now() + utc_clock_offset_s`.
     ///
@@ -616,6 +746,39 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// present or the session was built via [`Self::from_mpd`].
     pub fn utc_clock_offset_s(&self) -> f64 {
         self.utc_clock_offset_s
+    }
+
+    /// Target playout latency in milliseconds from the first
+    /// `<ServiceDescription><Latency@target>` element, or `None` when the
+    /// manifest does not declare one.
+    ///
+    /// This corresponds to `ServiceDescriptionController.js` in dash.js.
+    /// Expose the value to the application so it can configure a low-latency
+    /// catch-up controller (see [`Self::set_buffer_target_ms`]).
+    ///
+    /// Note: `@target` is in seconds in the MPEG-DASH spec; this method
+    /// converts to milliseconds for consistency with the rest of the API.
+    pub fn target_latency_ms(&self) -> Option<f64> {
+        self.mpd
+            .ServiceDescription
+            .iter()
+            .flat_map(|sd| sd.Latency.iter())
+            .find_map(|l| l.target.map(|t| t * 1_000.0))
+    }
+
+    /// Recommended playback-rate range `(min, max)` from the first
+    /// `<ServiceDescription><PlaybackRate>` element that declares both
+    /// attributes.  Returns `None` when the manifest does not declare one.
+    ///
+    /// The application can use these bounds to implement catch-up / slow-down
+    /// rate control when the actual latency deviates from
+    /// [`Self::target_latency_ms`].
+    pub fn playback_rate_range(&self) -> Option<(f64, f64)> {
+        self.mpd
+            .ServiceDescription
+            .iter()
+            .flat_map(|sd| sd.PlaybackRate.iter())
+            .find_map(|pr| Some((pr.min?, pr.max?)))
     }
 
     /// Subscribe to in-band DASH events extracted from `emsg` boxes.
@@ -808,6 +971,40 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// Set (or clear) the per-segment fetch timeout.
     pub fn set_abandon_timeout_ms(&mut self, ms: Option<u64>) {
         self.abandon_timeout_ms = ms;
+    }
+
+    // ── Bitrate cap ───────────────────────────────────────────────────────────
+
+    /// Constrain ABR quality selection to representations with
+    /// `bandwidth ≤ bps`.
+    ///
+    /// After this call, [`Self::fetch_next_segment`] will never select a
+    /// representation above `bps` bits/s for `media_type`, regardless of the
+    /// ABR algorithm's unconstrained choice.  The lowest representation is
+    /// always eligible even when its bandwidth exceeds the cap.
+    ///
+    /// Mirrors `AbrController.setMaxAllowedBitrateFor()` in dash.js.
+    pub fn set_max_bitrate(&mut self, media_type: MediaType, bps: u64) {
+        match media_type {
+            MediaType::Video => self.video_max_bitrate_bps = Some(bps),
+            MediaType::Audio => self.audio_max_bitrate_bps = Some(bps),
+        }
+    }
+
+    /// Remove a previously set bitrate cap for `media_type`.
+    pub fn clear_max_bitrate(&mut self, media_type: MediaType) {
+        match media_type {
+            MediaType::Video => self.video_max_bitrate_bps = None,
+            MediaType::Audio => self.audio_max_bitrate_bps = None,
+        }
+    }
+
+    /// The active bitrate cap for `media_type`, or `None` when uncapped.
+    pub fn max_bitrate(&self, media_type: &MediaType) -> Option<u64> {
+        match media_type {
+            MediaType::Video => self.video_max_bitrate_bps,
+            MediaType::Audio => self.audio_max_bitrate_bps,
+        }
     }
 
     // ── Buffer pruning ────────────────────────────────────────────────────────
@@ -1019,11 +1216,39 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// Fetch the next segment for the given media type using the current ABR
     /// quality decision, then append it to the corresponding source buffer.
     ///
+    /// At MPD period boundaries, the session automatically advances to the next
+    /// period and reinitialises the track without returning an error.
+    ///
     /// For **live streams**, the manifest is refreshed automatically at the
     /// start of each call when `MPD@minimumUpdatePeriod` has elapsed.
     ///
-    /// Returns [`DashError::EndOfStream`] when all segments have been fetched.
+    /// Returns [`DashError::EndOfStream`] when all segments in all periods have
+    /// been fetched.
     pub async fn fetch_next_segment(
+        &mut self,
+        media_type: MediaType,
+        metrics: &AbrMetrics,
+    ) -> Result<QualityDecision, DashError> {
+        loop {
+            match self.fetch_next_segment_inner(media_type.clone(), metrics).await {
+                Err(DashError::EndOfStream { .. }) => {
+                    if self.try_advance_period().await? {
+                        continue; // retry with new period
+                    }
+                    return Err(DashError::EndOfStream {
+                        media_type: media_type.to_string(),
+                    });
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Inner implementation of [`Self::fetch_next_segment`] for a single period.
+    ///
+    /// Returns [`DashError::EndOfStream`] at period boundaries; the public
+    /// wrapper catches this and advances the period before retrying.
+    async fn fetch_next_segment_inner(
         &mut self,
         media_type: MediaType,
         metrics: &AbrMetrics,
@@ -1077,7 +1302,36 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         // Run ABR.
         let decision = {
             let track = self.track(&media_type)?;
-            self.abr.select(&track.representations, metrics)
+            let uncapped = self.abr.select(&track.representations, metrics);
+            // Apply bitrate cap: clamp to the highest representation whose
+            // bandwidth is at or below the cap.  Always allow index 0 even
+            // when it exceeds the cap (avoids a situation where no quality is
+            // selectable).
+            let max_bps = match &media_type {
+                MediaType::Video => self.video_max_bitrate_bps,
+                MediaType::Audio => self.audio_max_bitrate_bps,
+            };
+            if let Some(cap) = max_bps {
+                let capped_idx = track
+                    .representations
+                    .iter()
+                    .rposition(|r| r.bandwidth <= cap)
+                    .unwrap_or(0);
+                if capped_idx < uncapped.index {
+                    tracing::debug!(
+                        media_type = %media_type,
+                        uncapped_index = uncapped.index,
+                        capped_index = capped_idx,
+                        cap_bps = cap,
+                        "bitrate cap applied"
+                    );
+                    QualityDecision { index: capped_idx, reason: uncapped.reason }
+                } else {
+                    uncapped
+                }
+            } else {
+                uncapped
+            }
         };
 
         // Apply quality switch if needed.
@@ -1132,6 +1386,50 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         }
 
+        // ── SegmentBase: lazy sidx population ────────────────────────────────
+        // For SegmentBase tracks, the sidx box must be fetched once to learn
+        // the byte ranges for each subsegment.  After this call,
+        // `track.segment_byte_ranges` is guaranteed to be `Some(_)` and
+        // `track.total_segments` is set so that the early EOS checks fire
+        // correctly on subsequent calls.
+        {
+            let is_base = matches!(
+                self.track(&media_type)?.addressing_mode,
+                AddressingMode::Base { .. }
+            );
+            if is_base && self.track(&media_type)?.segment_byte_ranges.is_none() {
+                self.fetch_base_sidx(&media_type).await?;
+            }
+        }
+
+        // For SegmentBase tracks, derive the byte range for the current
+        // subsegment from the now-populated index.
+        let base_byte_range: Option<(u64, u64)> = {
+            let track = self.track(&media_type)?;
+            if let AddressingMode::Base { .. } = &track.addressing_mode {
+                let seg_idx = track.segment_number as usize;
+                let ranges = track
+                    .segment_byte_ranges
+                    .as_ref()
+                    .expect("populated by fetch_base_sidx above");
+                if seg_idx >= ranges.len() {
+                    tracing::info!(
+                        media_type = %media_type,
+                        seg_idx,
+                        total = ranges.len(),
+                        "SegmentBase index exhausted — signalling EndOfStream"
+                    );
+                    return Err(DashError::EndOfStream {
+                        media_type: media_type.to_string(),
+                    });
+                }
+                let e = &ranges[seg_idx];
+                Some((e.byte_offset, e.byte_offset + e.byte_length as u64 - 1))
+            } else {
+                None
+            }
+        };
+
         // Build the expanded segment URL.
         let (candidates, expanded_path, seg_number, maybe_timeline_info) = {
             let track = self.track(&media_type)?;
@@ -1140,7 +1438,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let addressing_mode = track.addressing_mode.clone();
             let next_seg_time = track.next_segment_time;
 
-            let period = &self.mpd.periods[0];
+            let period = &self.mpd.periods[self.current_period_index];
             let adaptation = find_adaptation(period, &media_type).ok_or_else(|| {
                 DashError::NoRepresentations {
                     media_type: media_type.to_string(),
@@ -1154,7 +1452,20 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
             let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
 
-            if addressing_mode == AddressingMode::List {
+            if let AddressingMode::Base { ref media_url, .. } = addressing_mode {
+                // ─ SegmentBase addressing ────────────────────────────────────
+                // The media file is the effective base URL (or a relative
+                // path within it).  Byte-range is handled separately via
+                // `base_byte_range` above.
+                let candidates = collect_candidate_base_urls(
+                    &self.base_url,
+                    &self.mpd.base_url,
+                    period,
+                    adaptation,
+                    repr_base_urls,
+                );
+                (candidates, media_url.clone(), seg_num, None)
+            } else if addressing_mode == AddressingMode::List {
                 // ─ SegmentList addressing ────────────────────────────────────
                 let sl = merge_segment_lists(repr_obj, adaptation, period)
                     .ok_or(DashError::SegmentUrlUnresolvable)?;
@@ -1262,7 +1573,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 "fetching segment"
             );
 
-            let request = FetchRequest::new(segment_url.clone(), RequestType::MediaSegment);
+            let request = {
+                let req = FetchRequest::new(segment_url.clone(), RequestType::MediaSegment);
+                if let Some((br_start, br_end)) = base_byte_range {
+                    req.with_byte_range(br_start, br_end)
+                } else {
+                    req
+                }
+            };
 
             let fetch_result: Result<FetchResponse, DashError> = if let Some(ms) = abandon_ms {
                 match tokio::time::timeout(
@@ -1387,6 +1705,146 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         Ok(decision)
     }
 
+    // ── Period management ─────────────────────────────────────────────────────
+
+    /// Attempt to advance to the next MPD `Period`.
+    ///
+    /// When `Ok(true)` is returned, `current_period_index` has been incremented,
+    /// tracks have been reinitialised, and init segments for the new period have
+    /// been fetched.  The caller should retry the segment fetch.
+    ///
+    /// When `Ok(false)` is returned, there are no more periods and the caller
+    /// should propagate [`DashError::EndOfStream`].
+    async fn try_advance_period(&mut self) -> Result<bool, DashError> {
+        let next_idx = self.current_period_index + 1;
+        if next_idx >= self.mpd.periods.len() {
+            return Ok(false);
+        }
+
+        tracing::info!(
+            from = self.current_period_index,
+            to = next_idx,
+            "period boundary: advancing to next MPD period"
+        );
+        self.current_period_index = next_idx;
+
+        // Clear init-segment cache: the new period may have different codec
+        // configurations even for the same representation IDs.
+        self.init_cache.clear();
+
+        let presentation_duration = self.mpd.mediaPresentationDuration;
+
+        // Read all period data into owned structs so that the immutable
+        // borrow on `self.mpd` is released before we mutably borrow tracks.
+        let (period_start_s, effective_duration_s, video_reinit, audio_reinit) = {
+            let period = &self.mpd.periods[next_idx];
+            let period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+            let eff = period.duration.or(presentation_duration);
+            let effective_duration_s = eff.map(|d| d.as_secs_f64());
+            let video_reinit = find_adaptation(period, &MediaType::Video)
+                .map(|a| compute_track_reinit(a, period, presentation_duration));
+            let audio_reinit = find_adaptation(period, &MediaType::Audio)
+                .map(|a| compute_track_reinit(a, period, presentation_duration));
+            (period_start_s, effective_duration_s, video_reinit, audio_reinit)
+        };
+        // `self.mpd` immutable borrow ends here.
+
+        let ms_duration = presentation_duration.map(|d| d.as_secs_f64());
+        let stream_info = StreamInfo {
+            start: period_start_s,
+            duration: effective_duration_s,
+        };
+
+        if let (Some(ri), Some(track)) = (&video_reinit, self.video_track.as_mut()) {
+            apply_track_reinit(track, ri, &stream_info, ms_duration).await?;
+        }
+        if let (Some(ri), Some(track)) = (&audio_reinit, self.audio_track.as_mut()) {
+            apply_track_reinit(track, ri, &stream_info, ms_duration).await?;
+        }
+
+        // Fetch init segments for the new period's tracks.
+        if self.video_track.is_some() {
+            self.fetch_init_segment(MediaType::Video).await?;
+        }
+        if self.audio_track.is_some() {
+            self.fetch_init_segment(MediaType::Audio).await?;
+        }
+
+        Ok(true)
+    }
+
+    /// Fetch and parse the `sidx` index for a `SegmentBase` track.
+    ///
+    /// Issues a byte-range `GET` for the `indexRange` declared in the MPD,
+    /// parses the `sidx` box with [`parse_sidx_entries`], and stores the
+    /// resulting subsegment table in [`TrackState::segment_byte_ranges`].
+    /// Also updates [`TrackState::total_segments`] so that the normal EOS
+    /// segment-count check fires correctly after the index is known.
+    ///
+    /// No-op when `segment_byte_ranges` is already populated.
+    async fn fetch_base_sidx(&mut self, media_type: &MediaType) -> Result<(), DashError> {
+        let (media_url_str, index_range) = {
+            let track = self.track(media_type)?;
+            if track.segment_byte_ranges.is_some() {
+                return Ok(()); // already populated
+            }
+            match &track.addressing_mode {
+                AddressingMode::Base { media_url, index_range, .. } => {
+                    (media_url.clone(), *index_range)
+                }
+                _ => return Ok(()), // not a Base track
+            }
+        };
+
+        let period = &self.mpd.periods[self.current_period_index];
+        let adaptation = find_adaptation(period, media_type).ok_or_else(|| {
+            DashError::NoRepresentations {
+                media_type: media_type.to_string(),
+            }
+        })?;        let first_repr = adaptation.representations.first();
+        let repr_base_urls = first_repr.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+
+        let sidx_base = resolve_effective_base_url(
+            &self.base_url,
+            &self.mpd.base_url,
+            period,
+            adaptation,
+            repr_base_urls,
+        );
+        let sidx_url = sidx_base
+            .join(&media_url_str)
+            .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+
+        tracing::debug!(
+            media_type = %media_type,
+            url = %sidx_url,
+            range_start = index_range.0,
+            range_end = index_range.1,
+            "SegmentBase: fetching sidx index"
+        );
+
+        let request = FetchRequest::new(sidx_url, RequestType::InitializationSegment)
+            .with_byte_range(index_range.0, index_range.1);
+        let response = self.fetcher.fetch(request).await?;
+
+        // `index_end_offset` = first byte after the fetched range.
+        let index_end_offset = index_range.1 + 1;
+        let entries = parse_sidx_entries(&response.data, index_end_offset)
+            .ok_or(DashError::SegmentUrlUnresolvable)?;
+
+        let n = entries.len() as u64;
+        tracing::info!(
+            media_type = %media_type,
+            total_segments = n,
+            "SegmentBase: sidx parsed, subsegment table populated"
+        );
+
+        let track = self.track_mut(media_type)?;
+        track.total_segments = Some(n);
+        track.segment_byte_ranges = Some(entries);
+        Ok(())
+    }
+
     /// Fetch and append the initialisation segment for the given media type.
     ///
     /// The fetched bytes are stored in the internal init-segment cache
@@ -1394,20 +1852,28 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// [`Self::fetch_next_segment`] will re-append from the cache without
     /// touching the network.
     pub async fn fetch_init_segment(&mut self, media_type: MediaType) -> Result<usize, DashError> {
-        let (init_url, rep_id) = {
+        let (init_url, byte_range, rep_id) = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
-            let url = self.resolve_init_url(&media_type, rep)?;
-            (url, rep.id.clone())
+            let (url, br) = self.resolve_init_url(&media_type, rep)?;
+            (url, br, rep.id.clone())
         };
 
         tracing::debug!(
             media_type = %media_type,
             url = %init_url,
+            byte_range = ?byte_range,
             "fetching init segment"
         );
 
-        let request = FetchRequest::new(init_url, RequestType::InitializationSegment);
+        let request = {
+            let req = FetchRequest::new(init_url, RequestType::InitializationSegment);
+            if let Some((start, end)) = byte_range {
+                req.with_byte_range(start, end)
+            } else {
+                req
+            }
+        };
         let response = self.fetcher.fetch(request).await?;
         let bytes_received = response.data.len();
 
@@ -1459,13 +1925,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         })
     }
 
-    /// Resolve the URL for the initialisation segment of the given representation.
+    /// Resolve the URL (and optional byte range) for the initialisation
+    /// segment of the given representation.
+    ///
+    /// Returns `(url, byte_range)` where `byte_range` is `Some((start, end))`
+    /// when the init data is a byte range within the media file (as declared
+    /// by `SegmentBase.Initialization@range`).
     fn resolve_init_url(
         &self,
         media_type: &MediaType,
         rep: &RepresentationInfo,
-    ) -> Result<Url, DashError> {
-        let period = &self.mpd.periods[0];
+    ) -> Result<(Url, Option<(u64, u64)>), DashError> {
+        let period = &self.mpd.periods[self.current_period_index];
         let adaptation =
             find_adaptation(period, media_type).ok_or_else(|| DashError::NoRepresentations {
                 media_type: media_type.to_string(),
@@ -1476,6 +1947,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             .iter()
             .find(|r| r.id.as_deref() == Some(rep.id.as_str()));
 
+        // ─ SegmentTemplate init ──────────────────────────────────────────────
         if let Some(tmpl) = merge_segment_templates(repr_obj, adaptation, period) {
             let init_tmpl = tmpl
                 .initialization
@@ -1493,13 +1965,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     adaptation,
                     repr_base_urls,
                 );
-                return base
+                let url = base
                     .join(&url_str)
-                    .map_err(|_| DashError::SegmentUrlUnresolvable);
+                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+                return Ok((url, None));
             }
         }
 
-        // SegmentList: check Initialization.sourceURL at any hierarchy level.
+        // ─ SegmentList init ──────────────────────────────────────────────────
         if let Some(sl) = merge_segment_lists(repr_obj, adaptation, period) {
             if let Some(src) = sl.Initialization.as_ref().and_then(|i| i.sourceURL.as_deref()) {
                 let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
@@ -1510,9 +1983,47 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     adaptation,
                     repr_base_urls,
                 );
-                return base
+                let url = base
                     .join(src)
-                    .map_err(|_| DashError::SegmentUrlUnresolvable);
+                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+                return Ok((url, None));
+            }
+        }
+
+        // ─ SegmentBase init ──────────────────────────────────────────────────
+        // For SegmentBase, the init data is either:
+        //   (a) a byte range within the media file declared by
+        //       `SegmentBase.Initialization@range`, or
+        //   (b) a separate URL given by `SegmentBase.Initialization.sourceURL`.
+        if let Some(sb) = find_segment_base(repr_obj, adaptation, period) {
+            let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+            let base = resolve_effective_base_url(
+                &self.base_url,
+                &self.mpd.base_url,
+                period,
+                adaptation,
+                repr_base_urls,
+            );
+
+            // Check for Initialization@range (byte-range within the media file).
+            if let Some(range_str) = sb.Initialization.as_ref().and_then(|i| i.range.as_deref()) {
+                let br = parse_byte_range(range_str).ok_or(DashError::SegmentUrlUnresolvable)?;
+                // The file is the media URL resolved against the effective base.
+                let media_path = segment_base_media_path(repr_obj, adaptation);
+                let url = base
+                    .join(&media_path)
+                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+                return Ok((url, Some(br)));
+            }
+
+            // Check for Initialization.sourceURL (separate init file).
+            if let Some(src) =
+                sb.Initialization.as_ref().and_then(|i| i.sourceURL.as_deref())
+            {
+                let url = base
+                    .join(src)
+                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+                return Ok((url, None));
             }
         }
 
