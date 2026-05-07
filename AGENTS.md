@@ -145,7 +145,7 @@ loop {
 `estimated_buffer_level_ms` is a wall-clock approximation — it assumes real-time
 playback speed.  It is meaningless before `notify_playing()` is called (returns 0).
 `segment_duration_ms` is extracted from `SegmentTemplate.duration / timescale × 1000`
-at session construction time (`extract_segment_timing()` in `src/session.rs`).
+at session construction time (`extract_segment_timing()` in `src/session/mpd.rs`).
 
 ### `TrackState` segment timing fields
 
@@ -179,18 +179,19 @@ initial_segment_number = segment_number   (set at the same time)
 `safety_margin` defaults to 3 segments; `MPD@suggestedPresentationDelay`
 overrides it when present.  `segment_number` is clamped to at least
 `start_number`.  The helper is `compute_live_edge_segment()` in
-`src/session.rs`.
+`src/session/live.rs`.
 
 ### `DashSession` uses the first `Period` only
 
 Multi-period support is not yet implemented.  Passing an MPD with multiple
 periods will not error, but only the first period's tracks are used.
 
-### Segment URL resolution only handles `SegmentTemplate` with `$Number$`
+### Segment URL resolution handles `SegmentTemplate` with `$Number$` and `$Time$`
 
-`$Time$` addressing, `SegmentList`, and byte-range `SegmentBase` are not
-yet implemented.  `resolve_segment_url` returns `DashError::SegmentUrlUnresolvable`
-for manifests that use those forms.
+`SegmentTemplate` addressing via `$Number$` (fixed-duration segments) and
+`$Time$` (SegmentTimeline) are both supported.  `SegmentList` and byte-range
+`SegmentBase` are not yet implemented.  `resolve_segment_url` returns
+`DashError::SegmentUrlUnresolvable` for manifests that use those forms.
 
 ---
 
@@ -271,11 +272,14 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
-| Session coordinator | `src/session.rs` |
-| Segment timing extraction | `extract_segment_timing()` in `src/session.rs` |
+| Session coordinator (`DashSession`, `TrackState`, `MediaType`) | `src/session/mod.rs` |
+| MPD helpers (`merge_segment_templates`, `extract_segment_timing`, etc.) | `src/session/mpd.rs` |
+| SegmentTimeline / `$Time$` walking | `src/session/timeline.rs` |
+| URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
+| Live-edge segment calculation | `src/session/live.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
-| Live-stream API tests | `tests/session.rs` |
+| Live-stream API + SegmentTimeline tests | `tests/session.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
@@ -313,8 +317,6 @@ implementation priority.  PRs welcome.
 
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
-| `$Time$` template variable | `TemplateSegmentsGetter.js` | `expand_template()` passes `$Time$` through verbatim. Need to expand it alongside `$Number$` in `session.rs`. Test: `expand_unknown_identifier_preserved` currently asserts the pass-through behaviour — update it. |
-| SegmentTimeline | `TimelineSegmentsGetter.js` | `dash-mpd` parses `SegmentTimeline`; `merge_segment_templates` propagates it. `fetch_next_segment` only knows `$Number$`; add a `$Time$`-based path that walks the timeline. |
 | SegmentList | `ListSegmentsGetter.js` | No code path exists. Add a new dispatch arm in `fetch_next_segment` after `merge_segment_templates`. |
 | SegmentBase (byte-range) | `SegmentBaseGetter.js`, `SegmentBaseLoader.js` | `FetchRequest::byte_range` field exists but is never set. Fetch the `sidx`/index, walk byte ranges, set the field. |
 | Multi-period playback | `StreamController.js` / `Stream.js` | `from_mpd` and `fetch_next_segment` currently hardcode `periods[0]`. Need period switching, `Period@duration`-based EOS detection, and `TrackState` re-initialisation on period boundary. |

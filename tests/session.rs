@@ -502,3 +502,151 @@ async fn live_edge_segment_number_near_live_edge() {
         "expected segment ~{expected_start}, got {seg_num} (url: {url_str})"
     );
 }
+
+// ── SegmentTimeline / $Time$ integration tests ────────────────────────────────
+
+/// A VOD MPD whose single AdaptationSet uses SegmentTimeline with three
+/// explicit S entries (no repeats).  timescale = 90 000.
+const TIMELINE_VOD_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT9S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="chunk-$Time$.m4s" initialization="init.mp4" timescale="90000">
+        <SegmentTimeline>
+          <S t="0"      d="270000"/>
+          <S t="270000" d="270000"/>
+          <S t="540000" d="270000"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// VOD MPD with a single S entry that has `r="2"` (3 segments total).
+const TIMELINE_REPEAT_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT9S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="chunk-$Time$.m4s" initialization="init.mp4" timescale="90000">
+        <SegmentTimeline>
+          <S t="0" d="270000" r="2"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Fetch all three segments from a SegmentTimeline VOD stream in order and
+/// verify that the URLs contain the correct `$Time$` values.
+#[tokio::test]
+async fn timeline_vod_fetches_in_time_order() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[TIMELINE_VOD_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+
+    // Fetch the three segments; all should succeed.
+    for i in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .unwrap_or_else(|e| panic!("segment {i} fetch failed: {e}"));
+    }
+
+    let urls = recorded.lock().unwrap();
+    assert_eq!(urls.len(), 3, "expected 3 segment fetches");
+
+    let times: Vec<u64> = urls
+        .iter()
+        .map(|u| {
+            // URL looks like "http://example.com/chunk-270000.m4s"
+            u.rsplit('/').next().unwrap_or("")
+                .strip_prefix("chunk-").unwrap_or("")
+                .strip_suffix(".m4s").unwrap_or("")
+                .parse()
+                .expect("non-numeric time in URL")
+        })
+        .collect();
+
+    assert_eq!(times, vec![0u64, 270_000, 540_000], "unexpected $Time$ sequence");
+}
+
+/// After all three SegmentTimeline segments have been fetched, the next call
+/// must return `DashError::EndOfStream`.
+#[tokio::test]
+async fn timeline_vod_eos_after_all_segments() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[TIMELINE_VOD_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+
+    for _ in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .expect("segment fetch should succeed");
+    }
+
+    let result = session.fetch_next_segment(MediaType::Video, &metrics).await;
+    assert!(
+        matches!(result, Err(DashError::EndOfStream { .. })),
+        "expected EndOfStream after timeline exhausted, got {result:?}"
+    );
+}
+
+/// A SegmentTimeline with `r="2"` (3 occurrences) should produce the same
+/// `$Time$` sequence as three explicit S entries with the same durations.
+#[tokio::test]
+async fn timeline_repeat_attribute_produces_correct_times() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[TIMELINE_REPEAT_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+
+    for i in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .unwrap_or_else(|e| panic!("segment {i} fetch failed: {e}"));
+    }
+
+    let urls = recorded.lock().unwrap();
+    let times: Vec<u64> = urls
+        .iter()
+        .map(|u| {
+            u.rsplit('/').next().unwrap_or("")
+                .strip_prefix("chunk-").unwrap_or("")
+                .strip_suffix(".m4s").unwrap_or("")
+                .parse()
+                .expect("non-numeric time in URL")
+        })
+        .collect();
+
+    assert_eq!(times, vec![0u64, 270_000, 540_000]);
+
+    // After all repeats, the timeline is exhausted → EOS.
+    drop(urls);
+    let result = session.fetch_next_segment(MediaType::Video, &metrics).await;
+    assert!(
+        matches!(result, Err(DashError::EndOfStream { .. })),
+        "expected EndOfStream after repeat segments exhausted, got {result:?}"
+    );
+}

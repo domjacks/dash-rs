@@ -376,8 +376,6 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 
 | Feature | dash.js equivalent | Notes |
 |---|---|---|
-| `$Time$` template variable | `TemplateSegmentsGetter.js` | `expand_template` passes it through verbatim; `SegmentUrlUnresolvable` is returned for manifests that use it |
-| SegmentTimeline | `TimelineSegmentsGetter.js` | Parsed by `dash-mpd` but never dispatched |
 | SegmentList | `ListSegmentsGetter.js` | Not implemented |
 | SegmentBase (byte-range) | `SegmentBaseGetter.js` | `FetchRequest::byte_range` field exists but is never set |
 | Multi-period playback | `StreamController.js` / `Stream.js` | First `Period` only; no error on multi-period MPDs |
