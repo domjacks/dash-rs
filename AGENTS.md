@@ -272,16 +272,17 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
-| Session coordinator (`DashSession`, `TrackState`, `MediaType`) | `src/session/mod.rs` |
+| Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
 | MPD helpers (`merge_segment_templates`, `extract_segment_timing`, etc.) | `src/session/mpd.rs` |
 | SegmentTimeline / `$Time$` walking | `src/session/timeline.rs` |
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
 | Live-edge segment calculation | `src/session/live.rs` |
 | UTC clock sync (`resolve_utc_timing`, `query_http_utc`) | `src/session/utc.rs` |
 | XS datetime parser (`parse_xs_datetime`) | `src/util.rs` |
+| ISO BMFF box parsing (`sidx`, `emsg`) | `src/mp4.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
 | MSE abstraction tests | `tests/media_source.rs` |
-| Live-stream API + SegmentTimeline + UTCTiming tests | `tests/session.rs` |
+| Live-stream API + SegmentTimeline + UTCTiming + emsg tests | `tests/session.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
@@ -307,6 +308,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `ManifestUpdater.js` | `session::DashSession::refresh_manifest_if_due` (called automatically inside `fetch_next_segment`) |
 | `MediaPlayer.js` + `StreamProcessor.js` | `session::DashSession` |
 | `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` |
+| `EventController.js` | `session::DashEvent` + `DashSession::subscribe_events` (broadcast channel; events dispatched by `fetch_next_segment`) |
 
 ---
 
@@ -328,7 +330,6 @@ implementation priority.  PRs welcome.
 
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
-| In-band DASH events (`emsg`) | `EventController.js` | Parse the `emsg` ISO BMFF box from each fetched segment (after `parse_sidx` in `fetch_next_segment`). Expose a callback or channel on `DashSession` for timed event dispatch. |
 | Content steering server | `ContentSteeringController.js` | Static CDN failover exists. Parse `<ContentSteering>` from the MPD; spawn a refresh task that polls the steering server and updates the ordered base-URL list in `DashSession`. |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | New file `src/abr/l2a.rs`. Implements the Lyapunov optimisation tuned for low-latency streams. Register in `AbrController::default()`. |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` / `LearningAbrController.js` | New file `src/abr/lolp.rs`. Requires a QoE evaluator and an online weight-selector; more complex than other rules. |

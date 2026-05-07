@@ -1,10 +1,14 @@
 //! Minimal ISO Base Media File Format (ISOBMFF) box parsing.
 //!
 //! This module implements only the subset of the spec needed to extract
-//! presentation-time information from MPEG-DASH media segments:
+//! presentation-time information and in-band timed events from MPEG-DASH
+//! media segments:
 //!
 //! - [`parse_sidx`] — parses a `SegmentIndexBox` (`sidx`) to obtain the
 //!   segment's start and end presentation times in seconds.
+//! - [`parse_all_emsg`] — scans a segment for all `DASHEventMessageBox`
+//!   (`emsg`) boxes (ISO 14496-12 §8.10.2) and returns one [`EmsgInfo`] per
+//!   box found.
 //!
 //! # Why `sidx`?
 //!
@@ -24,16 +28,302 @@
 //! accurate time ranges — enabling the `BufferOccupancyRule` to make
 //! data-driven quality decisions instead of returning no opinion.
 //!
+//! # Why `emsg`?
+//!
+//! MPEG-DASH in-band events are carried as `emsg` boxes (ISO 14496-12
+//! §8.10.2) embedded in media segments.  They are the mechanism used for
+//! ad-insertion cues (SCTE-35), audience measurement triggers, and other
+//! timed metadata.  Two box versions exist:
+//!
+//! | Version | Presentation time field | String fields order |
+//! |---|---|---|
+//! | 0 | `presentation_time_delta` (u32, relative to segment start) | strings first |
+//! | 1 | `presentation_time` (u64, absolute on media timeline) | integers first |
+//!
 //! # Limitations
 //!
-//! - Only top-level `sidx` boxes are scanned.  Hierarchical (nested) sidx
-//!   chains are not followed.
+//! - Only **top-level** `sidx` / `emsg` boxes are scanned.  Boxes nested
+//!   inside `moof` fragments are not found.
 //! - `sidx` boxes embedded inside `moof` are not found.
 //! - Segments that use only `tfdt`/`mvhd` for timing (no `sidx`) will still
 //!   produce `Chunk { start: None, end: None }` — this is the pre-existing
 //!   behaviour and is not a regression.
 
-/// Timing information extracted from an ISO BMFF `sidx` box.
+use bytes::Bytes;
+
+// ── EmsgInfo / parse_all_emsg ─────────────────────────────────────────────────
+
+/// A single DASH event parsed from a `DASHEventMessageBox` (`emsg`,
+/// ISO 14496-12 §8.10.2).
+///
+/// Two wire versions exist:
+///
+/// | Field | Version 0 | Version 1 |
+/// |---|---|---|
+/// | `presentation_time_s` | `presentation_time_delta / timescale` — relative to the segment's earliest presentation time | `presentation_time / timescale` — absolute on the media timeline |
+///
+/// The DASH-IF recommends version 1 for new content; version 0 is still
+/// widespread in live ad-insertion workflows (SCTE-35 `urn:scte:scte35:2014:xml+bin`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmsgInfo {
+    /// Box version: 0 or 1.
+    pub version: u8,
+    /// URI identifying the event scheme (e.g. `"urn:scte:scte35:2014:xml+bin"`).
+    pub scheme_id_uri: String,
+    /// Optional value qualifying the scheme (empty string when absent).
+    pub value: String,
+    /// Presentation time in seconds.
+    ///
+    /// - **Version 0**: `presentation_time_delta / timescale` — offset from the
+    ///   segment's earliest presentation time.  Add `sidx.start_s` (when
+    ///   available) to convert to an absolute timeline position.
+    /// - **Version 1**: `presentation_time / timescale` — absolute position on
+    ///   the media presentation timeline.
+    pub presentation_time_s: f64,
+    /// Duration of the event in seconds.
+    ///
+    /// [`f64::INFINITY`] when `event_duration == 0xFFFF_FFFF` (indefinite, per
+    /// the spec).
+    pub duration_s: f64,
+    /// Unique identifier for this event within its scheme.
+    pub id: u32,
+    /// Raw event message payload.
+    pub message_data: Bytes,
+}
+
+/// Scan `data` for all ISO BMFF `emsg` (DASHEventMessageBox) boxes at the
+/// top level and return one [`EmsgInfo`] per box found.
+///
+/// Returns an empty `Vec` when no `emsg` boxes are present or the buffer is
+/// entirely malformed.  Individual boxes that are malformed are silently
+/// skipped.
+///
+/// # Example
+///
+/// ```rust
+/// use dash_rs::mp4::parse_all_emsg;
+///
+/// // Build a minimal version-1 emsg:
+/// //   timescale=1000, presentation_time=5000 (5 s), event_duration=2000 (2 s),
+/// //   id=42, scheme_id_uri="urn:example", value="", message_data=b"hello"
+/// let mut box_body: Vec<u8> = Vec::new();
+/// box_body.push(1);                              // version = 1
+/// box_body.extend_from_slice(&[0u8; 3]);        // flags
+/// box_body.extend_from_slice(&1000u32.to_be_bytes()); // timescale
+/// box_body.extend_from_slice(&5000u64.to_be_bytes()); // presentation_time
+/// box_body.extend_from_slice(&2000u32.to_be_bytes()); // event_duration
+/// box_body.extend_from_slice(&42u32.to_be_bytes());   // id
+/// box_body.extend_from_slice(b"urn:example\0"); // scheme_id_uri
+/// box_body.extend_from_slice(b"\0");            // value (empty)
+/// box_body.extend_from_slice(b"hello");         // message_data
+///
+/// let total_size = (8u32 + box_body.len() as u32).to_be_bytes();
+/// let mut data: Vec<u8> = total_size.to_vec();
+/// data.extend_from_slice(b"emsg");
+/// data.extend_from_slice(&box_body);
+///
+/// let events = parse_all_emsg(&data);
+/// assert_eq!(events.len(), 1);
+/// assert_eq!(events[0].scheme_id_uri, "urn:example");
+/// assert!((events[0].presentation_time_s - 5.0).abs() < 1e-9);
+/// assert!((events[0].duration_s - 2.0).abs() < 1e-9);
+/// assert_eq!(events[0].id, 42);
+/// assert_eq!(&events[0].message_data[..], b"hello");
+/// ```
+pub fn parse_all_emsg(data: &[u8]) -> Vec<EmsgInfo> {
+    let mut result = Vec::new();
+    let mut offset = 0usize;
+
+    loop {
+        if offset + 8 > data.len() {
+            break;
+        }
+
+        let raw_size = u32::from_be_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ]);
+        let typ: [u8; 4] = [
+            data[offset + 4],
+            data[offset + 5],
+            data[offset + 6],
+            data[offset + 7],
+        ];
+
+        let (box_size, content_start): (usize, usize) = match raw_size {
+            1 => {
+                if offset + 16 > data.len() {
+                    break;
+                }
+                let large = u64::from_be_bytes([
+                    data[offset + 8],
+                    data[offset + 9],
+                    data[offset + 10],
+                    data[offset + 11],
+                    data[offset + 12],
+                    data[offset + 13],
+                    data[offset + 14],
+                    data[offset + 15],
+                ]) as usize;
+                (large, 16)
+            }
+            0 => (data.len() - offset, 8),
+            n if (n as usize) < 8 => break,
+            n => (n as usize, 8),
+        };
+
+        let box_end = (offset + box_size).min(data.len());
+
+        if typ == *b"emsg" {
+            // content_start is relative to box start; fullbox payload begins there.
+            let payload_start = offset + content_start;
+            if payload_start < box_end {
+                if let Some(emsg) = parse_emsg_fullbox(&data[payload_start..box_end]) {
+                    result.push(emsg);
+                }
+            }
+        }
+
+        if offset + box_size > data.len() {
+            break;
+        }
+        offset += box_size;
+    }
+
+    result
+}
+
+// ── Internal emsg parser ──────────────────────────────────────────────────────
+
+/// Parse the FullBox payload of an `emsg` box.
+///
+/// `data` must start at the `version` byte (byte 0 = version, bytes 1–3 = flags).
+///
+/// Version 0 layout (ISO 14496-12 §8.10.2):
+/// ```text
+/// version(1) flags(3)
+/// scheme_id_uri (null-terminated)
+/// value         (null-terminated)
+/// timescale     (u32)
+/// presentation_time_delta (u32)
+/// event_duration (u32)
+/// id            (u32)
+/// message_data  (remaining bytes)
+/// ```
+///
+/// Version 1 layout:
+/// ```text
+/// version(1) flags(3)
+/// timescale (u32)
+/// presentation_time (u64)
+/// event_duration (u32)
+/// id (u32)
+/// scheme_id_uri (null-terminated)
+/// value         (null-terminated)
+/// message_data  (remaining bytes)
+/// ```
+fn parse_emsg_fullbox(data: &[u8]) -> Option<EmsgInfo> {
+    if data.is_empty() {
+        return None;
+    }
+    let version = data[0];
+    // flags at [1..4] — not used.
+
+    match version {
+        0 => parse_emsg_v0(&data[4..]),
+        1 => parse_emsg_v1(&data[4..]),
+        _ => None, // unknown version
+    }
+}
+
+/// Parse the post-flags body of a version-0 `emsg`.
+fn parse_emsg_v0(body: &[u8]) -> Option<EmsgInfo> {
+    // scheme_id_uri (null-terminated)
+    let (scheme_id_uri, rest) = read_cstring(body)?;
+    // value (null-terminated)
+    let (value, rest) = read_cstring(rest)?;
+    // Need at least 16 bytes: timescale(4) + pt_delta(4) + dur(4) + id(4)
+    if rest.len() < 16 {
+        return None;
+    }
+    let timescale = u32::from_be_bytes([rest[0], rest[1], rest[2], rest[3]]);
+    if timescale == 0 {
+        return None;
+    }
+    let presentation_time_delta = u32::from_be_bytes([rest[4], rest[5], rest[6], rest[7]]);
+    let event_duration = u32::from_be_bytes([rest[8], rest[9], rest[10], rest[11]]);
+    let id = u32::from_be_bytes([rest[12], rest[13], rest[14], rest[15]]);
+    let message_data = Bytes::copy_from_slice(&rest[16..]);
+
+    let presentation_time_s = presentation_time_delta as f64 / timescale as f64;
+    let duration_s = if event_duration == 0xFFFF_FFFF {
+        f64::INFINITY
+    } else {
+        event_duration as f64 / timescale as f64
+    };
+
+    Some(EmsgInfo {
+        version: 0,
+        scheme_id_uri,
+        value,
+        presentation_time_s,
+        duration_s,
+        id,
+        message_data,
+    })
+}
+
+/// Parse the post-flags body of a version-1 `emsg`.
+fn parse_emsg_v1(body: &[u8]) -> Option<EmsgInfo> {
+    // Need at least: timescale(4) + presentation_time(8) + event_duration(4) + id(4) = 20 bytes
+    // before the null-terminated strings.
+    if body.len() < 20 {
+        return None;
+    }
+    let timescale = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
+    if timescale == 0 {
+        return None;
+    }
+    let presentation_time = u64::from_be_bytes([
+        body[4], body[5], body[6], body[7], body[8], body[9], body[10], body[11],
+    ]);
+    let event_duration = u32::from_be_bytes([body[12], body[13], body[14], body[15]]);
+    let id = u32::from_be_bytes([body[16], body[17], body[18], body[19]]);
+
+    let rest = &body[20..];
+    let (scheme_id_uri, rest) = read_cstring(rest)?;
+    let (value, rest) = read_cstring(rest)?;
+    let message_data = Bytes::copy_from_slice(rest);
+
+    let presentation_time_s = presentation_time as f64 / timescale as f64;
+    let duration_s = if event_duration == 0xFFFF_FFFF {
+        f64::INFINITY
+    } else {
+        event_duration as f64 / timescale as f64
+    };
+
+    Some(EmsgInfo {
+        version: 1,
+        scheme_id_uri,
+        value,
+        presentation_time_s,
+        duration_s,
+        id,
+        message_data,
+    })
+}
+
+/// Read a null-terminated UTF-8 string from `data`, returning `(string, remainder)`.
+/// Returns `None` if no null terminator is found.
+fn read_cstring(data: &[u8]) -> Option<(String, &[u8])> {
+    let nul = data.iter().position(|&b| b == 0)?;
+    let s = String::from_utf8_lossy(&data[..nul]).into_owned();
+    Some((s, &data[nul + 1..]))
+}
+
+
 ///
 /// All times are in **seconds** relative to the stream's presentation
 /// timeline.
@@ -504,5 +794,198 @@ mod tests {
         let info = parse_sidx(&data).unwrap();
         assert!((info.start_s - 0.0).abs() < 1e-9);
         assert!((info.end_s - 3.84).abs() < 1e-9);
+    }
+
+    // ── emsg helpers ──────────────────────────────────────────────────────────
+
+    /// Build a version-0 `emsg` box.
+    fn make_emsg_v0(
+        scheme_id_uri: &str,
+        value: &str,
+        timescale: u32,
+        presentation_time_delta: u32,
+        event_duration: u32,
+        id: u32,
+        message_data: &[u8],
+    ) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        body.push(0); // version
+        body.extend_from_slice(&[0u8; 3]); // flags
+        body.extend_from_slice(scheme_id_uri.as_bytes());
+        body.push(0); // null terminator
+        body.extend_from_slice(value.as_bytes());
+        body.push(0); // null terminator
+        body.extend_from_slice(&timescale.to_be_bytes());
+        body.extend_from_slice(&presentation_time_delta.to_be_bytes());
+        body.extend_from_slice(&event_duration.to_be_bytes());
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(message_data);
+
+        let size = (8u32 + body.len() as u32).to_be_bytes();
+        let mut buf = size.to_vec();
+        buf.extend_from_slice(b"emsg");
+        buf.extend_from_slice(&body);
+        buf
+    }
+
+    /// Build a version-1 `emsg` box.
+    fn make_emsg_v1(
+        scheme_id_uri: &str,
+        value: &str,
+        timescale: u32,
+        presentation_time: u64,
+        event_duration: u32,
+        id: u32,
+        message_data: &[u8],
+    ) -> Vec<u8> {
+        let mut body: Vec<u8> = Vec::new();
+        body.push(1); // version
+        body.extend_from_slice(&[0u8; 3]); // flags
+        body.extend_from_slice(&timescale.to_be_bytes());
+        body.extend_from_slice(&presentation_time.to_be_bytes());
+        body.extend_from_slice(&event_duration.to_be_bytes());
+        body.extend_from_slice(&id.to_be_bytes());
+        body.extend_from_slice(scheme_id_uri.as_bytes());
+        body.push(0); // null terminator
+        body.extend_from_slice(value.as_bytes());
+        body.push(0); // null terminator
+        body.extend_from_slice(message_data);
+
+        let size = (8u32 + body.len() as u32).to_be_bytes();
+        let mut buf = size.to_vec();
+        buf.extend_from_slice(b"emsg");
+        buf.extend_from_slice(&body);
+        buf
+    }
+
+    // ── emsg correctness ──────────────────────────────────────────────────────
+
+    #[test]
+    fn emsg_v0_basic_fields() {
+        let data = make_emsg_v0("urn:scte:scte35:2014:xml+bin", "1", 90_000, 180_000, 270_000, 7, b"payload");
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.version, 0);
+        assert_eq!(e.scheme_id_uri, "urn:scte:scte35:2014:xml+bin");
+        assert_eq!(e.value, "1");
+        // presentation_time_delta=180000, timescale=90000 → 2.0 s
+        assert!((e.presentation_time_s - 2.0).abs() < 1e-9, "pt={}", e.presentation_time_s);
+        // event_duration=270000, timescale=90000 → 3.0 s
+        assert!((e.duration_s - 3.0).abs() < 1e-9, "dur={}", e.duration_s);
+        assert_eq!(e.id, 7);
+        assert_eq!(&e.message_data[..], b"payload");
+    }
+
+    #[test]
+    fn emsg_v1_basic_fields() {
+        // timescale=1000, presentation_time=5000 → 5 s; duration=2000 → 2 s
+        let data = make_emsg_v1("urn:example:test", "val", 1000, 5000, 2000, 42, b"hello");
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        assert_eq!(e.version, 1);
+        assert_eq!(e.scheme_id_uri, "urn:example:test");
+        assert_eq!(e.value, "val");
+        assert!((e.presentation_time_s - 5.0).abs() < 1e-9, "pt={}", e.presentation_time_s);
+        assert!((e.duration_s - 2.0).abs() < 1e-9, "dur={}", e.duration_s);
+        assert_eq!(e.id, 42);
+        assert_eq!(&e.message_data[..], b"hello");
+    }
+
+    #[test]
+    fn emsg_indefinite_duration_v0() {
+        let data = make_emsg_v0("urn:x", "", 1000, 0, 0xFFFF_FFFF, 1, b"");
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].duration_s.is_infinite(), "expected INFINITY for 0xFFFFFFFF event_duration");
+    }
+
+    #[test]
+    fn emsg_indefinite_duration_v1() {
+        let data = make_emsg_v1("urn:x", "", 1000, 0, 0xFFFF_FFFF, 1, b"");
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        assert!(events[0].duration_s.is_infinite());
+    }
+
+    #[test]
+    fn emsg_empty_value_string() {
+        // Both scheme_id_uri and value can be empty.
+        let data = make_emsg_v1("", "", 1000, 0, 1000, 0, b"");
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].scheme_id_uri, "");
+        assert_eq!(events[0].value, "");
+    }
+
+    #[test]
+    fn emsg_multiple_boxes_in_segment() {
+        // Two emsg boxes back-to-back; both should be returned.
+        let mut data = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
+        data.extend_from_slice(&make_emsg_v1("urn:b", "", 1000, 2000, 500, 2, b"second"));
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].scheme_id_uri, "urn:a");
+        assert_eq!(&events[0].message_data[..], b"first");
+        assert_eq!(events[1].scheme_id_uri, "urn:b");
+        assert_eq!(&events[1].message_data[..], b"second");
+    }
+
+    #[test]
+    fn emsg_mixed_with_other_boxes() {
+        // Real segments: styp + sidx + emsg.  Both sidx and emsg should parse.
+        let styp: &[u8] = &[
+            0, 0, 0, 20, b's', b't', b'y', b'p',
+            b'd', b'a', b's', b'h', 0, 0, 0, 0,
+            b'd', b'a', b's', b'h',
+        ];
+        let sidx = make_sidx_v0(1000, 0, &[2000]);
+        let emsg = make_emsg_v1("urn:test", "", 1000, 500, 1000, 9, b"data");
+
+        let mut data = styp.to_vec();
+        data.extend_from_slice(&sidx);
+        data.extend_from_slice(&emsg);
+
+        // sidx still found
+        let info = parse_sidx(&data).unwrap();
+        assert!((info.start_s - 0.0).abs() < 1e-9);
+        assert!((info.end_s - 2.0).abs() < 1e-9);
+
+        // emsg still found
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].scheme_id_uri, "urn:test");
+        assert_eq!(events[0].id, 9);
+    }
+
+    #[test]
+    fn emsg_no_emsg_returns_empty() {
+        // A buffer with only a sidx: parse_all_emsg should return empty.
+        let data = make_sidx_v0(1000, 0, &[1000]);
+        assert!(parse_all_emsg(&data).is_empty());
+    }
+
+    #[test]
+    fn emsg_empty_buffer_returns_empty() {
+        assert!(parse_all_emsg(&[]).is_empty());
+    }
+
+    #[test]
+    fn emsg_zero_timescale_skipped() {
+        // A v1 emsg with timescale=0 must be skipped (would cause divide-by-zero).
+        let data = make_emsg_v1("urn:x", "", 0, 0, 0, 0, b"");
+        // parse_all_emsg silently skips malformed boxes.
+        assert!(parse_all_emsg(&data).is_empty());
+    }
+
+    #[test]
+    fn emsg_large_message_payload() {
+        // Verify that large message_data round-trips correctly.
+        let payload: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let data = make_emsg_v1("urn:big", "0", 90_000, 0, 90_000, 0, &payload);
+        let events = parse_all_emsg(&data);
+        assert_eq!(events.len(), 1);
+        assert_eq!(&events[0].message_data[..], payload.as_slice());
     }
 }

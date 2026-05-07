@@ -1080,3 +1080,227 @@ async fn utc_unsupported_schemes_fall_back_to_zero() {
         "unsupported UTCTiming schemes must leave offset at 0.0"
     );
 }
+
+// ── emsg / in-band event tests ────────────────────────────────────────────────
+
+/// Build a version-1 `emsg` box as raw bytes.
+fn make_emsg_v1(
+    scheme_id_uri: &str,
+    value: &str,
+    timescale: u32,
+    presentation_time: u64,
+    event_duration: u32,
+    id: u32,
+    message_data: &[u8],
+) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.push(1); // version
+    body.extend_from_slice(&[0u8; 3]); // flags
+    body.extend_from_slice(&timescale.to_be_bytes());
+    body.extend_from_slice(&presentation_time.to_be_bytes());
+    body.extend_from_slice(&event_duration.to_be_bytes());
+    body.extend_from_slice(&id.to_be_bytes());
+    body.extend_from_slice(scheme_id_uri.as_bytes());
+    body.push(0);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    body.extend_from_slice(message_data);
+
+    let size = (8u32 + body.len() as u32).to_be_bytes();
+    let mut buf = size.to_vec();
+    buf.extend_from_slice(b"emsg");
+    buf.extend_from_slice(&body);
+    buf
+}
+
+/// Build a version-0 `emsg` box as raw bytes.
+fn make_emsg_v0(
+    scheme_id_uri: &str,
+    value: &str,
+    timescale: u32,
+    presentation_time_delta: u32,
+    event_duration: u32,
+    id: u32,
+    message_data: &[u8],
+) -> Vec<u8> {
+    let mut body: Vec<u8> = Vec::new();
+    body.push(0); // version
+    body.extend_from_slice(&[0u8; 3]); // flags
+    body.extend_from_slice(scheme_id_uri.as_bytes());
+    body.push(0);
+    body.extend_from_slice(value.as_bytes());
+    body.push(0);
+    body.extend_from_slice(&timescale.to_be_bytes());
+    body.extend_from_slice(&presentation_time_delta.to_be_bytes());
+    body.extend_from_slice(&event_duration.to_be_bytes());
+    body.extend_from_slice(&id.to_be_bytes());
+    body.extend_from_slice(message_data);
+
+    let size = (8u32 + body.len() as u32).to_be_bytes();
+    let mut buf = size.to_vec();
+    buf.extend_from_slice(b"emsg");
+    buf.extend_from_slice(&body);
+    buf
+}
+
+/// A `SegmentFetcher` that serves one MPD from a queue and returns a fixed
+/// `segment_data` payload for every media / init segment fetch.
+struct EmsgMockFetcher {
+    manifest_queue: Arc<Mutex<VecDeque<Bytes>>>,
+    segment_data: Bytes,
+}
+
+impl EmsgMockFetcher {
+    fn new(manifest_xml: &str, segment_data: Vec<u8>) -> Self {
+        Self {
+            manifest_queue: Arc::new(Mutex::new(VecDeque::from([Bytes::from(
+                manifest_xml.to_string(),
+            )]))),
+            segment_data: Bytes::from(segment_data),
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentFetcher for EmsgMockFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        let data = if request.request_type == RequestType::Manifest {
+            self.manifest_queue
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default()
+        } else {
+            self.segment_data.clone()
+        };
+        let len = data.len() as u64;
+        Ok(FetchResponse {
+            final_url: request.url,
+            data,
+            transfer_duration_ms: 1,
+            bytes_received: len,
+        })
+    }
+
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+        Ok(true)
+    }
+
+    fn abort(&self) {}
+}
+
+/// A v1 emsg embedded in a media segment is delivered to a subscriber of
+/// `subscribe_events` when `fetch_next_segment` processes that segment.
+#[tokio::test]
+async fn emsg_v1_event_delivered_to_subscriber() {
+    let emsg_bytes = make_emsg_v1(
+        "urn:scte:scte35:2014:xml+bin",
+        "1",
+        90_000,
+        450_000, // 5.0 s
+        90_000,  // 1.0 s duration
+        77,
+        b"splice-info",
+    );
+
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Subscribe before the fetch so no events are missed.
+    let mut events = session.subscribe_events();
+
+    let metrics = default_metrics();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap();
+
+    let ev = events.try_recv().expect("expected one emsg event");
+    assert_eq!(ev.scheme_id_uri, "urn:scte:scte35:2014:xml+bin");
+    assert_eq!(ev.value, "1");
+    assert!((ev.presentation_time_s - 5.0).abs() < 1e-6, "pt={}", ev.presentation_time_s);
+    assert!((ev.duration_s - 1.0).abs() < 1e-6, "dur={}", ev.duration_s);
+    assert_eq!(ev.id, 77);
+    assert_eq!(&ev.message_data[..], b"splice-info");
+    assert_eq!(ev.media_type, MediaType::Video);
+}
+
+/// A v0 emsg preserves `scheme_id_uri`, `value`, and the time fields through
+/// the full `fetch_next_segment` → broadcast path.
+#[tokio::test]
+async fn emsg_v0_fields_preserved_through_broadcast() {
+    // timescale=1000, pt_delta=2000 → 2.0 s; event_duration=3000 → 3.0 s
+    let emsg_bytes = make_emsg_v0("urn:example:v0", "myval", 1000, 2000, 3000, 99, b"v0data");
+
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let mut events = session.subscribe_events();
+
+    session
+        .fetch_next_segment(MediaType::Video, &default_metrics())
+        .await
+        .unwrap();
+
+    let ev = events.try_recv().expect("expected v0 emsg event");
+    assert_eq!(ev.scheme_id_uri, "urn:example:v0");
+    assert_eq!(ev.value, "myval");
+    assert!((ev.presentation_time_s - 2.0).abs() < 1e-9, "pt={}", ev.presentation_time_s);
+    assert!((ev.duration_s - 3.0).abs() < 1e-9, "dur={}", ev.duration_s);
+    assert_eq!(ev.id, 99);
+    assert_eq!(&ev.message_data[..], b"v0data");
+}
+
+/// When there are no subscribers, `fetch_next_segment` must not panic or
+/// return an error — discarding the event silently is correct behaviour.
+#[tokio::test]
+async fn emsg_no_subscriber_does_not_panic() {
+    let emsg_bytes = make_emsg_v1("urn:x", "", 1000, 0, 1000, 1, b"");
+
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Deliberately do NOT call subscribe_events().
+    let result = session
+        .fetch_next_segment(MediaType::Video, &default_metrics())
+        .await;
+    assert!(result.is_ok(), "fetch_next_segment must succeed with no emsg subscribers");
+}
+
+/// Multiple `emsg` boxes in a single segment each produce an independent event.
+#[tokio::test]
+async fn emsg_two_events_in_one_segment() {
+    let mut emsg_bytes = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
+    emsg_bytes.extend_from_slice(&make_emsg_v1("urn:b", "", 1000, 2000, 500, 2, b"second"));
+
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let mut events = session.subscribe_events();
+
+    session
+        .fetch_next_segment(MediaType::Video, &default_metrics())
+        .await
+        .unwrap();
+
+    let ev1 = events.try_recv().expect("expected first emsg event");
+    let ev2 = events.try_recv().expect("expected second emsg event");
+    assert_eq!(ev1.scheme_id_uri, "urn:a");
+    assert_eq!(&ev1.message_data[..], b"first");
+    assert_eq!(ev2.scheme_id_uri, "urn:b");
+    assert_eq!(&ev2.message_data[..], b"second");
+    // No third event.
+    assert!(events.try_recv().is_err());
+}

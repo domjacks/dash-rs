@@ -55,5 +55,5 @@ pub mod util;
 pub use abr::{AbrController, AbrMetrics, QualityDecision};
 pub use error::DashError;
 pub use manifest::MPD;
-pub use mp4::{parse_sidx, SidxInfo};
-pub use session::{DashSession, MediaType};
+pub use mp4::{parse_all_emsg, parse_sidx, EmsgInfo, SidxInfo};
+pub use session::{DashEvent, DashSession, MediaType};

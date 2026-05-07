@@ -385,7 +385,6 @@ The table below tracks gaps relative to dash.js, grouped by impact.
 
 | Feature | dash.js equivalent | Notes |
 |---|---|---|
-| In-band DASH events (`emsg`) | `EventController.js` | No `emsg` box parsing or timed-event dispatch |
 | Content steering server | `ContentSteeringController.js` | Static weighted-random BaseURL failover exists; no dynamic steering server polling |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | Not implemented |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` | Not implemented |

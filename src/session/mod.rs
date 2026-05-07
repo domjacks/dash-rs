@@ -32,7 +32,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use bytes::Bytes;
 use dash_mpd::{MPD, Representation};
+use tokio::sync::broadcast;
 use url::Url;
 
 use crate::{
@@ -44,7 +46,7 @@ use crate::{
         sink::{SourceBufferSink, StreamInfo},
         Chunk, MediaSource,
     },
-    mp4::parse_sidx,
+    mp4::{parse_all_emsg, parse_sidx},
 };
 
 use self::{
@@ -74,6 +76,75 @@ impl std::fmt::Display for MediaType {
         }
     }
 }
+
+// ── DashEvent ─────────────────────────────────────────────────────────────────
+
+/// An in-band DASH event extracted from a `DASHEventMessageBox` (`emsg`) in a
+/// media segment.
+///
+/// Subscribers receive these via the channel returned by
+/// [`DashSession::subscribe_events`].  The channel is a
+/// `tokio::sync::broadcast` channel with a buffer of 64 events; slow
+/// consumers may see [`tokio::sync::broadcast::error::RecvError::Lagged`] if
+/// they fall too far behind.
+///
+/// # Presentation time semantics
+///
+/// | `emsg` version | `presentation_time_s` meaning |
+/// |---|---|
+/// | 0 | Seconds relative to the segment's earliest presentation time.  Add `sidx.start_s` (if available) to get an absolute timeline position. |
+/// | 1 | Absolute seconds from the start of the media presentation timeline. |
+///
+/// # Example
+///
+/// ```no_run
+/// # use dash_rs::session::{DashSession, MediaType};
+/// # use dash_rs::fetch::stub::StubSegmentFetcher;
+/// # use dash_rs::media_source::stub::StubMediaSource;
+/// # use std::sync::Arc;
+/// # use url::Url;
+/// # async fn example() -> Result<(), dash_rs::error::DashError> {
+/// # let mut media_source = StubMediaSource::new();
+/// # media_source.open();
+/// # let url = Url::parse("https://example.com/manifest.mpd").unwrap();
+/// let mut session = DashSession::from_url(&url, StubSegmentFetcher, media_source).await?;
+///
+/// // Subscribe *before* the fetch loop so no events are missed.
+/// let mut events = session.subscribe_events();
+///
+/// tokio::spawn(async move {
+///     while let Ok(ev) = events.recv().await {
+///         println!("event: {} @ {:.3}s", ev.scheme_id_uri, ev.presentation_time_s);
+///     }
+/// });
+/// # Ok(())
+/// # }
+/// ```
+#[derive(Debug, Clone)]
+pub struct DashEvent {
+    /// Which media track's segment contained this event.
+    pub media_type: MediaType,
+    /// URI identifying the event scheme (e.g. `"urn:scte:scte35:2014:xml+bin"`).
+    pub scheme_id_uri: String,
+    /// Optional value qualifying the scheme (empty string when the `emsg`
+    /// field is absent or empty).
+    pub value: String,
+    /// Presentation time in seconds (see table above for version semantics).
+    pub presentation_time_s: f64,
+    /// Duration of the event in seconds.  [`f64::INFINITY`] when the `emsg`
+    /// signals an indefinite duration (`event_duration == 0xFFFF_FFFF`).
+    pub duration_s: f64,
+    /// Unique identifier for this event within its scheme.
+    pub id: u32,
+    /// Raw event message payload bytes.
+    pub message_data: Bytes,
+}
+
+/// Capacity of the in-band event broadcast channel.
+///
+/// A slow consumer that falls more than this many events behind will receive
+/// [`tokio::sync::broadcast::error::RecvError::Lagged`].
+const EVENT_CHANNEL_CAPACITY: usize = 64;
 
 // ── TrackState ────────────────────────────────────────────────────────────────
 
@@ -220,6 +291,12 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// when no `UTCTiming` is present, all elements fail, or the session was
     /// constructed via [`Self::from_mpd`] (no network access allowed).
     utc_clock_offset_s: f64,
+    /// Broadcast sender for in-band DASH events extracted from `emsg` boxes.
+    ///
+    /// Callers subscribe via [`Self::subscribe_events`].  If no subscribers
+    /// are present, sends are silently dropped (the `broadcast` channel
+    /// discards messages when there are zero receivers).
+    event_tx: broadcast::Sender<DashEvent>,
 }
 
 // Re-export for convenience in examples.
@@ -436,6 +513,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         let mpd_minimum_update_period_ms = mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
 
+        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+
         Ok(Self {
             mpd,
             base_url,
@@ -456,6 +535,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             last_manifest_refresh: None,
             init_cache: HashMap::new(),
             utc_clock_offset_s,
+            event_tx,
         })
     }
 
@@ -474,6 +554,22 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// present or the session was built via [`Self::from_mpd`].
     pub fn utc_clock_offset_s(&self) -> f64 {
         self.utc_clock_offset_s
+    }
+
+    /// Subscribe to in-band DASH events extracted from `emsg` boxes.
+    ///
+    /// Call this **before** starting the fetch loop so that no events are
+    /// missed.  Events are broadcast from within [`Self::fetch_next_segment`]
+    /// immediately after the segment bytes are received and parsed.
+    ///
+    /// The returned [`broadcast::Receiver`] is a multi-producer,
+    /// multi-consumer channel — multiple subscribers each receive every event
+    /// independently.  If a subscriber's internal buffer fills up (capacity
+    /// [`EVENT_CHANNEL_CAPACITY`] = 64), the oldest events are overwritten and
+    /// the next `recv()` call will return
+    /// [`tokio::sync::broadcast::error::RecvError::Lagged`].
+    pub fn subscribe_events(&self) -> broadcast::Receiver<DashEvent> {
+        self.event_tx.subscribe()
     }
 
     /// Shared reference to the underlying [`MediaSource`].
@@ -1104,6 +1200,38 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 "sidx timing extracted"
             );
         }
+
+        // Parse and broadcast any in-band DASH events embedded in this segment.
+        let emsg_events = parse_all_emsg(&response.data);
+        if !emsg_events.is_empty() {
+            tracing::debug!(
+                media_type = %media_type,
+                segment_number = seg_number,
+                count = emsg_events.len(),
+                "emsg: dispatching in-band events"
+            );
+            for emsg in emsg_events {
+                tracing::debug!(
+                    scheme_id_uri = %emsg.scheme_id_uri,
+                    value = %emsg.value,
+                    presentation_time_s = emsg.presentation_time_s,
+                    id = emsg.id,
+                    "emsg event"
+                );
+                let event = DashEvent {
+                    media_type: media_type.clone(),
+                    scheme_id_uri: emsg.scheme_id_uri,
+                    value: emsg.value,
+                    presentation_time_s: emsg.presentation_time_s,
+                    duration_s: emsg.duration_s,
+                    id: emsg.id,
+                    message_data: emsg.message_data,
+                };
+                // Errors here mean no subscribers — that is fine.
+                let _ = self.event_tx.send(event);
+            }
+        }
+
         let chunk = Chunk::new(
             response.data,
             sidx.map(|s| s.start_s),
