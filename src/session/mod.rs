@@ -427,6 +427,14 @@ impl TrackState {
 pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     mpd: MPD,
     base_url: Url,
+    /// Alternative manifest URLs from `<Location>` elements in the MPD.
+    ///
+    /// Mirrors `LocationSelector.js` in dash.js.  When [`Self::refresh_manifest`]
+    /// fails on `base_url`, each URL in this list is tried in order.  The first
+    /// successful response updates `base_url` to that location URL so that all
+    /// future refreshes use the working CDN.  Updated on every successful
+    /// manifest refresh.
+    location_urls: Vec<Url>,
     fetcher: Arc<F>,
     media_source: M,
     abr: AbrController,
@@ -689,11 +697,26 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         let mpd_minimum_update_period_ms = mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
 
+        // Parse `<Location>` elements — alternative manifest URLs used as
+        // fallback on refresh failure (mirrors `LocationSelector.js`).
+        let location_urls: Vec<Url> = mpd
+            .locations
+            .iter()
+            .filter_map(|loc| base_url.join(&loc.url).ok())
+            .collect();
+        if !location_urls.is_empty() {
+            tracing::debug!(
+                count = location_urls.len(),
+                "manifest contains Location elements"
+            );
+        }
+
         let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
 
         Ok(Self {
             mpd,
             base_url,
+            location_urls,
             fetcher,
             media_source,
             abr: AbrController::default(),
@@ -723,6 +746,22 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The parsed MPD manifest.
     pub fn mpd(&self) -> &MPD {
         &self.mpd
+    }
+
+    /// The URL that the manifest was last loaded from (or successfully refreshed from).
+    ///
+    /// Updated to the responding `<Location>` URL when a refresh falls back to
+    /// one of the alternative locations.
+    pub fn manifest_url(&self) -> &Url {
+        &self.base_url
+    }
+
+    /// Alternative manifest URLs parsed from `<Location>` elements.
+    ///
+    /// On manifest refresh failure, these are tried in order before the error
+    /// is returned.  Updated on every successful manifest refresh.
+    pub fn location_urls(&self) -> &[Url] {
+        &self.location_urls
     }
 
     /// The number of `Period` elements in the manifest.
@@ -1085,15 +1124,63 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Re-fetch and re-parse the manifest, updating `total_segments`,
     /// `minimumUpdatePeriod`, and `base_url` without resetting ABR or buffer state.
+    ///
+    /// If the primary `base_url` fails, each `<Location>` URL is tried in order
+    /// (mirrors `LocationSelector.js`).  The first URL that responds successfully
+    /// becomes the new `base_url` for all subsequent refreshes.  If every URL
+    /// fails the last error is returned.
     pub async fn refresh_manifest(&mut self) -> Result<(), DashError> {
         tracing::info!(url = %self.base_url, "refreshing live manifest");
 
         let loader = ManifestLoader::new(Arc::clone(&self.fetcher));
-        let (new_mpd, new_base_url) = loader.load(&self.base_url).await?;
+
+        // Try the primary URL, then fall back through any <Location> alternatives.
+        let (new_mpd, new_base_url) = {
+            let primary_result = loader.load(&self.base_url).await;
+            match primary_result {
+                Ok(pair) => pair,
+                Err(primary_err) => {
+                    let mut last_err = primary_err;
+                    let mut found: Option<(dash_mpd::MPD, Url)> = None;
+                    for location_url in &self.location_urls {
+                        tracing::warn!(
+                            primary_url = %self.base_url,
+                            location_url = %location_url,
+                            "manifest refresh: primary URL failed, trying Location fallback"
+                        );
+                        match loader.load(location_url).await {
+                            Ok(pair) => {
+                                found = Some(pair);
+                                break;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    url = %location_url,
+                                    error = %e,
+                                    "manifest refresh: Location URL also failed"
+                                );
+                                last_err = e;
+                            }
+                        }
+                    }
+                    match found {
+                        Some(pair) => pair,
+                        None => return Err(last_err),
+                    }
+                }
+            }
+        };
 
         self.last_manifest_refresh = Some(Instant::now());
-        self.base_url = new_base_url;
+        self.base_url = new_base_url.clone();
         self.minimum_update_period_ms = new_mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
+
+        // Update location_urls from the refreshed manifest.
+        self.location_urls = new_mpd
+            .locations
+            .iter()
+            .filter_map(|loc| new_base_url.join(&loc.url).ok())
+            .collect();
 
         let presentation_duration = new_mpd.mediaPresentationDuration;
         if let Some(period) = new_mpd.periods.first() {

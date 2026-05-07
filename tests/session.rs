@@ -2272,3 +2272,232 @@ async fn xlink_adaptation_set_onload_is_inlined() {
         "expected a remote-as-seg-N URL but recorded {urls:?}"
     );
 }
+
+// ── MPD <Location> ────────────────────────────────────────────────────────────
+
+/// MPD with two `<Location>` elements — used by Location tests below.
+const LOCATION_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <Location>http://cdn1.example.com/manifest.mpd</Location>
+  <Location>http://cdn2.example.com/manifest.mpd</Location>
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// MPD with no `<Location>` elements.
+const NO_LOCATION_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// A `SegmentFetcher` that routes manifest requests by URL.
+///
+/// Each entry in `routes` maps a URL string to a queue of responses.
+/// `Ok(xml)` serves the given XML; `Err(())` simulates a network failure.
+/// An empty queue or a missing entry also returns an error.
+struct RoutesFetcher {
+    routes: Arc<Mutex<std::collections::HashMap<String, VecDeque<Result<String, ()>>>>>,
+}
+
+impl RoutesFetcher {
+    fn new(
+        routes: impl IntoIterator<Item = (String, Vec<Result<String, ()>>)>,
+    ) -> Self {
+        Self {
+            routes: Arc::new(Mutex::new(
+                routes
+                    .into_iter()
+                    .map(|(k, v)| (k, v.into_iter().collect()))
+                    .collect(),
+            )),
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentFetcher for RoutesFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        if request.request_type != RequestType::Manifest {
+            // Non-manifest requests always succeed with empty bytes.
+            return Ok(FetchResponse {
+                final_url: request.url,
+                data: Bytes::new(),
+                transfer_duration_ms: 1,
+                bytes_received: 0,
+            });
+        }
+
+        let url_str = request.url.to_string();
+        let outcome = self
+            .routes
+            .lock()
+            .unwrap()
+            .get_mut(&url_str)
+            .and_then(|q| q.pop_front());
+
+        match outcome {
+            Some(Ok(xml)) => {
+                let data = Bytes::from(xml);
+                let len = data.len() as u64;
+                Ok(FetchResponse {
+                    final_url: request.url,
+                    data,
+                    transfer_duration_ms: 1,
+                    bytes_received: len,
+                })
+            }
+            _ => Err(FetchError::Network {
+                url: request.url,
+                message: "simulated network failure".into(),
+            }),
+        }
+    }
+
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+        Ok(true)
+    }
+
+    fn abort(&self) {}
+}
+
+/// `location_urls()` returns the URLs from `<Location>` elements in order.
+#[test]
+fn location_urls_parsed_from_mpd() {
+    let session = session_from_xml(LOCATION_MPD);
+    let urls = session.location_urls();
+    assert_eq!(urls.len(), 2);
+    assert_eq!(urls[0].as_str(), "http://cdn1.example.com/manifest.mpd");
+    assert_eq!(urls[1].as_str(), "http://cdn2.example.com/manifest.mpd");
+}
+
+/// `location_urls()` is empty when the MPD has no `<Location>` elements.
+#[test]
+fn location_urls_empty_when_no_location_elements() {
+    assert!(session_from_xml(NO_LOCATION_MPD).location_urls().is_empty());
+}
+
+/// When the primary URL fails on refresh, the first working `<Location>` URL
+/// is tried and the refresh succeeds.
+#[tokio::test]
+async fn refresh_manifest_falls_back_to_location_url() {
+    // Initial load uses the primary URL; the refresh attempt at the primary
+    // fails; cdn1 (the first Location) succeeds.
+    let primary = "http://primary.example.com/manifest.mpd".to_string();
+    let cdn1 = "http://cdn1.example.com/manifest.mpd".to_string();
+
+    let fetcher = RoutesFetcher::new([
+        (primary.clone(), vec![Ok(LOCATION_MPD.to_string()), Err(())]),
+        (cdn1.clone(), vec![Ok(LOCATION_MPD.to_string())]),
+    ]);
+
+    let url = Url::parse(&primary).unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .expect("initial load should succeed");
+
+    // Confirm locations were parsed.
+    assert_eq!(session.location_urls().len(), 2);
+
+    // The primary URL fails on refresh; the first Location URL rescues it.
+    session
+        .refresh_manifest()
+        .await
+        .expect("refresh should succeed via Location fallback");
+}
+
+/// After a successful `<Location>` fallback, `manifest_url()` is updated to
+/// the responding location URL.
+#[tokio::test]
+async fn refresh_manifest_updates_base_url_to_location_url() {
+    let primary = "http://primary.example.com/manifest.mpd".to_string();
+    let cdn1 = "http://cdn1.example.com/manifest.mpd".to_string();
+
+    let fetcher = RoutesFetcher::new([
+        (primary.clone(), vec![Ok(LOCATION_MPD.to_string()), Err(())]),
+        (cdn1.clone(), vec![Ok(NO_LOCATION_MPD.to_string())]),
+    ]);
+
+    let url = Url::parse(&primary).unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert_eq!(session.manifest_url().as_str(), primary);
+
+    session.refresh_manifest().await.unwrap();
+
+    // After fallback, subsequent refreshes use the location URL.
+    assert_eq!(session.manifest_url().as_str(), cdn1);
+}
+
+/// After falling back to a `<Location>` URL, `location_urls()` reflects the
+/// `<Location>` elements in the *new* manifest (the refreshed one), not the
+/// stale original.
+#[tokio::test]
+async fn refresh_manifest_updates_location_urls_from_refreshed_manifest() {
+    let primary = "http://primary.example.com/manifest.mpd".to_string();
+    let cdn1 = "http://cdn1.example.com/manifest.mpd".to_string();
+
+    // The initial MPD has two Location entries (cdn1, cdn2).
+    // The refreshed MPD (served by cdn1) has no Location entries.
+    let fetcher = RoutesFetcher::new([
+        (primary.clone(), vec![Ok(LOCATION_MPD.to_string()), Err(())]),
+        (cdn1.clone(), vec![Ok(NO_LOCATION_MPD.to_string())]),
+    ]);
+
+    let url = Url::parse(&primary).unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert_eq!(session.location_urls().len(), 2, "initial manifest has 2 Location entries");
+
+    session.refresh_manifest().await.unwrap();
+
+    assert!(
+        session.location_urls().is_empty(),
+        "refreshed manifest has no Location entries; location_urls should be empty"
+    );
+}
+
+/// When every URL (primary + all Location fallbacks) fails, `refresh_manifest`
+/// returns an error.
+#[tokio::test]
+async fn refresh_manifest_returns_error_when_all_locations_fail() {
+    let primary = "http://primary.example.com/manifest.mpd".to_string();
+    let cdn1 = "http://cdn1.example.com/manifest.mpd".to_string();
+    let cdn2 = "http://cdn2.example.com/manifest.mpd".to_string();
+
+    // Initial load works; all subsequent requests fail.
+    let fetcher = RoutesFetcher::new([
+        (primary.clone(), vec![Ok(LOCATION_MPD.to_string()), Err(())]),
+        (cdn1.clone(), vec![Err(())]),
+        (cdn2.clone(), vec![Err(())]),
+    ]);
+
+    let url = Url::parse(&primary).unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let result = session.refresh_manifest().await;
+    assert!(
+        result.is_err(),
+        "refresh should fail when all URLs (primary + Location) return errors"
+    );
+}

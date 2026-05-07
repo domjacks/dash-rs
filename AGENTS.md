@@ -322,6 +322,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `AbandonRequestsRule.js` | `abr::abandon_requests::AbandonRequestsRule` |
 | `AbrController.js` | `abr::AbrController` |
 | `ManifestUpdater.js` | `session::DashSession::refresh_manifest_if_due` (called automatically inside `fetch_next_segment`) |
+| `LocationSelector.js` | `DashSession::location_urls()` + `manifest_url()`; fallback logic inside `refresh_manifest` |
 | `MediaPlayer.js` + `StreamProcessor.js` | `session::DashSession` |
 | `StreamController.js` / `Stream.js` | `session::DashSession::try_advance_period` (called automatically inside `fetch_next_segment`) |
 | `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` |
@@ -346,7 +347,6 @@ All Tier 1 features are now implemented.  No outstanding items.
 |---|---|---|
 | Content steering server | `ContentSteeringController.js` | Static CDN failover exists. Parse `<ContentSteering>` from the MPD; spawn a refresh task that polls the steering server and updates the ordered base-URL list in `DashSession`. |
 | Gap controller (stall recovery) | `GapController.js` | Monitor playback position against buffer level; when a decoded-buffer gap stalls the player, seek forward past it to resume. Add a `GapController` struct that `DashSession` ticks on each `fetch_next_segment` call; expose `on_stall(position_ms, buffer_level_ms) -> Option<SeekTarget>`. No stall-detection or auto-recovery exists today. |
-| MPD `<Location>` element | `LocationSelector.js` | `<Location>` elements list alternative manifest URLs. When the primary URL fails in `ManifestLoader::load` or `refresh_manifest_if_due`, retry each `Location` URL in order before returning an error. Parsed `Location` URLs should be stored as `Vec<Url>` in `DashSession`. |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | New file `src/abr/l2a.rs`. Implements the Lyapunov optimisation tuned for low-latency streams. Register in `AbrController::default()`. |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` / `LearningAbrController.js` | New file `src/abr/lolp.rs`. Requires a QoE evaluator and an online weight-selector; more complex than other rules. |
 | Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Requires `SegmentFetcher` to support progressive byte delivery (streaming body). `FetchResponse` currently holds complete `Bytes`; need a `Stream<Item=Bytes>` variant or callback. |
@@ -361,11 +361,20 @@ All Tier 1 features are now implemented.  No outstanding items.
 | Formal metrics collection | `DashMetrics.js` / `MetricsModel.js` | Add a `DashMetrics` struct that `DashSession` populates on each fetch/append: buffer level samples, HTTP request records, representation-switch events. Expose via `session.metrics()`. |
 | DVB/ISO metrics reporting | `MetricsReporting.js` / `DVBReporting` | After `DashMetrics` exists, add an optional HTTP reporter that POSTs samples to a `@dvb:metrics` service location from the MPD. Gate behind a Cargo feature. |
 | CMCD / CMSD | `CmcdModel.js` / `CmsdModel.js` | Build CMCD query parameters from `AbrMetrics` + session state and attach to each `FetchRequest`. Parse `CMSD` response headers from `FetchResponse`. Gate behind a feature. |
+| UTCTiming `http-head` method | `TimeSyncController.js` | `urn:mpeg:dash:utc:http-head:2014` reads clock time from the `Date:` HTTP response header of a HEAD request. Currently logged and skipped in `resolve_utc_timing`. Add a `check_existence`-style HEAD call and parse the `Date:` header. Some BBC/DVB streams use this scheme exclusively. |
 | Subtitle / text tracks | `TextController.js` / `TTMLParser.js` / `VTTParser.js` | Add `MediaType::Text`. In `from_mpd`, find text `AdaptationSet`s and create a third `TrackState`. Need a `TextParser` trait with TTML and VTT implementations. |
 | Thumbnails / trick play | `ThumbnailController.js` / `ThumbnailTracks.js` | Parse thumbnail `AdaptationSet` (role=`thumbnail`). Add `DashSession::thumbnail_at(time_s)` that returns a sprite-sheet tile URL and crop rect. |
 | DRM / Content Protection | `streaming/protection/` | Add a `ContentProtection` descriptor to `RepresentationInfo`. Expose a `DrmKeyProvider` trait. `DashSession` calls it when a `pssh` box is encountered. Platform-specific EME/CDM integration belongs in examples. |
 | Codec capability filtering | `Capabilities.js` / `CapabilitiesFilter.js` | Add a `CodecCapabilities` trait. `DashSession::from_mpd` calls `capabilities.is_supported(mime)` and filters representations before `TrackState` is built. GStreamer implementation belongs in the example. |
+| Common Access Token (CAT) | `CommonAccessTokenController.js` | ETSI TS 103 485 — attaches a `commonAccessToken` JWT to segment request headers for subscriber-gated streams. Add an optional `cat_token: Option<String>` field to `FetchRequest` and a `DashSession::set_cat_token(token)` setter. |
+| Extended URL Query Info | `ExtUrlQueryInfoController.js` | `<ExtendedUrlQueryInfo>` MPD element appends service-specific query parameters to segment URLs at fetch time (used for CDN token auth). Parse the element in `from_mpd` and append its parameters in `expand_template` / `resolve_effective_base_url`. |
 | Offline download | `src/offline/` | Native equivalent: a download coordinator that writes segments to a directory with a manifest index. Out of scope until the above tiers are complete. |
+
+### Behavioural differences vs dash.js (not missing features, but quality-of-implementation gaps)
+
+- **CDN failover / URL blacklisting**: dash.js `BlacklistController` maintains a time-based per-URL exclusion list so a recently-failed CDN candidate is avoided for a configurable cooldown period before retry.  dash-rs retries all candidate `BaseURL` entries on every request in priority order and returns `AllBaseUrlsFailed` if all fail; there is no per-URL memory of recent failures across fetches.
+
+- **Throughput model**: dash.js `ThroughputController` maintains a global throughput estimate with multiple EWMA windows (fast and slow) and uses harmonic mean over the sample distribution to resist outliers.  dash-rs tracks a single α-EMA (`throughput_ema_bps`) per track independently; audio and video can therefore diverge, and the estimate over-reacts on bursty connections compared to dash.js's multi-window model.
 
 ### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
 
