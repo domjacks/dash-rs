@@ -1,0 +1,166 @@
+//! CDN URL blacklist — time-based per-origin exclusion list.
+//!
+//! Mirrors `BlacklistController.js` in dash.js.  When a segment fetch fails for
+//! a particular CDN, its service-location key is added to this map with an expiry
+//! of `now + cooldown`.  Subsequent fetch attempts skip any candidate whose key
+//! is still in the map.
+//!
+//! If every candidate is blacklisted (the full candidate list has been exhausted),
+//! the exclusion is overridden and all candidates are tried again — this prevents
+//! the session from permanently stalling when no healthy CDN is available.
+//!
+//! The default cooldown is **600 seconds**, matching
+//! `BlacklistController.BLACKLIST_DURATION` in dash.js.
+
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
+
+/// Default cooldown duration matching dash.js `BlacklistController.BLACKLIST_DURATION`.
+pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// Time-based CDN blacklist.
+///
+/// Maps *service-location keys* to expiry [`Instant`]s.  A key is considered
+/// blacklisted while `Instant::now() < expiry`.
+///
+/// The key is the `@serviceLocation` attribute of the contributing `<BaseURL>`
+/// element, or the URL's host string when that attribute is absent.
+#[derive(Debug)]
+pub(super) struct CdnBlacklist {
+    entries: HashMap<String, Instant>,
+    cooldown: Duration,
+}
+
+impl Default for CdnBlacklist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CdnBlacklist {
+    /// Create a blacklist with the default 600-second cooldown.
+    pub(super) fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            cooldown: DEFAULT_COOLDOWN,
+        }
+    }
+
+    /// Replace the cooldown duration applied to future `record_failure` calls.
+    pub(super) fn set_cooldown(&mut self, cooldown: Duration) {
+        self.cooldown = cooldown;
+    }
+
+    /// Returns the current cooldown duration.
+    pub(super) fn cooldown(&self) -> Duration {
+        self.cooldown
+    }
+
+    /// Returns `true` if `key` is currently blacklisted (cooldown has not yet elapsed).
+    pub(super) fn is_blacklisted(&self, key: &str) -> bool {
+        self.entries
+            .get(key)
+            .map(|&expiry| Instant::now() < expiry)
+            .unwrap_or(false)
+    }
+
+    /// Record a failure for `key`, (re-)starting its cooldown window.
+    ///
+    /// If `key` is already in the map, its expiry is reset to `now + cooldown`.
+    pub(super) fn record_failure(&mut self, key: &str) {
+        let expiry = Instant::now() + self.cooldown;
+        self.entries.insert(key.to_owned(), expiry);
+        tracing::debug!(key, cooldown_s = self.cooldown.as_secs_f64(), "CDN blacklisted");
+    }
+
+    /// Remove entries whose cooldown has already elapsed.
+    ///
+    /// Called opportunistically before filtering candidates so that the map
+    /// stays bounded across long-running sessions.
+    pub(super) fn evict_expired(&mut self) {
+        let now = Instant::now();
+        self.entries.retain(|_, expiry| now < *expiry);
+    }
+}
+
+// ── Unit tests ────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn new_blacklist_has_no_entries() {
+        let bl = CdnBlacklist::new();
+        assert!(!bl.is_blacklisted("cdn1"));
+        assert!(!bl.is_blacklisted("cdn2"));
+    }
+
+    #[test]
+    fn record_failure_blacklists_key() {
+        let mut bl = CdnBlacklist::new();
+        bl.record_failure("cdn1");
+        assert!(bl.is_blacklisted("cdn1"));
+        assert!(!bl.is_blacklisted("cdn2"), "unrelated key must not be affected");
+    }
+
+    #[test]
+    fn blacklist_expires_after_cooldown() {
+        let mut bl = CdnBlacklist::new();
+        bl.set_cooldown(Duration::from_millis(5));
+        bl.record_failure("cdn1");
+        assert!(bl.is_blacklisted("cdn1"), "should be blacklisted immediately after failure");
+        thread::sleep(Duration::from_millis(10));
+        assert!(!bl.is_blacklisted("cdn1"), "should have expired after cooldown");
+    }
+
+    #[test]
+    fn record_failure_resets_expiry() {
+        let mut bl = CdnBlacklist::new();
+        bl.set_cooldown(Duration::from_millis(20));
+        bl.record_failure("cdn1");
+        thread::sleep(Duration::from_millis(10));
+        // Reset the expiry — should be blacklisted for another full cooldown.
+        bl.record_failure("cdn1");
+        thread::sleep(Duration::from_millis(15));
+        assert!(
+            bl.is_blacklisted("cdn1"),
+            "expiry should have been extended by the second record_failure"
+        );
+    }
+
+    #[test]
+    fn evict_expired_removes_stale_entries() {
+        let mut bl = CdnBlacklist::new();
+        bl.set_cooldown(Duration::from_millis(5));
+        bl.record_failure("cdn1");
+        thread::sleep(Duration::from_millis(10));
+        bl.evict_expired();
+        assert!(
+            bl.entries.is_empty(),
+            "evict_expired should remove elapsed entries"
+        );
+    }
+
+    #[test]
+    fn evict_expired_keeps_live_entries() {
+        let mut bl = CdnBlacklist::new();
+        bl.set_cooldown(Duration::from_secs(600));
+        bl.record_failure("cdn1");
+        bl.evict_expired();
+        assert!(bl.is_blacklisted("cdn1"), "live entry must survive evict_expired");
+    }
+
+    #[test]
+    fn set_cooldown_takes_effect_for_new_failures() {
+        let mut bl = CdnBlacklist::new();
+        bl.set_cooldown(Duration::from_millis(1));
+        assert_eq!(bl.cooldown(), Duration::from_millis(1));
+        bl.record_failure("cdn1");
+        thread::sleep(Duration::from_millis(5));
+        assert!(!bl.is_blacklisted("cdn1"), "short cooldown should expire quickly");
+    }
+}

@@ -292,6 +292,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
 | Live-edge segment calculation | `src/session/live.rs` |
 | UTC clock sync (`resolve_utc_timing`, `query_http_utc`) | `src/session/utc.rs` |
+| CDN blacklist (`CdnBlacklist`, service-location keying, cooldown) | `src/session/blacklist.rs` |
 | XLink pre-processing (`resolve_xlinks`, Period + AdaptationSet) | `src/session/xlink.rs` |
 | XS datetime parser (`parse_xs_datetime`) | `src/util.rs` |
 | ISO BMFF box parsing (`sidx` timing, `sidx` byte-range index, `emsg`) | `src/mp4.rs` |
@@ -329,6 +330,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `EventController.js` | `session::DashEvent` + `DashSession::subscribe_events` (broadcast channel; events dispatched by `fetch_next_segment`) |
 | `ServiceDescriptionController.js` | `DashSession::target_latency_ms()` + `playback_rate_range()` |
 | `AbrController.setMaxAllowedBitrateFor()` | `DashSession::set_max_bitrate(media_type, bps)` / `clear_max_bitrate` / `max_bitrate` |
+| `BlacklistController.js` | `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`; blacklist logic in `src/session/blacklist.rs` |
 
 ---
 
@@ -372,7 +374,7 @@ All Tier 1 features are now implemented.  No outstanding items.
 
 ### Behavioural differences vs dash.js (not missing features, but quality-of-implementation gaps)
 
-- **CDN failover / URL blacklisting**: dash.js `BlacklistController` maintains a time-based per-URL exclusion list so a recently-failed CDN candidate is avoided for a configurable cooldown period before retry.  dash-rs retries all candidate `BaseURL` entries on every request in priority order and returns `AllBaseUrlsFailed` if all fail; there is no per-URL memory of recent failures across fetches.
+- **CDN failover / URL blacklisting**: implemented — `CdnBlacklist` (`src/session/blacklist.rs`) mirrors `BlacklistController.js`.  After a segment-fetch failure the contributing `<BaseURL>` service-location key is blacklisted for a configurable cooldown (default 600 s, matching dash.js).  Subsequent fetches skip blacklisted candidates; when every candidate is blacklisted the exclusion is overridden and all are retried to prevent permanent stalls.  Configure via `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`.
 
 - **Throughput model**: dash.js `ThroughputController` maintains a global throughput estimate with multiple EWMA windows (fast and slow) and uses harmonic mean over the sample distribution to resist outliers.  dash-rs tracks a single α-EMA (`throughput_ema_bps`) per track independently; audio and video can therefore diverge, and the estimate over-reacts on bursty connections compared to dash.js's multi-window model.
 

@@ -2501,3 +2501,240 @@ async fn refresh_manifest_returns_error_when_all_locations_fail() {
         "refresh should fail when all URLs (primary + Location) return errors"
     );
 }
+
+// ── CDN blacklist ─────────────────────────────────────────────────────────────
+
+/// An MPD with two `<BaseURL>` elements at MPD level.
+///
+/// `cdn1` has priority=1 (tried first) and serviceLocation="cdn1".
+/// `cdn2` has priority=2 (tried second) and serviceLocation="cdn2".
+/// Both have 4 s total duration and 4 s segment duration, giving exactly 1
+/// segment, which keeps the test fetches simple.
+const TWO_CDN_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT4S">
+  <BaseURL serviceLocation="cdn1" dvb:priority="1"
+           xmlns:dvb="urn:dvb:dash:namespace:2012">http://cdn1.example.com/</BaseURL>
+  <BaseURL serviceLocation="cdn2" dvb:priority="2"
+           xmlns:dvb="urn:dvb:dash:namespace:2012">http://cdn2.example.com/</BaseURL>
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// A `SegmentFetcher` that:
+/// - Serves a preset manifest XML on the first manifest request.
+/// - Fails (HTTP 503) for segment URLs whose host matches any entry in `failing_hosts`.
+/// - Records every segment URL that was attempted (success or failure).
+struct CdnFetcher {
+    manifest: Bytes,
+    failing_hosts: Vec<String>,
+    attempted_urls: Arc<Mutex<Vec<String>>>,
+}
+
+impl CdnFetcher {
+    fn new(manifest: &str, failing_hosts: &[&str], attempted: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            manifest: Bytes::from(manifest.to_string()),
+            failing_hosts: failing_hosts.iter().map(|s| s.to_string()).collect(),
+            attempted_urls: attempted,
+        }
+    }
+}
+
+#[async_trait]
+impl SegmentFetcher for CdnFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        if request.request_type == RequestType::Manifest {
+            let len = self.manifest.len() as u64;
+            return Ok(FetchResponse {
+                final_url: request.url,
+                data: self.manifest.clone(),
+                transfer_duration_ms: 1,
+                bytes_received: len,
+            });
+        }
+
+        // Record the attempt.
+        self.attempted_urls
+            .lock()
+            .unwrap()
+            .push(request.url.to_string());
+
+        let host = request.url.host_str().unwrap_or("").to_string();
+        if self.failing_hosts.iter().any(|h| h == &host) {
+            return Err(FetchError::Http {
+                status: 503,
+                url: request.url,
+            });
+        }
+
+        Ok(FetchResponse {
+            final_url: request.url,
+            data: Bytes::new(),
+            transfer_duration_ms: 1,
+            bytes_received: 0,
+        })
+    }
+
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+        Ok(true)
+    }
+
+    fn abort(&self) {}
+}
+
+/// After cdn1 fails on the first `fetch_next_segment`, it is blacklisted and
+/// skipped on the second call — only cdn2 is attempted.
+#[tokio::test]
+async fn cdn_blacklist_skips_failing_cdn_on_subsequent_fetches() {
+    let attempted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = CdnFetcher::new(
+        TWO_CDN_MPD,
+        &["cdn1.example.com"],
+        Arc::clone(&attempted),
+    );
+
+    let url = Url::parse("http://primary.example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Disable the default 600-second cooldown and use a long-enough value for
+    // the test to remain deterministic without sleeping.
+    session.set_cdn_blacklist_cooldown_ms(60_000);
+
+    let metrics = default_metrics();
+
+    // First fetch: cdn1 fails → cdn2 succeeds.  cdn1 is now blacklisted.
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("first fetch should succeed via cdn2 fallback");
+
+    let urls_after_first: Vec<String> = attempted.lock().unwrap().clone();
+    let cdn1_count_after_first = urls_after_first
+        .iter()
+        .filter(|u| u.contains("cdn1.example.com"))
+        .count();
+    assert_eq!(cdn1_count_after_first, 1, "cdn1 should have been tried once on first fetch");
+
+    // Clear the recording for the second fetch.
+    attempted.lock().unwrap().clear();
+
+    // Second fetch: cdn1 is blacklisted → only cdn2 should be tried.
+    // EOS after 1 segment (total_segments = 1), so we expect EndOfStream here.
+    // We just need to verify cdn1 was NOT attempted regardless of the outcome.
+    let _ = session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await; // may succeed or return EOS — we only care about the URL log
+
+    let urls_after_second = attempted.lock().unwrap();
+    let cdn1_count_after_second = urls_after_second
+        .iter()
+        .filter(|u| u.contains("cdn1.example.com"))
+        .count();
+    assert_eq!(
+        cdn1_count_after_second, 0,
+        "cdn1 should be skipped on subsequent fetches while blacklisted; attempted: {:?}",
+        *urls_after_second
+    );
+}
+
+/// When every CDN candidate is blacklisted the session falls back to trying all
+/// of them, preventing a permanent stall.
+#[tokio::test]
+async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
+    let attempted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // cdn1 always fails; cdn2 fails on first attempt, succeeds on second.
+    let cdn2_calls: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+
+    struct AllBlacklistedFetcher {
+        manifest: Bytes,
+        cdn2_calls: Arc<Mutex<u32>>,
+        attempted: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SegmentFetcher for AllBlacklistedFetcher {
+        async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+            if request.request_type == RequestType::Manifest {
+                let len = self.manifest.len() as u64;
+                return Ok(FetchResponse {
+                    final_url: request.url,
+                    data: self.manifest.clone(),
+                    transfer_duration_ms: 1,
+                    bytes_received: len,
+                });
+            }
+
+            self.attempted.lock().unwrap().push(request.url.to_string());
+            let host = request.url.host_str().unwrap_or("").to_string();
+
+            if host == "cdn1.example.com" {
+                return Err(FetchError::Http { status: 503, url: request.url });
+            }
+
+            // cdn2: fail on first call, succeed on second.
+            let mut n = self.cdn2_calls.lock().unwrap();
+            *n += 1;
+            if *n == 1 {
+                return Err(FetchError::Http { status: 503, url: request.url });
+            }
+            Ok(FetchResponse {
+                final_url: request.url,
+                data: Bytes::new(),
+                transfer_duration_ms: 1,
+                bytes_received: 0,
+            })
+        }
+
+        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> { Ok(true) }
+        fn abort(&self) {}
+    }
+
+    let fetcher = AllBlacklistedFetcher {
+        manifest: Bytes::from(TWO_CDN_MPD.to_string()),
+        cdn2_calls: Arc::clone(&cdn2_calls),
+        attempted: Arc::clone(&attempted),
+    };
+
+    let url = Url::parse("http://primary.example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Use a 60-second cooldown so both CDNs stay blacklisted across the test.
+    session.set_cdn_blacklist_cooldown_ms(60_000);
+
+    let metrics = default_metrics();
+
+    // First fetch: cdn1 fails (blacklisted), cdn2 fails (blacklisted) → error.
+    let first = session.fetch_next_segment(MediaType::Video, &metrics).await;
+    assert!(first.is_err(), "first fetch should fail when both CDNs are down");
+
+    // Second fetch: both CDNs are blacklisted → safety net kicks in → cdn1 fails
+    // again, cdn2 succeeds on its second call.
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("second fetch should succeed via the all-blacklisted safety net");
+}
+
+/// `cdn_blacklist_cooldown_ms` / `set_cdn_blacklist_cooldown_ms` round-trip.
+#[test]
+fn cdn_blacklist_cooldown_accessor_round_trips() {
+    let mut session = session_from_xml(STATIC_MPD);
+    // Default matches dash.js (600 000 ms = 600 s).
+    assert_eq!(session.cdn_blacklist_cooldown_ms(), 600_000);
+    session.set_cdn_blacklist_cooldown_ms(30_000);
+    assert_eq!(session.cdn_blacklist_cooldown_ms(), 30_000);
+    // Zero disables the blacklist.
+    session.set_cdn_blacklist_cooldown_ms(0);
+    assert_eq!(session.cdn_blacklist_cooldown_ms(), 0);
+}

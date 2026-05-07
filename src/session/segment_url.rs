@@ -16,6 +16,20 @@
 use dash_mpd::{AdaptationSet, BaseURL, Period};
 use url::Url;
 
+/// A resolved CDN candidate URL paired with its blacklist key.
+///
+/// Returned by [`collect_candidate_base_urls`].  The `service_location` field
+/// identifies the CDN origin for the purpose of [`super::blacklist::CdnBlacklist`]:
+/// it equals the `@serviceLocation` attribute of the deepest `<BaseURL>` element
+/// in the DASH hierarchy that declares one, falling back to the URL's host string.
+#[derive(Debug, Clone)]
+pub(super) struct CandidateUrl {
+    /// The fully-resolved URL to fetch.
+    pub url: Url,
+    /// CDN identity key used for blacklisting.
+    pub service_location: String,
+}
+
 /// Expand DASH `SegmentTemplate` identifier tokens.
 ///
 /// Handled identifiers:
@@ -114,29 +128,55 @@ pub(super) fn expand_template(
 /// through unchanged.
 ///
 /// The list is guaranteed to be non-empty (falls back to the manifest URL).
+///
+/// Each returned [`CandidateUrl`] carries a `service_location` key derived
+/// from the `@serviceLocation` attribute of the deepest `<BaseURL>` in the
+/// hierarchy that declares one, falling back to the URL's host string.  This
+/// key is used by [`super::blacklist::CdnBlacklist`] to exclude recently-failed
+/// CDN origins from the retry sequence.
 pub(super) fn collect_candidate_base_urls(
     manifest_url: &Url,
     mpd_base_urls: &[BaseURL],
     period: &Period,
     adaptation: &AdaptationSet,
     repr_base_urls: &[BaseURL],
-) -> Vec<Url> {
-    fn expand(parents: Vec<Url>, bases: &[BaseURL]) -> Vec<Url> {
+) -> Vec<CandidateUrl> {
+    /// (resolved_url, inherited_service_location)
+    type Pair = (Url, Option<String>);
+
+    fn expand(parents: Vec<Pair>, bases: &[BaseURL]) -> Vec<Pair> {
         if bases.is_empty() {
             return parents;
         }
         let ordered = priority_weighted_order(bases);
         parents
             .iter()
-            .flat_map(|p| ordered.iter().filter_map(move |b| p.join(&b.base).ok()))
+            .flat_map(|(p_url, parent_svc)| {
+                ordered.iter().filter_map(move |b| {
+                    p_url.join(&b.base).ok().map(|url| {
+                        // Child's @serviceLocation overrides parent's; inherit when absent.
+                        let svc = b.serviceLocation.clone().or_else(|| parent_svc.clone());
+                        (url, svc)
+                    })
+                })
+            })
             .collect()
     }
 
-    let root = vec![manifest_url.clone()];
+    let root: Vec<Pair> = vec![(manifest_url.clone(), None)];
     let after_mpd = expand(root, mpd_base_urls);
     let after_period = expand(after_mpd, &period.BaseURL);
     let after_adapt = expand(after_period, &adaptation.BaseURL);
-    expand(after_adapt, repr_base_urls)
+    let pairs = expand(after_adapt, repr_base_urls);
+
+    pairs
+        .into_iter()
+        .map(|(url, svc)| {
+            let service_location =
+                svc.unwrap_or_else(|| url.host_str().unwrap_or(url.as_str()).to_owned());
+            CandidateUrl { url, service_location }
+        })
+        .collect()
 }
 
 /// Resolve a single effective base URL for init-segment URL construction by

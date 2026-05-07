@@ -408,5 +408,5 @@ All Tier 1 features are now implemented.  No outstanding items.
 
 ### Behavioural differences vs dash.js
 
-- **CDN failover / URL blacklisting**: dash.js `BlacklistController` time-gates recently-failed CDN URLs for a cooldown period.  dash-rs retries all `BaseURL` candidates on every request in priority order; there is no per-URL failure memory across fetches.
+- **CDN failover / URL blacklisting**: implemented — `CdnBlacklist` mirrors `BlacklistController.js`.  After a segment-fetch failure the contributing `<BaseURL>` service-location key is blacklisted for a configurable cooldown (default 600 s).  Subsequent fetches skip blacklisted candidates; when every candidate is blacklisted they are all retried to prevent permanent stalls.  Configure via `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`.
 - **Throughput model**: dash.js uses multiple EWMA windows (fast + slow) and harmonic mean to resist outliers.  dash-rs tracks a single α-EMA per track independently; audio and video estimates can diverge, and the model over-reacts on bursty connections.

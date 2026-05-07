@@ -20,6 +20,7 @@
 //! | `segment_url` | [`expand_template`], `collect_candidate_base_urls`, `resolve_effective_base_url` |
 //! | `utc` | `resolve_utc_timing`, `query_http_utc` — `UTCTiming` clock-sync |
 
+mod blacklist;
 mod live;
 mod mpd;
 mod segment_url;
@@ -60,6 +61,7 @@ use self::{
     segment_url::{collect_candidate_base_urls, expand_template, resolve_effective_base_url},
     timeline::find_timeline_segment,
 };
+use blacklist::CdnBlacklist;
 
 // ── MediaType ─────────────────────────────────────────────────────────────────
 
@@ -499,6 +501,14 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     video_max_bitrate_bps: Option<u64>,
     /// Optional maximum bitrate cap for audio, in bits per second.
     audio_max_bitrate_bps: Option<u64>,
+    /// Time-based CDN blacklist.
+    ///
+    /// Mirrors `BlacklistController.js` in dash.js.  When a segment fetch fails
+    /// for a `<BaseURL>` candidate, its service-location key is added here with
+    /// an expiry of `now + cooldown` (default 600 s).  Subsequent fetches skip
+    /// blacklisted candidates; if all candidates are blacklisted they are all
+    /// retried anyway to avoid a permanent stall.
+    cdn_blacklist: CdnBlacklist,
 }
 
 // Re-export for convenience in examples.
@@ -738,6 +748,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             event_tx,
             video_max_bitrate_bps: None,
             audio_max_bitrate_bps: None,
+            cdn_blacklist: CdnBlacklist::new(),
         })
     }
 
@@ -762,6 +773,22 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// is returned.  Updated on every successful manifest refresh.
     pub fn location_urls(&self) -> &[Url] {
         &self.location_urls
+    }
+
+    /// Cooldown duration applied to a failing CDN (default 600 s).
+    ///
+    /// Mirrors `BlacklistController.BLACKLIST_DURATION` in dash.js.
+    pub fn cdn_blacklist_cooldown_ms(&self) -> u64 {
+        self.cdn_blacklist.cooldown().as_millis() as u64
+    }
+
+    /// Override the CDN blacklist cooldown.
+    ///
+    /// Set to `0` to disable blacklisting (every segment fetch retries all
+    /// candidates, which was the previous behaviour).
+    pub fn set_cdn_blacklist_cooldown_ms(&mut self, ms: u64) {
+        self.cdn_blacklist
+            .set_cooldown(std::time::Duration::from_millis(ms));
     }
 
     /// The number of `Period` elements in the manifest.
@@ -1638,18 +1665,43 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             } // end SegmentTemplate branch
         };
 
-        // Fetch — try each CDN candidate in priority order.
+        // Fetch — try each CDN candidate in priority order, skipping any that
+        // are currently blacklisted.  If every candidate is blacklisted, the
+        // exclusion is overridden and all candidates are retried (safety net to
+        // prevent the session from permanently stalling).
         let fetcher = Arc::clone(&self.fetcher);
         let abandon_ms = self.abandon_timeout_ms;
         let mt_str = media_type.to_string();
+
+        // Remove expired entries opportunistically so the map stays bounded.
+        self.cdn_blacklist.evict_expired();
+
+        // Build the effective candidate list, filtering out blacklisted origins.
+        // Fall back to the full list when everything is blacklisted.
+        let effective: Vec<usize> = {
+            let non_bl: Vec<usize> = (0..candidates.len())
+                .filter(|&i| !self.cdn_blacklist.is_blacklisted(&candidates[i].service_location))
+                .collect();
+            if non_bl.is_empty() {
+                tracing::warn!(
+                    media_type = %media_type,
+                    "all CDN candidates are currently blacklisted — retrying all"
+                );
+                (0..candidates.len()).collect()
+            } else {
+                non_bl
+            }
+        };
 
         let mut last_err: DashError = DashError::AllBaseUrlsFailed {
             last_error: "no candidates".into(),
         };
         let mut opt_response: Option<FetchResponse> = None;
 
-        'candidates: for base in &candidates {
-            let segment_url = base
+        'candidates: for &idx in &effective {
+            let candidate = &candidates[idx];
+            let segment_url = candidate
+                .url
                 .join(&expanded_path)
                 .map_err(|_| DashError::SegmentUrlUnresolvable)?;
 
@@ -1657,6 +1709,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 media_type = %media_type,
                 segment_number = seg_number,
                 url = %segment_url,
+                service_location = %candidate.service_location,
                 "fetching segment"
             );
 
@@ -1696,9 +1749,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 Err(e) => {
                     tracing::warn!(
                         url = %segment_url,
+                        service_location = %candidate.service_location,
                         error = %e,
-                        "segment fetch failed — trying next base URL"
+                        "segment fetch failed — blacklisting CDN and trying next base URL"
                     );
+                    self.cdn_blacklist.record_failure(&candidate.service_location);
                     last_err = DashError::AllBaseUrlsFailed {
                         last_error: e.to_string(),
                     };
