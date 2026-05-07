@@ -377,8 +377,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
 
         // Extract live-stream fields before `mpd` is moved into the struct.
-        let mpd_minimum_update_period_ms =
-            mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
+        let mpd_minimum_update_period_ms = mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
 
         Ok(Self {
             mpd,
@@ -541,7 +540,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             Ok(t) => t,
             Err(_) => return 0.0,
         };
-        let segments_fetched = track.segment_number.saturating_sub(track.initial_segment_number);
+        let segments_fetched = track
+            .segment_number
+            .saturating_sub(track.initial_segment_number);
         let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
         let elapsed_ms = self
             .playback_started_at
@@ -774,8 +775,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.base_url = new_base_url;
 
         // Update minimumUpdatePeriod in case the server changed it.
-        self.minimum_update_period_ms =
-            new_mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
+        self.minimum_update_period_ms = new_mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
 
         // Re-derive total_segments for each track from the new manifest.
         // For a live stream this is the primary update: the segment count grows
@@ -1547,7 +1547,12 @@ fn resolve_effective_base_url(
     repr_base_urls: &[BaseURL],
 ) -> Url {
     let mut base = manifest_url.clone();
-    for level in [mpd_base_urls, &period.BaseURL, &adaptation.BaseURL, repr_base_urls] {
+    for level in [
+        mpd_base_urls,
+        &period.BaseURL,
+        &adaptation.BaseURL,
+        repr_base_urls,
+    ] {
         if let Some(b) = level.first() {
             if let Ok(u) = base.join(&b.base) {
                 base = u;
@@ -1752,8 +1757,7 @@ mod tests {
             ..Default::default()
         });
 
-        let merged =
-            merge_segment_templates(None, &AdaptationSet::default(), &period).unwrap();
+        let merged = merge_segment_templates(None, &AdaptationSet::default(), &period).unwrap();
 
         assert_eq!(merged.media.as_deref(), Some("s$Number$.m4s"));
         assert_eq!(merged.timescale, Some(1_000));
@@ -1768,8 +1772,9 @@ mod tests {
             &Period::default()
         )
         .is_none());
-        assert!(merge_segment_templates(None, &AdaptationSet::default(), &Period::default())
-            .is_none());
+        assert!(
+            merge_segment_templates(None, &AdaptationSet::default(), &Period::default()).is_none()
+        );
     }
 
     // ── expand_template ───────────────────────────────────────────────────────

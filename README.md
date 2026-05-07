@@ -370,9 +370,46 @@ Data flow per segment:
 
 ## What's not yet implemented
 
-- `SegmentList` and `SegmentBase` (byte-range) addressing — only `SegmentTemplate` with `$Number$` is currently supported.
-- `$Time$` template variable in `SegmentTemplate`.
-- Multi-period playback.
-- Subtitle / text track handling.
-- DRM / Encrypted Media Extensions.
-- MPD patch (`<Patch>` element).
+The table below tracks gaps relative to dash.js, grouped by impact.
+
+### Tier 1 — Core stream compatibility (blocks many real-world streams)
+
+| Feature | dash.js equivalent | Notes |
+|---|---|---|
+| `$Time$` template variable | `TemplateSegmentsGetter.js` | `expand_template` passes it through verbatim; `SegmentUrlUnresolvable` is returned for manifests that use it |
+| SegmentTimeline | `TimelineSegmentsGetter.js` | Parsed by `dash-mpd` but never dispatched |
+| SegmentList | `ListSegmentsGetter.js` | Not implemented |
+| SegmentBase (byte-range) | `SegmentBaseGetter.js` | `FetchRequest::byte_range` field exists but is never set |
+| Multi-period playback | `StreamController.js` / `Stream.js` | First `Period` only; no error on multi-period MPDs |
+| XLink resolution | `XlinkLoader.js` / `XlinkController.js` | `xlink:href` attributes in the MPD are silently ignored |
+
+### Tier 2 — Important for live streams and ABR quality
+
+| Feature | dash.js equivalent | Notes |
+|---|---|---|
+| Init segment caching | `InitCache.js` | Every quality switch requires the caller to call `fetch_init_segment` again manually |
+| In-band DASH events (`emsg`) | `EventController.js` | No `emsg` box parsing or timed-event dispatch |
+| UTCTiming / live clock sync | `TimeSyncController.js` | Wall-clock via `SystemTime::now()` is used; no `UTCTiming` endpoint queries |
+| Content steering server | `ContentSteeringController.js` | Static weighted-random BaseURL failover exists; no dynamic steering server polling |
+| L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | Not implemented |
+| LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` | Not implemented |
+| Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Fetcher receives whole segments only; no progressive streaming |
+| `<ServiceDescription>` | `ServiceDescriptionController.js` | Target latency and playback-rate bounds are ignored |
+| ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Not implemented |
+| Catch-up playback rate control | `CatchupController.js` | No library-level API to adjust playback rate for latency catch-up |
+| `startNumber` sliding-window live | `SegmentsUtils.js` | Not handled during `refresh_manifest`; noted in its doc comment |
+| MPD Patch (`<Patch>`) | `PatchManifestModel.js` | `PatchLocation` in manifest is ignored |
+
+### Tier 3 — Metrics, DRM, text, thumbnails
+
+| Feature | dash.js equivalent | Notes |
+|---|---|---|
+| Formal metrics collection | `DashMetrics.js` / `MetricsModel.js` | `AbrMetrics` is input-only; no buffer-level log, HTTP metrics, or switch history reporting |
+| DVB/ISO metrics reporting | `MetricsReporting.js` | Not implemented |
+| CMCD / CMSD | `CmcdModel.js` / `CmsdModel.js` | Not implemented |
+| Subtitle / text tracks | `TextController.js` / `TTMLParser.js` | `MediaType` has only `Video` and `Audio`; no text type |
+| Thumbnails / trick play | `ThumbnailController.js` | Not implemented |
+| DRM / Content Protection | `streaming/protection/` | No DRM variants in `DashError`; no crypto code |
+| Representation bitrate cap API | `AbrController.setMaxAllowedBitrateFor()` | No API to cap ABR to a user-specified max bitrate |
+| Codec capability filtering | `Capabilities.js` / `CapabilitiesFilter.js` | Environment-specific; not implemented |
+| Offline download | `src/offline/` | Browser-specific (IndexedDB); native equivalent would differ |

@@ -256,8 +256,8 @@ fn parse_sidx_fullbox(data: &[u8]) -> Option<SidxInfo> {
     let mut total_ticks: u64 = 0;
     for i in 0..reference_count {
         let off = refs_start + i * 12;
-        let dur = u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
-            as u64;
+        let dur =
+            u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) as u64;
         total_ticks = total_ticks.saturating_add(dur);
     }
 

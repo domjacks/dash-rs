@@ -134,7 +134,9 @@ fn open_stub_source() -> StubMediaSource {
 }
 
 /// Build a `DashSession` from a raw XML string without a network call.
-fn session_from_xml(xml: &str) -> DashSession<dash_rs::fetch::stub::StubSegmentFetcher, StubMediaSource> {
+fn session_from_xml(
+    xml: &str,
+) -> DashSession<dash_rs::fetch::stub::StubSegmentFetcher, StubMediaSource> {
     let mpd = dash_mpd::parse(xml).expect("MPD parse failed");
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
@@ -161,7 +163,10 @@ fn is_live_true_for_dynamic_mpd() {
 
 #[test]
 fn minimum_update_period_none_for_vod() {
-    assert_eq!(session_from_xml(STATIC_MPD).minimum_update_period_ms(), None);
+    assert_eq!(
+        session_from_xml(STATIC_MPD).minimum_update_period_ms(),
+        None
+    );
 }
 
 #[test]
@@ -256,9 +261,7 @@ async fn refresh_manifest_updates_segment_count() {
     }
 
     // Fifth call: fetched = 4, total = 4 → EndOfStream.
-    let result = session
-        .fetch_next_segment(MediaType::Video, &metrics)
-        .await;
+    let result = session.fetch_next_segment(MediaType::Video, &metrics).await;
     assert!(
         matches!(result, Err(DashError::EndOfStream { .. })),
         "expected EndOfStream after 4 fetches, got {result:?}"
@@ -471,7 +474,11 @@ async fn live_edge_segment_number_near_live_edge() {
         .unwrap();
 
     let urls = recorded.lock().unwrap();
-    assert_eq!(urls.len(), 1, "exactly one segment should have been fetched");
+    assert_eq!(
+        urls.len(),
+        1,
+        "exactly one segment should have been fetched"
+    );
 
     // Template is "seg-$Number$.m4s" so the URL ends in "seg-<N>.m4s".
     // Extract N by finding the trailing digits before ".m4s".

@@ -447,7 +447,14 @@ impl MediaSource for GstMediaSource {
                 // Deferring via MainContext::invoke would leave the pad unlinked
                 // during decodebin's preroll window, causing the pipeline to
                 // stall or error before video playback begins.
-                wire_sink_chain(&pipeline, src_pad, "videoconvert", None, "autovideosink", remap_pts);
+                wire_sink_chain(
+                    &pipeline,
+                    src_pad,
+                    "videoconvert",
+                    None,
+                    "autovideosink",
+                    remap_pts,
+                );
             } else if media_type.starts_with("audio/") {
                 wire_sink_chain(
                     &pipeline,
@@ -619,9 +626,7 @@ fn wire_sink_chain(
             move |_pad, info| {
                 // ── SEGMENT event ───────────────────────────────────────────
                 // Check type without borrowing info.data mutably yet.
-                let is_segment = if let Some(gst::PadProbeData::Event(ref ev)) =
-                    info.data
-                {
+                let is_segment = if let Some(gst::PadProbeData::Event(ref ev)) = info.data {
                     ev.type_() == gst::EventType::Segment
                 } else {
                     false
@@ -631,12 +636,8 @@ fn wire_sink_chain(
                     // Replace with a fresh zeroed TIME segment so that
                     // running_time = remapped_pts − segment.start = remapped_pts.
                     let new_seg = gst::FormattedSegment::<gst::ClockTime>::new();
-                    info.data = Some(gst::PadProbeData::Event(
-                        gst::event::Segment::new(&new_seg),
-                    ));
-                    tracing::info!(
-                        "live PTS probe: replaced SEGMENT with zeroed TIME segment"
-                    );
+                    info.data = Some(gst::PadProbeData::Event(gst::event::Segment::new(&new_seg)));
+                    tracing::info!("live PTS probe: replaced SEGMENT with zeroed TIME segment");
                     return gst::PadProbeReturn::Ok;
                 }
 
@@ -645,10 +646,7 @@ fn wire_sink_chain(
                     let buf_mut = buf.make_mut();
 
                     if let Some(pts) = buf_mut.pts() {
-                        let off = *pts_off
-                            .lock()
-                            .unwrap()
-                            .get_or_insert(pts.nseconds());
+                        let off = *pts_off.lock().unwrap().get_or_insert(pts.nseconds());
                         let new_pts = pts.nseconds().saturating_sub(off);
                         tracing::debug!(
                             pts_abs = pts.nseconds(),
@@ -659,10 +657,7 @@ fn wire_sink_chain(
                     }
 
                     if let Some(dts) = buf_mut.dts() {
-                        let off = *dts_off
-                            .lock()
-                            .unwrap()
-                            .get_or_insert(dts.nseconds());
+                        let off = *dts_off.lock().unwrap().get_or_insert(dts.nseconds());
                         buf_mut.set_dts(gst::ClockTime::from_nseconds(
                             dts.nseconds().saturating_sub(off),
                         ));
