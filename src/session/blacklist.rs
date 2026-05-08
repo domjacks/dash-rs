@@ -12,24 +12,23 @@
 //! The default cooldown is **600 seconds**, matching
 //! `BlacklistController.BLACKLIST_DURATION` in dash.js.
 
-use std::{
-    collections::HashMap,
-    time::{Duration, Instant},
-};
+use std::{collections::HashMap, time::Duration};
 
 /// Default cooldown duration matching dash.js `BlacklistController.BLACKLIST_DURATION`.
 pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// Time-based CDN blacklist.
 ///
-/// Maps *service-location keys* to expiry [`Instant`]s.  A key is considered
-/// blacklisted while `Instant::now() < expiry`.
+/// Maps *service-location keys* to expiry timestamps in milliseconds (from
+/// [`crate::time::mono_ms`]).  A key is considered blacklisted while
+/// `mono_ms() < expiry`.
 ///
 /// The key is the `@serviceLocation` attribute of the contributing `<BaseURL>`
 /// element, or the URL's host string when that attribute is absent.
 #[derive(Debug)]
 pub(super) struct CdnBlacklist {
-    entries: HashMap<String, Instant>,
+    /// Maps service-location key → expiry timestamp in ms (from `mono_ms()`).
+    entries: HashMap<String, f64>,
     cooldown: Duration,
 }
 
@@ -62,7 +61,7 @@ impl CdnBlacklist {
     pub(super) fn is_blacklisted(&self, key: &str) -> bool {
         self.entries
             .get(key)
-            .map(|&expiry| Instant::now() < expiry)
+            .map(|&expiry| crate::time::mono_ms() < expiry)
             .unwrap_or(false)
     }
 
@@ -70,7 +69,7 @@ impl CdnBlacklist {
     ///
     /// If `key` is already in the map, its expiry is reset to `now + cooldown`.
     pub(super) fn record_failure(&mut self, key: &str) {
-        let expiry = Instant::now() + self.cooldown;
+        let expiry = crate::time::mono_ms() + self.cooldown.as_secs_f64() * 1_000.0;
         self.entries.insert(key.to_owned(), expiry);
         tracing::debug!(key, cooldown_s = self.cooldown.as_secs_f64(), "CDN blacklisted");
     }
@@ -80,7 +79,7 @@ impl CdnBlacklist {
     /// Called opportunistically before filtering candidates so that the map
     /// stays bounded across long-running sessions.
     pub(super) fn evict_expired(&mut self) {
-        let now = Instant::now();
+        let now = crate::time::mono_ms();
         self.entries.retain(|_, expiry| now < *expiry);
     }
 }

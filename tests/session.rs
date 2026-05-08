@@ -477,13 +477,14 @@ async fn live_edge_segment_number_near_live_edge() {
     let urls = recorded.lock().unwrap();
     assert_eq!(
         urls.len(),
-        1,
-        "exactly one segment should have been fetched"
+        2,
+        "one init segment + one media segment should have been fetched"
     );
 
-    // Template is "seg-$Number$.m4s" so the URL ends in "seg-<N>.m4s".
+    // Template is "seg-$Number$.m4s" so the media URL ends in "seg-<N>.m4s".
+    // The first recorded URL is the init segment; the second is the media segment.
     // Extract N by finding the trailing digits before ".m4s".
-    let url_str = &urls[0];
+    let url_str = &urls[1];
     let seg_num: u64 = url_str
         .strip_suffix(".m4s")
         .and_then(|s| {
@@ -565,10 +566,11 @@ async fn timeline_vod_fetches_in_time_order() {
     }
 
     let urls = recorded.lock().unwrap();
-    assert_eq!(urls.len(), 3, "expected 3 segment fetches");
-
+    // The first recorded URL is the init segment ("init.mp4"); the rest are
+    // the three media segments.  Filter to only chunk URLs for the assertion.
     let times: Vec<u64> = urls
         .iter()
+        .filter(|u| u.contains("chunk-"))
         .map(|u| {
             // URL looks like "http://example.com/chunk-270000.m4s"
             u.rsplit('/').next().unwrap_or("")
@@ -579,6 +581,7 @@ async fn timeline_vod_fetches_in_time_order() {
         })
         .collect();
 
+    assert_eq!(times.len(), 3, "expected 3 media segment fetches");
     assert_eq!(times, vec![0u64, 270_000, 540_000], "unexpected $Time$ sequence");
 }
 
@@ -888,8 +891,10 @@ async fn timeline_repeat_attribute_produces_correct_times() {
     }
 
     let urls = recorded.lock().unwrap();
+    // Filter out the init segment URL; only extract times from chunk URLs.
     let times: Vec<u64> = urls
         .iter()
+        .filter(|u| u.contains("chunk-"))
         .map(|u| {
             u.rsplit('/').next().unwrap_or("")
                 .strip_prefix("chunk-").unwrap_or("")
@@ -1726,16 +1731,17 @@ async fn segmentbase_fetches_sidx_then_first_segment() {
 
     let entries = log.lock().unwrap();
     // [0] = manifest fetch (no byte range)
-    // [1] = sidx fetch (byte range 1000-1999)
-    // [2] = first segment fetch (byte range 2000..2000+4095 = 2000-6095)
-    assert!(entries.len() >= 3, "expected at least 3 fetches, got {entries:?}");
-    assert_eq!(entries[1].1, Some((1000, 1999)), "sidx fetch must use indexRange");
+    // [1] = init segment fetch (byte range 0-999, from Initialization@range)
+    // [2] = sidx fetch (byte range 1000-1999)
+    // [3] = first segment fetch (byte range 2000..2000+4095 = 2000-6095)
+    assert!(entries.len() >= 4, "expected at least 4 fetches, got {entries:?}");
+    assert_eq!(entries[2].1, Some((1000, 1999)), "sidx fetch must use indexRange");
     // first segment starts immediately after index_end_offset (2000) + first_offset (0).
     assert_eq!(
-        entries[2].1,
+        entries[3].1,
         Some((2000, 2000 + 4096 - 1)),
         "first segment byte range wrong; got {:?}",
-        entries[2].1
+        entries[3].1
     );
 }
 

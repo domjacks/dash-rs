@@ -59,14 +59,33 @@ async fn sleep_ms(ms: i32) {
 }
 
 /// Map a `JsValue` error to a `String` for reporting.
+///
+/// `JSON.stringify` on a `DOMException` returns `{}` because its properties
+/// are non-enumerable.  We therefore try the `.name` and `.message` properties
+/// first via `Reflect.get`, which works on any JS object.
 fn js_err(val: JsValue) -> String {
-    val.as_string()
-        .or_else(|| {
-            js_sys::JSON::stringify(&val)
-                .ok()
-                .and_then(|s| s.as_string())
-        })
-        .unwrap_or_else(|| "(opaque JS error)".to_owned())
+    // Fast path: already a string.
+    if let Some(s) = val.as_string() {
+        return s;
+    }
+
+    // Try to extract `.name` and `.message` (present on Error and DOMException).
+    let name = js_sys::Reflect::get(&val, &JsValue::from_str("name"))
+        .ok()
+        .and_then(|v| v.as_string());
+    let message = js_sys::Reflect::get(&val, &JsValue::from_str("message"))
+        .ok()
+        .and_then(|v| v.as_string());
+
+    match (name, message) {
+        (Some(n), Some(m)) if !m.is_empty() => format!("{n}: {m}"),
+        (Some(n), _) if !n.is_empty()       => n,
+        (_, Some(m)) if !m.is_empty()        => m,
+        _ => js_sys::JSON::stringify(&val)
+            .ok()
+            .and_then(|s| s.as_string())
+            .unwrap_or_else(|| "(opaque JS error)".to_owned()),
+    }
 }
 
 // ── WasmClock ─────────────────────────────────────────────────────────────────

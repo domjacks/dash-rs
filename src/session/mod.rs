@@ -63,7 +63,7 @@ use self::{
         extract_segment_timing, find_adaptation, find_segment_base, merge_segment_lists,
         merge_segment_templates, segment_base_media_path,
     },
-    segment_url::{collect_candidate_base_urls, expand_template, resolve_effective_base_url},
+    segment_url::{collect_candidate_base_urls, expand_template, resolve_effective_base_url, CandidateUrl},
     timeline::find_timeline_segment,
 };
 use blacklist::CdnBlacklist;
@@ -308,6 +308,7 @@ async fn apply_track_reinit(
     track.addressing_mode = ri.addressing_mode.clone();
     track.next_segment_time = None;
     track.segment_byte_ranges = None;
+    track.init_segment_sent = false;
     Ok(())
 }
 
@@ -370,6 +371,10 @@ struct TrackState {
     /// Populated lazily on the first [`DashSession::fetch_next_segment`] call
     /// by fetching and parsing the `sidx` index.  `None` until populated.
     segment_byte_ranges: Option<Vec<SidxEntry>>,
+    /// `true` after the init segment has been successfully appended for the
+    /// current period.  Reset to `false` by [`apply_track_reinit`] at period
+    /// boundaries so that the new period's init segment is fetched automatically.
+    init_segment_sent: bool,
 }
 
 impl TrackState {
@@ -397,6 +402,7 @@ impl TrackState {
             throughput_ema_bps: 0.0,
             last_transfer_ms: 0.0,
             segment_byte_ranges: None,
+            init_segment_sent: false,
         }
     }
 }
@@ -1711,6 +1717,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         }
 
+        // ── First-play init segment ───────────────────────────────────────────
+        // If no quality switch occurred (the common case on the very first call),
+        // the block above did not run.  Ensure the init segment has been sent
+        // before any media data reaches the source buffer.
+        if !quality_switched && !self.track(&media_type)?.init_segment_sent {
+            self.fetch_init_segment(media_type.clone()).await?;
+        }
+
         // ── SegmentBase: lazy sidx population ────────────────────────────────
         // For SegmentBase tracks, the sidx box must be fetched once to learn
         // the byte ranges for each subsegment.  After this call,
@@ -2211,30 +2225,90 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// (`init_cache`).  Subsequent quality switches inside
     /// [`Self::fetch_next_segment`] will re-append from the cache without
     /// touching the network.
+    ///
+    /// Uses the same CDN blacklist-aware candidate loop as
+    /// [`Self::fetch_next_segment`] so that CDN fallback and blacklisting work
+    /// identically for init segments.
     pub async fn fetch_init_segment(&mut self, media_type: MediaType) -> Result<usize, DashError> {
-        let (init_url, byte_range, rep_id) = {
+        let (init_path, candidates, byte_range, rep_id) = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
-            let (url, br) = self.resolve_init_url(&media_type, rep)?;
-            (url, br, rep.id.clone())
+            let (path, cands, br) = self.resolve_init_path_and_candidates(&media_type, rep)?;
+            (path, cands, br, rep.id.clone())
         };
 
         tracing::debug!(
             media_type = %media_type,
-            url = %init_url,
+            init_path = %init_path,
             byte_range = ?byte_range,
             "fetching init segment"
         );
 
-        let request = {
-            let req = FetchRequest::new(init_url, RequestType::InitializationSegment);
-            if let Some((start, end)) = byte_range {
+        // CDN blacklist-aware candidate loop — mirrors the media segment loop.
+        self.cdn_blacklist.evict_expired();
+        let effective: Vec<usize> = {
+            let non_bl: Vec<usize> = (0..candidates.len())
+                .filter(|&i| !self.cdn_blacklist.is_blacklisted(&candidates[i].service_location))
+                .collect();
+            if non_bl.is_empty() {
+                tracing::warn!(
+                    media_type = %media_type,
+                    "all CDN candidates blacklisted for init segment — retrying all"
+                );
+                (0..candidates.len()).collect()
+            } else {
+                non_bl
+            }
+        };
+
+        let fetcher = Arc::clone(&self.fetcher);
+        let mut last_err = DashError::AllBaseUrlsFailed {
+            last_error: "no candidates".into(),
+        };
+        let mut opt_response: Option<FetchResponse> = None;
+
+        for &idx in &effective {
+            let candidate = &candidates[idx];
+            let init_url = candidate
+                .url
+                .join(&init_path)
+                .map_err(|_| DashError::SegmentUrlUnresolvable)?;
+
+            tracing::debug!(
+                media_type = %media_type,
+                url = %init_url,
+                service_location = %candidate.service_location,
+                "fetching init segment from candidate"
+            );
+
+            let req = FetchRequest::new(init_url.clone(), RequestType::InitializationSegment);
+            let req = if let Some((start, end)) = byte_range {
                 req.with_byte_range(start, end)
             } else {
                 req
+            };
+
+            match fetcher.fetch(req).await {
+                Ok(resp) => {
+                    opt_response = Some(resp);
+                    break;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        url = %init_url,
+                        service_location = %candidate.service_location,
+                        error = %e,
+                        "init segment fetch failed — blacklisting CDN and trying next"
+                    );
+                    self.cdn_blacklist.record_failure(&candidate.service_location);
+                    last_err = DashError::AllBaseUrlsFailed {
+                        last_error: e.to_string(),
+                    };
+                }
             }
-        };
-        let response = self.fetcher.fetch(request).await?;
+        }
+
+        let response = opt_response.ok_or(last_err)?;
         let bytes_received = response.data.len();
 
         // Populate the cache so quality-switch re-appends are free.
@@ -2246,6 +2320,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         {
             let track = self.track_mut(&media_type)?;
             track.sink.append(chunk).await?;
+            track.init_segment_sent = true;
         }
 
         tracing::info!(
@@ -2285,17 +2360,20 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         })
     }
 
-    /// Resolve the URL (and optional byte range) for the initialisation
-    /// segment of the given representation.
+    /// Resolve the initialisation segment as a `(path, candidates, byte_range)` triple.
     ///
-    /// Returns `(url, byte_range)` where `byte_range` is `Some((start, end))`
-    /// when the init data is a byte range within the media file (as declared
-    /// by `SegmentBase.Initialization@range`).
-    fn resolve_init_url(
+    /// - `path` — URL path relative to each CDN candidate (the template-expanded
+    ///   init path or `sourceURL`).
+    /// - `candidates` — ordered CDN candidates from [`collect_candidate_base_urls`].
+    /// - `byte_range` — set for `SegmentBase.Initialization@range` fetches.
+    ///
+    /// Used by [`Self::fetch_init_segment`] to implement CDN-aware fallback for
+    /// init segment fetches (same logic as the media segment candidate loop).
+    fn resolve_init_path_and_candidates(
         &self,
         media_type: &MediaType,
         rep: &RepresentationInfo,
-    ) -> Result<(Url, Option<(u64, u64)>), DashError> {
+    ) -> Result<(String, Vec<CandidateUrl>, Option<(u64, u64)>), DashError> {
         let period = &self.mpd.periods[self.current_period_index];
         let adaptation =
             find_adaptation(period, media_type).ok_or_else(|| DashError::NoRepresentations {
@@ -2307,6 +2385,15 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             .iter()
             .find(|r| r.id.as_deref() == Some(rep.id.as_str()));
 
+        let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
+        let candidates = collect_candidate_base_urls(
+            &self.base_url,
+            &self.mpd.base_url,
+            period,
+            adaptation,
+            repr_base_urls,
+        );
+
         // ─ SegmentTemplate init ──────────────────────────────────────────────
         if let Some(tmpl) = merge_segment_templates(repr_obj, adaptation, period) {
             let init_tmpl = tmpl
@@ -2315,38 +2402,15 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .or_else(|| tmpl.Initialization.as_ref()?.sourceURL.as_deref());
 
             if let Some(init_tmpl) = init_tmpl {
-                let url_str = expand_template(init_tmpl, &rep.id, rep.bandwidth, 0, None);
-
-                let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
-                let base = resolve_effective_base_url(
-                    &self.base_url,
-                    &self.mpd.base_url,
-                    period,
-                    adaptation,
-                    repr_base_urls,
-                );
-                let url = base
-                    .join(&url_str)
-                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
-                return Ok((url, None));
+                let path = expand_template(init_tmpl, &rep.id, rep.bandwidth, 0, None);
+                return Ok((path, candidates, None));
             }
         }
 
         // ─ SegmentList init ──────────────────────────────────────────────────
         if let Some(sl) = merge_segment_lists(repr_obj, adaptation, period) {
             if let Some(src) = sl.Initialization.as_ref().and_then(|i| i.sourceURL.as_deref()) {
-                let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
-                let base = resolve_effective_base_url(
-                    &self.base_url,
-                    &self.mpd.base_url,
-                    period,
-                    adaptation,
-                    repr_base_urls,
-                );
-                let url = base
-                    .join(src)
-                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
-                return Ok((url, None));
+                return Ok((src.to_owned(), candidates, None));
             }
         }
 
@@ -2356,34 +2420,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         //       `SegmentBase.Initialization@range`, or
         //   (b) a separate URL given by `SegmentBase.Initialization.sourceURL`.
         if let Some(sb) = find_segment_base(repr_obj, adaptation, period) {
-            let repr_base_urls = repr_obj.map(|r| r.BaseURL.as_slice()).unwrap_or(&[]);
-            let base = resolve_effective_base_url(
-                &self.base_url,
-                &self.mpd.base_url,
-                period,
-                adaptation,
-                repr_base_urls,
-            );
-
             // Check for Initialization@range (byte-range within the media file).
             if let Some(range_str) = sb.Initialization.as_ref().and_then(|i| i.range.as_deref()) {
                 let br = parse_byte_range(range_str).ok_or(DashError::SegmentUrlUnresolvable)?;
-                // The file is the media URL resolved against the effective base.
                 let media_path = segment_base_media_path(repr_obj, adaptation);
-                let url = base
-                    .join(&media_path)
-                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
-                return Ok((url, Some(br)));
+                return Ok((media_path, candidates, Some(br)));
             }
 
             // Check for Initialization.sourceURL (separate init file).
             if let Some(src) =
                 sb.Initialization.as_ref().and_then(|i| i.sourceURL.as_deref())
             {
-                let url = base
-                    .join(src)
-                    .map_err(|_| DashError::SegmentUrlUnresolvable)?;
-                return Ok((url, None));
+                return Ok((src.to_owned(), candidates, None));
             }
         }
 

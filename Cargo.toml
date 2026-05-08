@@ -34,7 +34,9 @@ gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
 gstreamer-app    = { version = "0.24", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-getrandom = { version = "0.2", features = ["js"] }
+getrandom     = { version = "0.2", features = ["js"] }
+js-sys        = "0.3"
+futures-timer = { version = "3", features = ["wasm-bindgen"] }
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["full"] }

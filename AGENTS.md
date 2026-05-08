@@ -294,6 +294,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 |---|---|
 | Public API surface | `src/lib.rs` |
 | Error types | `src/error.rs` |
+| Platform-agnostic monotonic clock helper | `src/time.rs` |
 | ABR rule trait | `src/abr/rule.rs` |
 | ABR controller | `src/abr/mod.rs` |
 | `MediaSource` / `SourceBuffer` traits | `src/media_source/mod.rs` |

@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::abr::{
     metrics::AbrMetrics,
@@ -18,8 +18,9 @@ const HISTORY_CAPACITY: usize = 4;
 pub struct SwitchHistoryRule {
     /// Minimum wall-clock time between up-switches.
     pub min_switch_interval: Duration,
-    /// Timestamps of recent quality switches (newest first).
-    recent_switches: VecDeque<Instant>,
+    /// Timestamps (in ms from [`crate::time::mono_ms`]) of recent quality
+    /// switches, newest first.
+    recent_switches: VecDeque<f64>,
 }
 
 impl Default for SwitchHistoryRule {
@@ -35,7 +36,7 @@ impl SwitchHistoryRule {
     /// Record that a switch just occurred. Call this whenever `DashSession`
     /// actually changes quality.
     pub fn record_switch(&mut self) {
-        let now = Instant::now();
+        let now = crate::time::mono_ms();
         self.recent_switches.push_front(now);
         if self.recent_switches.len() > HISTORY_CAPACITY {
             self.recent_switches.pop_back();
@@ -60,13 +61,15 @@ impl AbrRule for SwitchHistoryRule {
         let current = metrics.current_index.unwrap_or(0);
 
         // Check whether the most recent switch was too recent.
-        if let Some(last_switch) = self.recent_switches.front() {
-            if last_switch.elapsed() < self.min_switch_interval {
+        if let Some(&last_switch_ms) = self.recent_switches.front() {
+            let elapsed_ms = crate::time::mono_ms() - last_switch_ms;
+            let min_interval_ms = self.min_switch_interval.as_secs_f64() * 1_000.0;
+            if elapsed_ms < min_interval_ms {
                 // Clamp to current quality to avoid further up-switching.
                 tracing::debug!(
                     rule = self.name(),
-                    elapsed_ms = last_switch.elapsed().as_millis(),
-                    min_interval_ms = self.min_switch_interval.as_millis(),
+                    elapsed_ms = elapsed_ms as u64,
+                    min_interval_ms = min_interval_ms as u64,
                     current_index = current,
                     "switch too recent — clamping to current quality"
                 );
