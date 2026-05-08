@@ -16,8 +16,9 @@ use dash_rs::{
     abr::AbrMetrics,
     error::DashError,
     fetch::{FetchError, FetchRequest, FetchResponse, RequestType, SegmentFetcher},
-    media_source::stub::StubMediaSource,
+    media_source::{stub::StubMediaSource, TimeRange},
     session::{DashSession, MediaType},
+    GapSeekReason,
 };
 
 // ── MPD XML fixtures ──────────────────────────────────────────────────────────
@@ -2737,4 +2738,349 @@ fn cdn_blacklist_cooldown_accessor_round_trips() {
     // Zero disables the blacklist.
     session.set_cdn_blacklist_cooldown_ms(0);
     assert_eq!(session.cdn_blacklist_cooldown_ms(), 0);
+}
+
+// ── seek_to ───────────────────────────────────────────────────────────────────
+
+/// A 60 s static MPD with 4 s segments and a single video track.
+const SEEK_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="aud-$Number$.m4s" initialization="init-audio.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// 60 s stream, startNumber=5, 4 s segments.
+const SEEK_MPD_STARTNUMBER: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="5" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// seek_to lands on the segment boundary that contains the requested time.
+#[test]
+fn seek_to_snaps_to_segment_boundary() {
+    let mut session = session_from_xml(SEEK_MPD);
+    // Segment duration = 4 s, startNumber = 1.
+    // Seek to 20 s → segment index 5 → segment_number = 1 + 5 = 6.
+    let snapped = session.seek_to(20.0);
+    assert!((snapped - 20.0).abs() < 1e-9, "snapped = {snapped}");
+}
+
+/// seek_to repositions both the video and audio tracks.
+#[test]
+fn seek_to_repositions_both_tracks() {
+    let mut session = session_from_xml(SEEK_MPD);
+    session.seek_to(12.0); // 12 / 4 = seg 3 → segment_number = 4
+
+    // estimated_buffer_level_ms counts from initial_segment_number = 4,
+    // and segment_number = 4 too, so 0 segments fetched → level = 0.
+    assert_eq!(
+        session.estimated_buffer_level_ms(&MediaType::Video),
+        0.0,
+        "video buffer level should be 0 after seek (no segments fetched yet)"
+    );
+    assert_eq!(
+        session.estimated_buffer_level_ms(&MediaType::Audio),
+        0.0,
+        "audio buffer level should be 0 after seek (no segments fetched yet)"
+    );
+}
+
+/// seek_to is clamped to start_number even when given a negative position.
+#[test]
+fn seek_to_clamps_below_start() {
+    let mut session = session_from_xml(SEEK_MPD);
+    let snapped = session.seek_to(-5.0);
+    assert_eq!(snapped, 0.0, "negative seek should snap to 0 s (segment 1)");
+}
+
+/// seek_to clamps to the last segment when the requested position exceeds
+/// the total duration.
+#[test]
+fn seek_to_clamps_above_total_segments() {
+    let mut session = session_from_xml(SEEK_MPD);
+    // 60 s / 4 s = 15 segments.  Request beyond the end.
+    let snapped = session.seek_to(999.0);
+    // Last segment starts at (15-1)*4 = 56 s.
+    assert!((snapped - 56.0).abs() < 1e-9, "snapped = {snapped}");
+}
+
+/// seek_to respects a non-1 startNumber.
+#[test]
+fn seek_to_respects_start_number() {
+    let mut session = session_from_xml(SEEK_MPD_STARTNUMBER);
+    // startNumber=5, seg_duration=4 s.  Seek to 8 s → offset 2 → seg 7.
+    let snapped = session.seek_to(8.0);
+    assert!((snapped - 8.0).abs() < 1e-9, "snapped = {snapped}");
+}
+
+/// After seek_to the next fetch_next_segment starts from the seeked segment.
+#[tokio::test]
+async fn seek_to_fetch_resumes_from_new_position() {
+    let mut session = session_from_xml(SEEK_MPD);
+    let metrics = default_metrics();
+
+    // Fetch one segment from the start (segment 1).
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("first fetch should succeed");
+
+    // Seek to 20 s (segment 6).
+    session.seek_to(20.0);
+
+    // The next fetch should succeed (stub fetcher always returns empty bytes).
+    // We just verify it does not return an error.
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("fetch after seek should succeed");
+}
+
+// ── tick_gap via DashSession ───────────────────────────────────────────────────
+
+/// Helper: build two non-adjacent buffered ranges for gap tests.
+///
+/// Layout (seconds):  [0 – 5]  gap  [6 – 10]
+fn gap_buffered() -> Vec<TimeRange> {
+    vec![TimeRange::new(0.0, 5.0), TimeRange::new(6.0, 10.0)]
+}
+
+/// When the position is inside a buffered range, tick_gap returns None.
+#[test]
+fn tick_gap_returns_none_when_position_in_buffer() {
+    let mut session = session_from_xml(SEEK_MPD);
+    // Position 2.0 is inside [0, 5] — no gap, no stall.
+    let result = session.tick_gap(2.0, &gap_buffered(), false);
+    assert!(result.is_none(), "no seek needed when inside buffered range");
+}
+
+/// When the position is just before a buffered gap, tick_gap recommends a
+/// seek to the start of the next range.
+#[test]
+fn tick_gap_recommends_seek_for_gap() {
+    let mut session = session_from_xml(SEEK_MPD);
+    // Position 5.1 s is past the end of [0, 5] and inside the gap before [6, 10].
+    // The gap is 1.0 s which is > small_gap_limit_s (0.8 s) but jump_large_gaps=true.
+    let result = session.tick_gap(5.1, &gap_buffered(), false);
+    assert!(result.is_some(), "gap should trigger a seek recommendation");
+    let target = result.unwrap();
+    // Should seek to the start of the next range (6.0) plus seek_offset_s (0.1).
+    assert!(
+        (target.position_s - 6.1).abs() < 1e-9,
+        "seek target should be gap_end + seek_offset, got {}",
+        target.position_s
+    );
+    assert!(
+        matches!(target.reason, GapSeekReason::GapJump { .. }),
+        "reason should be GapJump"
+    );
+}
+
+/// seek_to automatically resets the gap controller so a subsequent tick
+/// does not immediately re-fire the same seek target.
+#[test]
+fn seek_to_resets_gap_controller_automatically() {
+    let mut session = session_from_xml(SEEK_MPD);
+    let buffered = gap_buffered();
+
+    // First tick detects the gap and returns a seek target.
+    let target = session
+        .tick_gap(5.1, &buffered, false)
+        .expect("should recommend a gap seek");
+
+    // Caller honours the seek recommendation — seek_to resets the controller.
+    session.seek_to(target.position_s);
+
+    // Second tick at the same position must not re-fire (dedup guard).
+    let again = session.tick_gap(target.position_s, &buffered, false);
+    assert!(
+        again.is_none(),
+        "gap controller should not re-fire immediately after seek_to"
+    );
+}
+
+/// gap_settings returns default values and set_gap_settings round-trips.
+#[test]
+fn gap_settings_round_trip() {
+    let mut session = session_from_xml(SEEK_MPD);
+
+    // Default: jump_large_gaps is true (dash.js default).
+    assert!(
+        session.gap_settings().jump_large_gaps,
+        "default jump_large_gaps should be true"
+    );
+
+    // Override: disable large-gap jumps.
+    let mut new_settings = session.gap_settings().clone();
+    new_settings.jump_large_gaps = false;
+    session.set_gap_settings(new_settings);
+
+    assert!(
+        !session.gap_settings().jump_large_gaps,
+        "jump_large_gaps should be false after override"
+    );
+
+    // Large gap (> small_gap_limit_s=0.8 s) should now return None.
+    let result = session.tick_gap(5.1, &gap_buffered(), false);
+    assert!(
+        result.is_none(),
+        "large gap jump should be suppressed when jump_large_gaps=false"
+    );
+}
+
+// ── Audio-only stream support ─────────────────────────────────────────────────
+
+/// A minimal audio-only live MPD: no video AdaptationSet, two audio
+/// representations at different bitrates.
+const AUDIO_ONLY_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" codecs="mp4a.40.2">
+      <SegmentTemplate media="aud-$Number$.m4s" initialization="init-audio.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+      <Representation id="a2" bandwidth="320000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// An MPD with two audio AdaptationSets using different codecs:
+/// AAC-HE (mp4a.40.5) at 48/96 kbps and AAC-LC (mp4a.40.2) at 128/320 kbps.
+/// Mirrors the BBC Radio One manifest structure.
+const MULTI_AUDIO_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" codecs="mp4a.40.5">
+      <SegmentTemplate media="he-$Number$.m4s" initialization="init-he.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="he48"  bandwidth="48000"/>
+      <Representation id="he96"  bandwidth="96000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio" codecs="mp4a.40.2">
+      <SegmentTemplate media="lc-$Number$.m4s" initialization="init-lc.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="lc128" bandwidth="128000"/>
+      <Representation id="lc320" bandwidth="320000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// has_video() returns false and has_audio() returns true for an audio-only MPD.
+#[test]
+fn audio_only_has_video_false_has_audio_true() {
+    let session = session_from_xml(AUDIO_ONLY_MPD);
+    assert!(!session.has_video(), "has_video should be false for audio-only stream");
+    assert!(session.has_audio(), "has_audio should be true for audio-only stream");
+}
+
+/// has_video() returns true and has_audio() returns false for a video-only MPD.
+#[test]
+fn video_only_has_video_true_has_audio_false() {
+    let session = session_from_xml(STATIC_MPD); // STATIC_MPD has only a video AdaptationSet
+    assert!(session.has_video(), "has_video should be true for video-only stream");
+    assert!(!session.has_audio(), "has_audio should be false for video-only stream");
+}
+
+/// has_video() and has_audio() both return true for a standard AV stream.
+#[test]
+fn av_stream_has_both_tracks() {
+    let session = session_from_xml(SEEK_MPD); // SEEK_MPD has both video and audio
+    assert!(session.has_video(), "has_video should be true for AV stream");
+    assert!(session.has_audio(), "has_audio should be true for AV stream");
+}
+
+/// fetch_next_segment(Video) returns NoRepresentations for an audio-only stream.
+#[tokio::test]
+async fn audio_only_video_fetch_returns_no_representations() {
+    let mut session = session_from_xml(AUDIO_ONLY_MPD);
+    let metrics = default_metrics();
+    let result = session.fetch_next_segment(MediaType::Video, &metrics).await;
+    assert!(
+        matches!(result, Err(DashError::NoRepresentations { .. })),
+        "expected NoRepresentations, got {result:?}"
+    );
+}
+
+/// fetch_next_segment(Audio) succeeds for an audio-only stream.
+#[tokio::test]
+async fn audio_only_audio_fetch_succeeds() {
+    let mut session = session_from_xml(AUDIO_ONLY_MPD);
+    let metrics = default_metrics();
+    session
+        .fetch_next_segment(MediaType::Audio, &metrics)
+        .await
+        .expect("audio fetch should succeed on audio-only stream");
+}
+
+/// audio_representations() returns the expected count for an audio-only stream.
+#[test]
+fn audio_only_representations_count() {
+    let session = session_from_xml(AUDIO_ONLY_MPD);
+    assert_eq!(
+        session.audio_representations().len(),
+        2,
+        "audio-only stream should expose 2 audio representations"
+    );
+    assert!(
+        session.video_representations().is_empty(),
+        "audio-only stream should have no video representations"
+    );
+}
+
+/// When two audio AdaptationSets are present, the one with the highest
+/// maximum representation bandwidth is selected.  For the MULTI_AUDIO_MPD
+/// fixture, AAC-LC at 128/320 kbps must win over AAC-HE at 48/96 kbps.
+#[test]
+fn multi_audio_selects_highest_bandwidth_adaptation_set() {
+    let session = session_from_xml(MULTI_AUDIO_MPD);
+    let reps = session.audio_representations();
+    assert_eq!(reps.len(), 2, "should select the 2-rep AAC-LC AdaptationSet");
+    // The selected AdaptationSet should be the AAC-LC one (ids lc128 / lc320).
+    let ids: Vec<&str> = reps.iter().map(|r| r.id.as_str()).collect();
+    assert!(
+        ids.contains(&"lc128") && ids.contains(&"lc320"),
+        "expected lc128 and lc320 representations, got {ids:?}"
+    );
+    // The AAC-HE representations must NOT be present.
+    assert!(
+        !ids.contains(&"he48") && !ids.contains(&"he96"),
+        "AAC-HE representations should not be selected, got {ids:?}"
+    );
+}
+
+/// The selected audio AdaptationSet's max bandwidth is 320 000 bps (AAC-LC).
+#[test]
+fn multi_audio_max_bandwidth_is_320kbps() {
+    let session = session_from_xml(MULTI_AUDIO_MPD);
+    let max_bps = session
+        .audio_representations()
+        .iter()
+        .map(|r| r.bandwidth)
+        .max()
+        .unwrap_or(0);
+    assert_eq!(max_bps, 320_000, "max audio bandwidth should be 320 000 bps (AAC-LC)");
 }

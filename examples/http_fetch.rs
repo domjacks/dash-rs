@@ -166,36 +166,48 @@ async fn main() -> Result<(), DashError> {
     let mut session = DashSession::from_url(&manifest_url, fetcher, media_source).await?;
 
     // 4. Print available representations.
-    println!("=== Video representations ===");
-    for (i, rep) in session.video_representations().iter().enumerate() {
-        println!(
-            "  [{i}] id={:<12} {:>6} kbps  {}x{}",
-            rep.id,
-            rep.bandwidth / 1_000,
-            rep.width.unwrap_or(0),
-            rep.height.unwrap_or(0),
-        );
+    if session.has_video() {
+        println!("=== Video representations ===");
+        for (i, rep) in session.video_representations().iter().enumerate() {
+            println!(
+                "  [{i}] id={:<12} {:>6} kbps  {}x{}",
+                rep.id,
+                rep.bandwidth / 1_000,
+                rep.width.unwrap_or(0),
+                rep.height.unwrap_or(0),
+            );
+        }
+    } else {
+        println!("=== Video representations ===  (none — audio-only stream)");
     }
-    println!("=== Audio representations ===");
-    for (i, rep) in session.audio_representations().iter().enumerate() {
-        println!(
-            "  [{i}] id={:<12} {:>6} kbps",
-            rep.id,
-            rep.bandwidth / 1_000,
-        );
+    if session.has_audio() {
+        println!("=== Audio representations ===");
+        for (i, rep) in session.audio_representations().iter().enumerate() {
+            println!(
+                "  [{i}] id={:<12} {:>6} kbps",
+                rep.id,
+                rep.bandwidth / 1_000,
+            );
+        }
+    } else {
+        println!("=== Audio representations ===  (none — video-only stream)");
     }
     println!();
 
     // 5. Fetch initialisation segments — required before media segments so
     //    that a real decoder can read codec parameters from the moov box.
     println!("=== Init segments ===");
-    match session.fetch_init_segment(MediaType::Video).await {
-        Ok(n) => println!("  video  init: {n} bytes"),
-        Err(e) => println!("  video  init skipped: {e}"),
+    if session.has_video() {
+        match session.fetch_init_segment(MediaType::Video).await {
+            Ok(n) => println!("  video  init: {n} bytes"),
+            Err(e) => println!("  video  init skipped: {e}"),
+        }
     }
-    match session.fetch_init_segment(MediaType::Audio).await {
-        Ok(n) => println!("  audio  init: {n} bytes"),
-        Err(e) => println!("  audio  init skipped: {e}"),
+    if session.has_audio() {
+        match session.fetch_init_segment(MediaType::Audio).await {
+            Ok(n) => println!("  audio  init: {n} bytes"),
+            Err(e) => println!("  audio  init skipped: {e}"),
+        }
     }
     println!();
 
@@ -204,44 +216,65 @@ async fn main() -> Result<(), DashError> {
     println!("=== Fetching {SEGMENTS_TO_FETCH} segments ===");
     println!(
         "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {}",
-        "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "video fetch"
+        "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "fetch ms"
     );
 
+    // Track whether each track has reached end-of-stream.
+    let mut video_done = !session.has_video();
+    let mut audio_done = !session.has_audio();
+
     for seg in 1..=SEGMENTS_TO_FETCH {
+        if video_done && audio_done {
+            break;
+        }
+
         // Read throughput measured by the fetcher during the previous segment.
         let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        // Use current_metrics() so SwitchHistoryRule sees the real current_index.
-        let mut metrics = session.current_metrics(MediaType::Video);
-        metrics.throughput_bps = throughput_bps;
         // Simple buffer model: assume each segment is 4 seconds of content.
-        metrics.buffer_level_ms = (seg as f64) * 4_000.0;
+        let buf_ms = (seg as f64) * 4_000.0;
 
-        let t_video = Instant::now();
-        let video_decision = session
-            .fetch_next_segment(MediaType::Video, &metrics)
-            .await?;
-        let video_ms = t_video.elapsed().as_millis();
+        // ── Video ──────────────────────────────────────────────────────────────
+        let t_fetch = Instant::now();
+        let (vid_idx, vid_reason) = if !video_done {
+            let mut metrics = session.current_metrics(MediaType::Video);
+            metrics.throughput_bps = throughput_bps;
+            metrics.buffer_level_ms = buf_ms;
+            match session.fetch_next_segment(MediaType::Video, &metrics).await {
+                Ok(d) => (d.index.to_string(), format!("{:?}", d.reason)),
+                Err(DashError::EndOfStream { .. }) => {
+                    video_done = true;
+                    ("done".into(), "-".into())
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            ("done".into(), "-".into())
+        };
+        let fetch_ms = t_fetch.elapsed().as_millis();
 
-        let audio_decision = session
-            .fetch_next_segment(MediaType::Audio, &{
-                let mut m = session.current_metrics(MediaType::Audio);
-                m.throughput_bps = throughput_bps;
-                m.buffer_level_ms = (seg as f64) * 4_000.0;
-                m
-            })
-            .await?;
+        // ── Audio ──────────────────────────────────────────────────────────────
+        let (aud_idx, aud_reason) = if !audio_done {
+            let mut metrics = session.current_metrics(MediaType::Audio);
+            metrics.throughput_bps = throughput_bps;
+            metrics.buffer_level_ms = buf_ms;
+            match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+                Ok(d) => (d.index.to_string(), format!("{:?}", d.reason)),
+                Err(DashError::EndOfStream { .. }) => {
+                    audio_done = true;
+                    ("done".into(), "-".into())
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            ("done".into(), "-".into())
+        };
 
         // Re-read throughput after both fetches for the next iteration.
         let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
 
         println!(
             "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps measured)",
-            seg,
-            video_decision.index,
-            format!("{:?}", video_decision.reason),
-            audio_decision.index,
-            format!("{:?}", audio_decision.reason),
-            video_ms,
+            seg, vid_idx, vid_reason, aud_idx, aud_reason, fetch_ms,
             measured_bps / 1_000.0,
         );
     }

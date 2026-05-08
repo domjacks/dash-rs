@@ -357,6 +357,11 @@ DashSession
         └── SourceBuffer (trait) ←── StubSourceBuffer
                                  └── GstSourceBuffer  (sink-gstreamer feature)
                                  └── (your implementation)
+
+GapController  (owned by DashSession; caller drives via session.tick_gap())
+└── tick_gap(position_s, buffered, is_paused) → Option<GapSeekTarget>
+    └── on gap/stall: caller seeks renderer, then calls session.seek_to()
+        └── seek_to() automatically resets the gap controller (on_seek())
 ```
 
 Data flow per segment:
@@ -382,7 +387,6 @@ All Tier 1 features are now implemented.  No outstanding items.
 | Feature | dash.js equivalent | Notes |
 |---|---|---|
 | Content steering server | `ContentSteeringController.js` | Static weighted-random BaseURL failover exists; no dynamic steering server polling |
-| Gap controller (stall recovery) | `GapController.js` | No stall detection or auto seek-forward recovery |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | Not implemented |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` | Not implemented |
 | Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Fetcher receives whole segments only; no progressive streaming |

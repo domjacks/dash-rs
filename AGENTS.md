@@ -98,6 +98,25 @@ Forgetting the macro produces cryptic "associated type not found" errors.
 If you build `RepresentationInfo` slices by hand (e.g. in tests), sort them
 first.
 
+### Audio-only and video-only streams are fully supported
+
+`DashSession` sets `video_track = None` or `audio_track = None` when the
+manifest has no corresponding `AdaptationSet`.  Use `session.has_video()` /
+`session.has_audio()` to gate operations before calling
+`fetch_next_segment`, `fetch_init_segment`, or `current_metrics` for that
+track — calling them on an absent track returns
+`DashError::NoRepresentations`.
+
+### Multiple audio `AdaptationSet`s — highest-bandwidth wins
+
+When a `Period` contains more than one audio `AdaptationSet` (e.g. a stream
+offering both AAC-HE at low bitrates and AAC-LC at high bitrates, as in BBC
+Radio One), `find_adaptation` selects the one whose representations have the
+**highest maximum bandwidth**.  This ensures high-quality codec tiers are
+preferred over lower-quality fallback tiers.  All representations within
+the selected `AdaptationSet` must share the same codec (they form a single
+`TrackState` with one MIME type).
+
 ### `AbrController::select` takes `&self`; `record_switch` takes `&mut self`
 
 `select` is intentionally immutable so it can be called while other state is
@@ -287,12 +306,13 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Manifest loading | `src/manifest/mod.rs` |
 | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
 | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
-| MPD helpers (`merge_segment_templates`, `extract_segment_timing`, etc.) | `src/session/mpd.rs` |
+| MPD helpers (`merge_segment_templates`, `extract_segment_timing`, `find_adaptation`, etc.) | `src/session/mpd.rs` |
 | SegmentTimeline / `$Time$` walking | `src/session/timeline.rs` |
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
 | Live-edge segment calculation | `src/session/live.rs` |
 | UTC clock sync (`resolve_utc_timing`, `query_http_utc`) | `src/session/utc.rs` |
 | CDN blacklist (`CdnBlacklist`, service-location keying, cooldown) | `src/session/blacklist.rs` |
+| Gap controller (stall detection, gap-jump logic) | `src/session/gap.rs` |
 | XLink pre-processing (`resolve_xlinks`, Period + AdaptationSet) | `src/session/xlink.rs` |
 | XS datetime parser (`parse_xs_datetime`) | `src/util.rs` |
 | ISO BMFF box parsing (`sidx` timing, `sidx` byte-range index, `emsg`) | `src/mp4.rs` |
@@ -331,6 +351,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `ServiceDescriptionController.js` | `DashSession::target_latency_ms()` + `playback_rate_range()` |
 | `AbrController.setMaxAllowedBitrateFor()` | `DashSession::set_max_bitrate(media_type, bps)` / `clear_max_bitrate` / `max_bitrate` |
 | `BlacklistController.js` | `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`; blacklist logic in `src/session/blacklist.rs` |
+| `GapController.js` | `session::GapController` (`src/session/gap.rs`); owned by `DashSession`; caller drives via `DashSession::tick_gap(position_s, buffered, is_paused)`; `DashSession::seek_to` automatically resets the controller via `on_seek()`; track-switch guard fires automatically at period boundaries |
 
 ---
 
@@ -348,7 +369,6 @@ All Tier 1 features are now implemented.  No outstanding items.
 | Feature | dash.js equivalent | Implementation notes |
 |---|---|---|
 | Content steering server | `ContentSteeringController.js` | Static CDN failover exists. Parse `<ContentSteering>` from the MPD; spawn a refresh task that polls the steering server and updates the ordered base-URL list in `DashSession`. |
-| Gap controller (stall recovery) | `GapController.js` | Monitor playback position against buffer level; when a decoded-buffer gap stalls the player, seek forward past it to resume. Add a `GapController` struct that `DashSession` ticks on each `fetch_next_segment` call; expose `on_stall(position_ms, buffer_level_ms) -> Option<SeekTarget>`. No stall-detection or auto-recovery exists today. |
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | New file `src/abr/l2a.rs`. Implements the Lyapunov optimisation tuned for low-latency streams. Register in `AbrController::default()`. |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` / `LearningAbrController.js` | New file `src/abr/lolp.rs`. Requires a QoE evaluator and an online weight-selector; more complex than other rules. |
 | Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Requires `SegmentFetcher` to support progressive byte delivery (streaming body). `FetchResponse` currently holds complete `Bytes`; need a `Stream<Item=Bytes>` variant or callback. |
@@ -377,6 +397,42 @@ All Tier 1 features are now implemented.  No outstanding items.
 - **CDN failover / URL blacklisting**: implemented — `CdnBlacklist` (`src/session/blacklist.rs`) mirrors `BlacklistController.js`.  After a segment-fetch failure the contributing `<BaseURL>` service-location key is blacklisted for a configurable cooldown (default 600 s, matching dash.js).  Subsequent fetches skip blacklisted candidates; when every candidate is blacklisted the exclusion is overridden and all are retried to prevent permanent stalls.  Configure via `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`.
 
 - **Throughput model**: dash.js `ThroughputController` maintains a global throughput estimate with multiple EWMA windows (fast and slow) and uses harmonic mean over the sample distribution to resist outliers.  dash-rs tracks a single α-EMA (`throughput_ema_bps`) per track independently; audio and video can therefore diverge, and the estimate over-reacts on bursty connections compared to dash.js's multi-window model.
+
+### `GapController` usage pattern
+
+`GapController` is a caller-driven state machine — it has no internal timer
+and performs no I/O.  The caller supplies the current renderer position and
+buffered ranges; the controller returns a seek recommendation when needed.
+
+`GapController` is **owned by `DashSession`**.  Callers do not instantiate it
+directly; they use `DashSession::tick_gap`.  `DashSession::seek_to` calls
+`GapController::on_seek` automatically, and the track-switch guard
+(`on_track_switch_started/ended`) fires automatically at period boundaries
+inside `try_advance_period`.
+
+```rust
+session.media_source_mut().set_playing()?;
+session.notify_playing();
+
+// In your fetch / UI loop (e.g. every 200 ms):
+let target = session.tick_gap(
+    renderer_position_s,    // from GStreamer query_position or equivalent
+    &source_buffer_ranges,  // union of SourceBuffer::buffered() across tracks
+    is_paused,
+);
+if let Some(t) = target {
+    // 1. Seek the renderer.
+    renderer.seek(t.position_s);
+    // 2. Reposition the segment fetcher — also resets the gap controller.
+    let snapped = session.seek_to(t.position_s);
+    // 3. Restart the playback clock.
+    session.notify_playing();
+}
+```
+
+The **period-end stall jump** (dash.js: `timeToStreamEnd < smallGapLimit → seek
+to stream end`) is not yet implemented in `GapController`.  If a live stream
+stalls at a period boundary, call `session.seek_to(period_end_s)` manually.
 
 ### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
 

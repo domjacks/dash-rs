@@ -174,35 +174,47 @@ async fn run_session(
         DashSession::from_url(&manifest_url, fetcher, media_source).await?;
 
     // Print available representations.
-    println!("\n=== Video representations ===");
-    for (i, rep) in session.video_representations().iter().enumerate() {
-        println!(
-            "  [{i}] id={:<12} {:>6} kbps  {}x{}",
-            rep.id,
-            rep.bandwidth / 1_000,
-            rep.width.unwrap_or(0),
-            rep.height.unwrap_or(0),
-        );
+    if session.has_video() {
+        println!("\n=== Video representations ===");
+        for (i, rep) in session.video_representations().iter().enumerate() {
+            println!(
+                "  [{i}] id={:<12} {:>6} kbps  {}x{}",
+                rep.id,
+                rep.bandwidth / 1_000,
+                rep.width.unwrap_or(0),
+                rep.height.unwrap_or(0),
+            );
+        }
+    } else {
+        println!("\n=== Video representations ===  (none — audio-only stream)");
     }
-    println!("=== Audio representations ===");
-    for (i, rep) in session.audio_representations().iter().enumerate() {
-        println!(
-            "  [{i}] id={:<12} {:>6} kbps",
-            rep.id,
-            rep.bandwidth / 1_000,
-        );
+    if session.has_audio() {
+        println!("=== Audio representations ===");
+        for (i, rep) in session.audio_representations().iter().enumerate() {
+            println!(
+                "  [{i}] id={:<12} {:>6} kbps",
+                rep.id,
+                rep.bandwidth / 1_000,
+            );
+        }
+    } else {
+        println!("=== Audio representations ===  (none — video-only stream)");
     }
     println!();
 
     // Fetch init segments (codec parameters for the decoder).
     println!("=== Init segments ===");
-    match session.fetch_init_segment(MediaType::Video).await {
-        Ok(n) => println!("  video  init: {n} bytes"),
-        Err(e) => println!("  video  init skipped: {e}"),
+    if session.has_video() {
+        match session.fetch_init_segment(MediaType::Video).await {
+            Ok(n) => println!("  video  init: {n} bytes"),
+            Err(e) => println!("  video  init skipped: {e}"),
+        }
     }
-    match session.fetch_init_segment(MediaType::Audio).await {
-        Ok(n) => println!("  audio  init: {n} bytes"),
-        Err(e) => println!("  audio  init skipped: {e}"),
+    if session.has_audio() {
+        match session.fetch_init_segment(MediaType::Audio).await {
+            Ok(n) => println!("  audio  init: {n} bytes"),
+            Err(e) => println!("  audio  init skipped: {e}"),
+        }
     }
 
     // For live CMAF streams (e.g. BBC Two HD), the fMP4 `tfdt` box carries
@@ -252,9 +264,10 @@ async fn run_session(
 
     // Track completion independently per track.  EOS on one track must not
     // short-circuit the other — mirrors dash.js calling mediaSource.endOfStream()
-    // only after ALL tracks have been exhausted.
-    let mut video_done = false;
-    let mut audio_done = false;
+    // only after ALL tracks have been exhausted.  For audio-only or video-only
+    // streams, mark the absent track as done immediately so the loop skips it.
+    let mut video_done = !session.has_video();
+    let mut audio_done = !session.has_audio();
     let mut seg: u32 = 0;
 
     loop {
@@ -325,12 +338,18 @@ async fn run_session(
         };
 
         // ── Audio: gate on buffer level, then fetch ──────────────────────────
-        // dash.js slaves audio target to video buffer level + 1 s so that
-        // audio and video stay in lock-step.
+        // When video is present, dash.js slaves audio target to the video
+        // buffer level + 1 s so that audio and video stay in lock-step.
+        // For audio-only streams, gate on the audio buffer level directly
+        // against buffer_target_ms (video buffer level would always be 0).
         let audio_result: Option<(usize, String)> = if !audio_done {
-            let audio_target_ms = session
-                .estimated_buffer_level_ms(&MediaType::Video)
-                .min(session.buffer_target_ms());
+            let audio_target_ms = if session.has_video() {
+                session
+                    .estimated_buffer_level_ms(&MediaType::Video)
+                    .min(session.buffer_target_ms())
+            } else {
+                session.buffer_target_ms()
+            };
             loop {
                 let buf = session.estimated_buffer_level_ms(&MediaType::Audio);
                 if buf < audio_target_ms + 1_000.0 {
@@ -359,7 +378,12 @@ async fn run_session(
         };
 
         let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        let vid_buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
+        // For display, show whichever track's buffer level is meaningful.
+        let buf_ms = if session.has_video() {
+            session.estimated_buffer_level_ms(&MediaType::Video)
+        } else {
+            session.estimated_buffer_level_ms(&MediaType::Audio)
+        };
 
         let (vid_idx, vid_reason, video_ms) = video_result
             .map(|(i, r, ms)| (i.to_string(), r, ms))
@@ -375,7 +399,7 @@ async fn run_session(
             vid_reason,
             aud_idx,
             aud_reason,
-            vid_buf_ms / 1_000.0,
+            buf_ms / 1_000.0,
             video_ms,
             measured_bps / 1_000.0,
         );

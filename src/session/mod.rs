@@ -21,12 +21,15 @@
 //! | `utc` | `resolve_utc_timing`, `query_http_utc` — `UTCTiming` clock-sync |
 
 mod blacklist;
+mod gap;
 mod live;
 mod mpd;
 mod segment_url;
 mod timeline;
 mod utc;
 mod xlink;
+
+pub use gap::{GapController, GapControllerSettings, GapSeekReason, GapSeekTarget};
 
 use std::{
     collections::HashMap,
@@ -509,6 +512,13 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// blacklisted candidates; if all candidates are blacklisted they are all
     /// retried anyway to avoid a permanent stall.
     cdn_blacklist: CdnBlacklist,
+    /// Gap / stall controller.
+    ///
+    /// Mirrors `GapController.js` in dash.js.  Owned by the session so that
+    /// the quality-switch guard (`on_track_switch_started/ended`) fires
+    /// automatically at period boundaries.  Callers drive detection via
+    /// [`Self::tick_gap`].
+    gap_controller: GapController,
 }
 
 // Re-export for convenience in examples.
@@ -749,6 +759,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             video_max_bitrate_bps: None,
             audio_max_bitrate_bps: None,
             cdn_blacklist: CdnBlacklist::new(),
+            gap_controller: GapController::new(),
         })
     }
 
@@ -757,6 +768,26 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The parsed MPD manifest.
     pub fn mpd(&self) -> &MPD {
         &self.mpd
+    }
+
+    /// Returns `true` when the manifest contains a video `AdaptationSet` with
+    /// at least one representation.
+    ///
+    /// Use this to gate video-specific operations (e.g.
+    /// [`Self::fetch_next_segment`] with [`MediaType::Video`]) so that
+    /// audio-only streams do not produce a
+    /// [`DashError::NoRepresentations`] error.
+    pub fn has_video(&self) -> bool {
+        self.video_track.is_some()
+    }
+
+    /// Returns `true` when the manifest contains an audio `AdaptationSet` with
+    /// at least one representation.
+    ///
+    /// Use this to gate audio-specific operations on streams that may be
+    /// video-only.
+    pub fn has_audio(&self) -> bool {
+        self.audio_track.is_some()
     }
 
     /// The URL that the manifest was last loaded from (or successfully refreshed from).
@@ -789,6 +820,48 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     pub fn set_cdn_blacklist_cooldown_ms(&mut self, ms: u64) {
         self.cdn_blacklist
             .set_cooldown(std::time::Duration::from_millis(ms));
+    }
+
+    // ── Gap / stall control ───────────────────────────────────────────────────
+
+    /// Advance the internal gap / stall detector one tick.
+    ///
+    /// Call this periodically (e.g. every 200 ms) from your playback loop,
+    /// supplying the renderer's current position and the union of all
+    /// `SourceBuffer::buffered()` ranges.  When the controller decides a seek
+    /// is needed it returns a [`GapSeekTarget`]; otherwise returns `None`.
+    ///
+    /// When a seek is returned, the caller should:
+    /// 1. Seek the renderer to `target.position_s`.
+    /// 2. Call [`Self::seek_to`] with the same value — this automatically
+    ///    resets the gap controller via [`GapController::on_seek`].
+    /// 3. Call [`Self::notify_playing`] to restart the buffer-level clock.
+    ///
+    /// This mirrors `GapController.js::_jumpGap` / `_checkStall` in dash.js.
+    pub fn tick_gap(
+        &mut self,
+        position_s: f64,
+        buffered: &[crate::media_source::TimeRange],
+        is_paused: bool,
+    ) -> Option<GapSeekTarget> {
+        self.gap_controller.tick(position_s, buffered, is_paused)
+    }
+
+    /// Read-only access to the gap controller settings.
+    pub fn gap_settings(&self) -> &GapControllerSettings {
+        self.gap_controller.settings()
+    }
+
+    /// Replace the gap controller settings.
+    ///
+    /// # Example
+    /// ```rust,ignore
+    /// let mut settings = session.gap_settings().clone();
+    /// settings.jump_large_gaps = false;
+    /// session.set_gap_settings(settings);
+    /// ```
+    pub fn set_gap_settings(&mut self, settings: GapControllerSettings) {
+        self.gap_controller.set_settings(settings);
     }
 
     /// The number of `Period` elements in the manifest.
@@ -1106,6 +1179,95 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         }
         Ok(())
+    }
+
+    // ── Seeking ───────────────────────────────────────────────────────────────
+
+    /// Reposition both tracks to the segment containing `position_s`.
+    ///
+    /// This is the counterpart of [`GapController::tick`]: when the gap
+    /// controller returns a [`GapSeekTarget`], pass `target.position_s` to
+    /// this method (and seek the renderer separately).
+    ///
+    /// # What it does
+    ///
+    /// For each track the segment number is recomputed as:
+    ///
+    /// ```text
+    /// new_segment = start_number + floor(position_s / segment_duration_s)
+    /// ```
+    ///
+    /// clamped to `[start_number, start_number + total_segments − 1]`.
+    ///
+    /// `initial_segment_number` is set to the new segment number so that
+    /// [`Self::estimated_buffer_level_ms`] counts from zero at the new
+    /// position.  For `SegmentTimeline` (`$Time$`) tracks `next_segment_time`
+    /// is reset to `None` so the timeline walk restarts from the correct
+    /// entry.  For `SegmentBase` tracks the `sidx` index is cleared and
+    /// will be re-fetched on the next [`Self::fetch_next_segment`] call.
+    ///
+    /// # After seeking
+    ///
+    /// Call [`Self::notify_playing`] once the renderer has completed its seek
+    /// so that the wall-clock used by `estimated_buffer_level_ms` and
+    /// `estimated_playback_position_s` restarts from the new position.
+    ///
+    /// # Returns
+    ///
+    /// The snapped position in seconds (start of the segment the seek landed
+    /// in).  This may differ slightly from `position_s` due to segment
+    /// boundaries.
+    pub fn seek_to(&mut self, position_s: f64) -> f64 {
+        let position_s = position_s.max(0.0);
+
+        let mut snapped_s: f64 = position_s;
+
+        for track in [self.video_track.as_mut(), self.audio_track.as_mut()]
+            .into_iter()
+            .flatten()
+        {
+            let seg_dur_s = track.segment_duration_ms / 1_000.0;
+            let offset_segs = if seg_dur_s > 0.0 {
+                (position_s / seg_dur_s).floor() as u64
+            } else {
+                0
+            };
+
+            let new_seg = track.start_number + offset_segs;
+
+            // Clamp to declared total, if known.
+            let new_seg = if let Some(total) = track.total_segments {
+                new_seg.min(track.start_number + total.saturating_sub(1))
+            } else {
+                new_seg
+            };
+
+            // For SegmentList the start_number is the raw array index base
+            // (usually 0); arithmetic is the same.
+            let new_seg = new_seg.max(track.start_number);
+
+            // Reset per-addressing-mode state.
+            track.next_segment_time = None; // Timeline: restart walk from new entry
+            if matches!(track.addressing_mode, AddressingMode::Base { .. }) {
+                track.segment_byte_ranges = None; // sidx will be re-fetched
+            }
+
+            track.segment_number = new_seg;
+            // Reset the buffer-level baseline so estimates count from zero at
+            // the new position.
+            track.initial_segment_number = new_seg;
+
+            let snapped_offset = new_seg.saturating_sub(track.start_number);
+            snapped_s = snapped_offset as f64 * seg_dur_s;
+        }
+
+        tracing::info!(
+            requested_s = position_s,
+            snapped_s,
+            "DashSession::seek_to"
+        );
+        self.gap_controller.on_seek();
+        snapped_s
     }
 
     // ── Live stream ───────────────────────────────────────────────────────────
@@ -1905,12 +2067,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
 
         // Fetch init segments for the new period's tracks.
+        // Bracket with the gap-controller guard so that gap-jump detection is
+        // suppressed while the source buffer is being replaced — mirroring the
+        // BUFFER_REPLACEMENT_STARTED / TRACK_CHANGE_RENDERED event pair in
+        // dash.js's GapController.js.
+        self.gap_controller.on_track_switch_started();
         if self.video_track.is_some() {
             self.fetch_init_segment(MediaType::Video).await?;
         }
         if self.audio_track.is_some() {
             self.fetch_init_segment(MediaType::Audio).await?;
         }
+        self.gap_controller.on_track_switch_ended();
 
         Ok(true)
     }

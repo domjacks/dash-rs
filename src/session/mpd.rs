@@ -71,16 +71,40 @@ pub(super) fn merge_segment_templates(
     Some(merged)
 }
 
-/// Return a reference to the first adaptation set matching `media_type`
+/// Return a reference to the best-matching adaptation set for `media_type`
 /// within `period`.
+///
+/// **Video**: returns the first video `AdaptationSet` (there is almost always
+/// only one).
+///
+/// **Audio**: when multiple audio `AdaptationSet`s are present (e.g. a stream
+/// that offers both AAC-HE at low bitrates and AAC-LC at high bitrates), the
+/// one whose representations have the **highest maximum bandwidth** is chosen.
+/// This ensures that high-quality codec tiers (e.g. `mp4a.40.2` at 320 kbps)
+/// are preferred over lower-quality fallback tiers (e.g. `mp4a.40.5` at
+/// 96 kbps).  When all candidates have equal or unknown bandwidths, the first
+/// matching `AdaptationSet` is returned (preserving prior behaviour).
 pub(super) fn find_adaptation<'a>(
     period: &'a Period,
     media_type: &MediaType,
 ) -> Option<&'a AdaptationSet> {
-    period.adaptations.iter().find(|a| match media_type {
-        MediaType::Video => dash_mpd::is_video_adaptation(a),
-        MediaType::Audio => dash_mpd::is_audio_adaptation(a),
-    })
+    match media_type {
+        MediaType::Video => period
+            .adaptations
+            .iter()
+            .find(dash_mpd::is_video_adaptation),
+        MediaType::Audio => period
+            .adaptations
+            .iter()
+            .filter(dash_mpd::is_audio_adaptation)
+            .max_by_key(|a| {
+                a.representations
+                    .iter()
+                    .filter_map(|r| r.bandwidth)
+                    .max()
+                    .unwrap_or(0)
+            }),
+    }
 }
 
 /// Extract `(start_number, segment_duration_ms, total_segments)` from the
