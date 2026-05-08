@@ -35,7 +35,7 @@ cargo run --features sink-gstreamer --example gstreamer_player
 cargo run --features sink-gstreamer --example gstreamer_player -- https://your-stream/manifest.mpd
 
 # WASM player (requires wasm-pack)
-wasm-pack build examples/wasm_player --target web --out-dir pkg
+wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player/pkg
 # Then serve examples/wasm_player/ with any static file server, e.g.:
 #   python3 -m http.server 8080
 # and open http://localhost:8080
@@ -322,7 +322,8 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
-| WASM player example (`WasmClock`, `WasmSegmentFetcher`, `WasmMediaSource`) | `examples/wasm_player/src/lib.rs` |
+| WASM player example (`JsBridge`, `BridgeClock`, `BridgeFetcher`, `BridgeMediaSource`, `BridgeSourceBuffer`, `play`) | `examples/wasm_player/src/lib.rs` |
+| WASM player browser bridge + UI wiring | `examples/wasm_player/player.js` |
 
 ---
 

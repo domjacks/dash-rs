@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>dash-rs WASM player</title>
   <style>
-    * { box-sizing: border-box; margin: 0; padding: 0; }
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: system-ui, sans-serif;
       background: #111;
@@ -56,6 +56,43 @@
       text-align: center;
     }
     #status.error { color: #f55; }
+
+    /* On-screen API call log */
+    #log-section {
+      width: 100%;
+      max-width: 900px;
+    }
+    #log-section h2 {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.4rem;
+    }
+    #api-log {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 0.6rem 0.8rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      line-height: 1.6;
+      height: 220px;
+      overflow-y: auto;
+      color: #ccc;
+    }
+    /* Web API bridge calls — coloured by category */
+    #api-log .cat-mse   { color: #5bf; }
+    #api-log .cat-fetch { color: #8d8; }
+    #api-log .cat-clock { color: #fa8; }
+    #api-log .cat-util  { color: #aaa; }
+    /* Rust tracing / console output — coloured by severity level */
+    #api-log .level-log   { color: #ccc; }
+    #api-log .level-info  { color: #ccc; }
+    #api-log .level-warn  { color: #fb3; }
+    #api-log .level-error { color: #f55; }
+    #api-log .level-debug { color: #555; }
   </style>
 </head>
 <body>
@@ -75,47 +112,23 @@
 
   <div id="status">Loading WASM module…</div>
 
+  <section id="log-section">
+    <h2>Player log</h2>
+    <div id="api-log"></div>
+  </section>
+
   <!--
     wasm-pack build --target web outputs:
-      pkg/wasm_player.js       ES module (glue)
+      pkg/wasm_player.js       ES module glue
       pkg/wasm_player_bg.wasm  compiled WASM binary
 
-    Build command (from workspace root):
+    Build (from workspace root):
       wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player/pkg
+
+    player.js contains the bridge object (all MSE + Fetch Web API calls) and
+    the UI wiring.  WASM drives the DASH logic and calls bridge methods for
+    every browser interaction.
   -->
-  <script type="module">
-    import init, { play } from './pkg/wasm_player.js';
-
-    const status = document.getElementById('status');
-    const form   = document.getElementById('form');
-    const input  = document.getElementById('url-input');
-
-    // Pre-fill URL from query string if present.
-    const searchUrl = new URLSearchParams(window.location.search).get('url');
-    if (searchUrl) input.value = searchUrl;
-
-    // Initialise the WASM module (loads + compiles the .wasm binary).
-    await init();
-    status.textContent = 'Ready. Enter a manifest URL and press Play.';
-
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const url = input.value.trim();
-      if (!url) return;
-
-      status.className = '';
-      status.textContent = `Starting playback: ${url}`;
-
-      try {
-        // play() runs the full fetch loop and resolves when EOS is reached.
-        await play(url);
-        status.textContent = 'Playback complete.';
-      } catch (err) {
-        status.className   = 'error';
-        status.textContent = `Error: ${err}`;
-        console.error('dash-rs error:', err);
-      }
-    });
-  </script>
+  <script type="module" src="./player.js"></script>
 </body>
 </html>

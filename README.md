@@ -302,16 +302,22 @@ Video representations (sorted by bandwidth):
 
 ### `wasm_player` — browser playback via WebAssembly
 
-Runs the full MPEG-DASH session in the browser using the native MSE
-(`MediaSource` / `SourceBuffer`) and Fetch APIs.  Implements
-[`WasmClock`], [`WasmSegmentFetcher`], [`WasmSourceBuffer`], and
-[`WasmMediaSource`] — all in `examples/wasm_player/src/lib.rs`.
+Runs the full MPEG-DASH session in the browser.  The architecture is a
+**JS-bridge**: all browser Web API calls (MSE, Fetch, clocks) live in
+`examples/wasm_player/player.js` as an annotated `bridge` object.  WASM calls
+bridge methods via the `JsBridge` extern type in `src/lib.rs`; Rust never
+touches browser objects directly.  Reading `player.js` top-to-bottom shows the
+complete set of Web APIs involved in MPEG-DASH playback.
+
+An on-screen **player log** panel shows all output colour-coded by source:
+- Bridge calls: coloured by Web API category (MSE = blue, Fetch = green, …)
+- Rust `tracing` output from WASM: coloured by severity level (warn = amber, error = red, …)
 
 **Prerequisites:** `wasm-pack` (`cargo install wasm-pack`)
 
 ```bash
-# Build the WASM module into examples/wasm_player/pkg/
-wasm-pack build examples/wasm_player --target web --out-dir pkg
+# Build the WASM module (from workspace root)
+wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player/pkg
 
 # Serve the player with any static file server
 python3 -m http.server 8080 --directory examples/wasm_player
@@ -399,7 +405,7 @@ tracing_subscriber::fmt()
 ```
 DashSession
 ├── ManifestLoader ──── SegmentFetcher (trait) ←── StubSegmentFetcher
-│       └── quick-xml + serde (pure-Rust MPD parser)   └── WasmSegmentFetcher  (wasm_player)
+│       └── quick-xml + serde (pure-Rust MPD parser)   └── BridgeFetcher       (wasm_player)
 │                                              └── HttpSegmentFetcher  (http_fetch example)
 ├── AbrController
 │   ├── ThroughputRule
@@ -408,8 +414,8 @@ DashSession
 │   └── SwitchHistoryRule
 └── SourceBufferSink (per track)
         └── SourceBuffer (trait) ←── StubSourceBuffer
-                                 └── WasmSourceBuffer  (wasm_player)
-                                 └── GstSourceBuffer   (sink-gstreamer feature)
+                                 └── BridgeSourceBuffer  (wasm_player)
+                                 └── GstSourceBuffer     (sink-gstreamer feature)
                                  └── (your implementation)
 
 GapController  (owned by DashSession; caller drives via session.tick_gap())

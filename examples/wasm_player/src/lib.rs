@@ -1,13 +1,39 @@
-//! WASM player example for dash-rs.
+//! WASM player example for dash-rs — JS-bridge architecture.
 //!
-//! Provides browser-native implementations of:
+//! All browser Web API calls live in the JavaScript layer (`index.html`).
+//! Rust/WASM drives the DASH logic (ABR, manifest parsing, segment scheduling)
+//! and calls out to JS for every browser interaction via the [`JsBridge`]
+//! extern type.
 //!
-//! | Trait | Type | Backing API |
+//! # API surface visible in JavaScript
+//!
+//! | Category | Web API | JS bridge method |
 //! |---|---|---|
-//! | [`Clock`] | [`WasmClock`] | `performance.now()` / `Date.now()` |
-//! | [`SegmentFetcher`] | [`WasmSegmentFetcher`] | `window.fetch()` |
-//! | [`SourceBuffer`] | [`WasmSourceBuffer`] | `MSE SourceBuffer` |
-//! | [`MediaSource`] | [`WasmMediaSource`] | `MSE MediaSource` |
+//! | Clock | `performance.now()` | `bridge.nowMs()` |
+//! | Clock | `Date.now()` | `bridge.unixNowS()` |
+//! | Utility | `setTimeout()` | `bridge.sleep(ms)` |
+//! | MSE | `new MediaSource()` | `bridge.setupMediaSource()` |
+//! | MSE | `URL.createObjectURL()` | `bridge.setupMediaSource()` |
+//! | MSE | `video.src = objectUrl` | `bridge.setupMediaSource()` |
+//! | MSE | `sourceopen` event | `bridge.setupMediaSource()` |
+//! | MSE | `mediaSource.readyState` | `bridge.getReadyState()` |
+//! | MSE | `mediaSource.duration` | `bridge.getDuration()` / `setDuration()` |
+//! | MSE | `mediaSource.addSourceBuffer()` | `bridge.addSourceBuffer()` |
+//! | MSE | `mediaSource.removeSourceBuffer()` | `bridge.removeSourceBuffer()` |
+//! | MSE | `mediaSource.endOfStream()` | `bridge.endOfStream()` |
+//! | MSE | `URL.revokeObjectURL()` | `bridge.close()` |
+//! | MSE | `sourceBuffer.appendBuffer()` | `bridge.appendBuffer()` |
+//! | MSE | `updateend` event | `bridge.appendBuffer()` |
+//! | MSE | `sourceBuffer.remove()` | `bridge.removeRange()` |
+//! | MSE | `sourceBuffer.abort()` | `bridge.abortBuffer()` |
+//! | MSE | `sourceBuffer.changeType()` | `bridge.changeType()` |
+//! | MSE | `sourceBuffer.buffered` | `bridge.getBuffered()` |
+//! | MSE | `sourceBuffer.updating` | `bridge.isUpdating()` |
+//! | MSE | `sourceBuffer.timestampOffset` | `bridge.getTimestampOffset()` / `setTimestampOffset()` |
+//! | MSE | `sourceBuffer.appendWindowStart/End` | `bridge.getAppendWindowStart/End()` / `set*()` |
+//! | Fetch | `fetch()` | `bridge.fetchBytes()` |
+//! | Fetch | `response.arrayBuffer()` | `bridge.fetchBytes()` |
+//! | Fetch | `fetch()` HEAD | `bridge.checkExists()` |
 //!
 //! # Build
 //!
@@ -15,20 +41,16 @@
 //! wasm-pack build examples/wasm_player --target web --out-dir pkg
 //! ```
 //!
-//! Then serve the directory containing `index.html` with any static file server,
-//! e.g. `python3 -m http.server 8080`, and open `http://localhost:8080`.
-//!
-//! Pass a custom manifest URL via the `?url=…` query parameter.
+//! Serve `examples/wasm_player/` with any static file server and open
+//! `index.html` in a browser.  The browser DevTools console and the on-screen
+//! API log both show every Web API call as it happens.
 
-use std::{
-    cell::RefCell,
-    rc::Rc,
-    sync::Arc,
-};
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use js_sys::Uint8Array;
+use js_sys::{Float64Array, Promise, Uint8Array};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -42,41 +64,20 @@ use dash_rs::{
     DashError,
 };
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── JS error helper ───────────────────────────────────────────────────────────
 
-/// Yield to the JavaScript event loop for `ms` milliseconds.
-///
-/// Used to poll `SourceBuffer.updating` and `MediaSource.readyState` while
-/// waiting for browser callbacks to fire.
-async fn sleep_ms(ms: i32) {
-    let promise = js_sys::Promise::new(&mut |resolve, _reject| {
-        web_sys::window()
-            .expect("no window")
-            .set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, ms)
-            .expect("set_timeout failed");
-    });
-    let _ = JsFuture::from(promise).await;
-}
-
-/// Map a `JsValue` error to a `String` for reporting.
-///
-/// `JSON.stringify` on a `DOMException` returns `{}` because its properties
-/// are non-enumerable.  We therefore try the `.name` and `.message` properties
-/// first via `Reflect.get`, which works on any JS object.
+/// Format a `JsValue` (which may be a `DOMException`, `Error`, or plain value)
+/// into a human-readable string.
 fn js_err(val: JsValue) -> String {
-    // Fast path: already a string.
     if let Some(s) = val.as_string() {
         return s;
     }
-
-    // Try to extract `.name` and `.message` (present on Error and DOMException).
     let name = js_sys::Reflect::get(&val, &JsValue::from_str("name"))
         .ok()
         .and_then(|v| v.as_string());
     let message = js_sys::Reflect::get(&val, &JsValue::from_str("message"))
         .ok()
         .and_then(|v| v.as_string());
-
     match (name, message) {
         (Some(n), Some(m)) if !m.is_empty() => format!("{n}: {m}"),
         (Some(n), _) if !n.is_empty()       => n,
@@ -88,320 +89,274 @@ fn js_err(val: JsValue) -> String {
     }
 }
 
-// ── WasmClock ─────────────────────────────────────────────────────────────────
+// ── JsBridge extern type ──────────────────────────────────────────────────────
 
-/// [`Clock`] implementation backed by the browser's `performance.now()` and
-/// `Date.now()`.
+/// The JavaScript bridge object passed from `index.html`.
 ///
-/// Only stores a plain `f64` so it is `Send + Sync` (required by the trait
-/// bound) even though WASM has a single-threaded execution model.
-pub struct WasmClock {
-    /// `performance.now()` value recorded at construction time, used to
-    /// convert absolute `performance.now()` readings into relative
-    /// milliseconds.
+/// Every browser Web API call that dash-rs needs goes through one of these
+/// methods.  The JavaScript implementation of each method is the educational
+/// reference — open `index.html` to read the exact Web API calls.
+///
+/// Methods that can throw synchronously use `#[wasm_bindgen(catch)]` so that
+/// JavaScript exceptions surface as `Result::Err` in Rust rather than panics.
+/// Methods that return a `Promise` surface errors via the rejected branch of
+/// [`JsFuture`].
+#[wasm_bindgen]
+extern "C" {
+    pub type JsBridge;
+
+    // ── Clock ─────────────────────────────────────────────────────────────
+    // performance.now() — monotonic milliseconds since navigation start.
+    #[wasm_bindgen(method, js_name = nowMs)]
+    fn now_ms(this: &JsBridge) -> f64;
+
+    // Date.now() / 1000 — seconds since Unix epoch.
+    #[wasm_bindgen(method, js_name = unixNowS)]
+    fn unix_now_s(this: &JsBridge) -> f64;
+
+    // ── Utility ───────────────────────────────────────────────────────────
+    // new Promise(r => setTimeout(r, ms))
+    #[wasm_bindgen(method)]
+    fn sleep(this: &JsBridge, ms: f64) -> Promise;
+
+    // ── MediaSource lifecycle ─────────────────────────────────────────────
+    // new MediaSource() + URL.createObjectURL() + video.src= + sourceopen
+    #[wasm_bindgen(method, js_name = setupMediaSource)]
+    fn setup_media_source(this: &JsBridge) -> Promise;
+
+    // mediaSource.readyState  →  "open" | "ended" | "closed"
+    #[wasm_bindgen(method, js_name = getReadyState)]
+    fn get_ready_state(this: &JsBridge) -> String;
+
+    // mediaSource.duration
+    #[wasm_bindgen(method, js_name = getDuration)]
+    fn get_duration(this: &JsBridge) -> f64;
+
+    // mediaSource.duration = d
+    #[wasm_bindgen(method, catch, js_name = setDuration)]
+    fn set_duration(this: &JsBridge, d: f64) -> Result<(), JsValue>;
+
+    // mediaSource.addSourceBuffer(mimeType)  →  opaque buffer id
+    #[wasm_bindgen(method, catch, js_name = addSourceBuffer)]
+    fn add_source_buffer(this: &JsBridge, mime_type: &str) -> Result<String, JsValue>;
+
+    // mediaSource.removeSourceBuffer(sourceBuffers[id])
+    #[wasm_bindgen(method, catch, js_name = removeSourceBuffer)]
+    fn remove_source_buffer_by_id(this: &JsBridge, sb_id: &str) -> Result<(), JsValue>;
+
+    // mediaSource.endOfStream()
+    #[wasm_bindgen(method, catch, js_name = endOfStream)]
+    fn end_of_stream(this: &JsBridge) -> Result<(), JsValue>;
+
+    // URL.revokeObjectURL(objectUrl)
+    #[wasm_bindgen(method, js_name = close)]
+    fn close_bridge(this: &JsBridge);
+
+    // ── SourceBuffer operations ────────────────────────────────────────────
+    // sb.appendBuffer(data)  +  updateend event  →  Promise<void>
+    #[wasm_bindgen(method, js_name = appendBuffer)]
+    fn append_buffer(this: &JsBridge, sb_id: &str, data: &Uint8Array) -> Promise;
+
+    // sb.remove(start, end)  +  updateend event  →  Promise<void>
+    #[wasm_bindgen(method, js_name = removeRange)]
+    fn remove_range(this: &JsBridge, sb_id: &str, start: f64, end: f64) -> Promise;
+
+    // sb.abort()
+    #[wasm_bindgen(method, catch, js_name = abortBuffer)]
+    fn abort_buffer(this: &JsBridge, sb_id: &str) -> Result<(), JsValue>;
+
+    // sb.changeType(mimeType)
+    #[wasm_bindgen(method, catch, js_name = changeType)]
+    fn change_type(this: &JsBridge, sb_id: &str, mime_type: &str) -> Result<(), JsValue>;
+
+    // sb.buffered  →  flat Float64Array [start0, end0, start1, end1, …]
+    #[wasm_bindgen(method, js_name = getBuffered)]
+    fn get_buffered(this: &JsBridge, sb_id: &str) -> Float64Array;
+
+    // sb.updating
+    #[wasm_bindgen(method, js_name = isUpdating)]
+    fn is_updating(this: &JsBridge, sb_id: &str) -> bool;
+
+    // sb.timestampOffset
+    #[wasm_bindgen(method, js_name = getTimestampOffset)]
+    fn get_timestamp_offset(this: &JsBridge, sb_id: &str) -> f64;
+
+    #[wasm_bindgen(method, js_name = setTimestampOffset)]
+    fn set_timestamp_offset(this: &JsBridge, sb_id: &str, offset: f64);
+
+    // sb.appendWindowStart
+    #[wasm_bindgen(method, js_name = getAppendWindowStart)]
+    fn get_append_window_start(this: &JsBridge, sb_id: &str) -> f64;
+
+    #[wasm_bindgen(method, js_name = setAppendWindowStart)]
+    fn set_append_window_start(this: &JsBridge, sb_id: &str, start: f64);
+
+    // sb.appendWindowEnd
+    #[wasm_bindgen(method, js_name = getAppendWindowEnd)]
+    fn get_append_window_end(this: &JsBridge, sb_id: &str) -> f64;
+
+    #[wasm_bindgen(method, js_name = setAppendWindowEnd)]
+    fn set_append_window_end(this: &JsBridge, sb_id: &str, end: f64);
+
+    // ── Fetch API ──────────────────────────────────────────────────────────
+    // fetch(url, {mode:'cors', headers:{'Range':…}})  →  Promise<FetchResult>
+    // FetchResult = { data: Uint8Array, finalUrl: string, durationMs: number }
+    #[wasm_bindgen(method, js_name = fetchBytes)]
+    fn fetch_bytes(this: &JsBridge, url: &str, range_header: Option<String>) -> Promise;
+
+    // fetch(url, {method:'HEAD'})  →  Promise<bool>
+    #[wasm_bindgen(method, js_name = checkExists)]
+    fn check_exists(this: &JsBridge, url: &str) -> Promise;
+}
+
+// ── FetchResult extern type ───────────────────────────────────────────────────
+
+/// Typed accessors for the plain JS object `{ data, finalUrl, durationMs }`
+/// returned by `bridge.fetchBytes()`.
+#[wasm_bindgen]
+extern "C" {
+    type FetchResult;
+
+    #[wasm_bindgen(method, getter)]
+    fn data(this: &FetchResult) -> Uint8Array;
+
+    #[wasm_bindgen(method, getter, js_name = finalUrl)]
+    fn final_url(this: &FetchResult) -> String;
+
+    #[wasm_bindgen(method, getter, js_name = durationMs)]
+    fn duration_ms(this: &FetchResult) -> f64;
+}
+
+// ── BridgeClock ───────────────────────────────────────────────────────────────
+
+/// [`Clock`] implementation that calls `performance.now()` and `Date.now()`
+/// via the JS bridge.
+///
+/// Stores `start_ms` (captured at construction) so that [`Clock::now_ms`]
+/// returns elapsed time rather than an absolute `performance.now()` value.
+struct BridgeClock {
+    bridge:   JsBridge,
     start_ms: f64,
 }
 
-impl WasmClock {
-    /// Create a new clock anchored at the current instant.
-    pub fn new() -> Self {
-        let start_ms = web_sys::window()
-            .and_then(|w| w.performance())
-            .map(|p| p.now())
-            .unwrap_or(0.0);
-        Self { start_ms }
-    }
-
-    /// Convenience constructor that wraps `self` in an `Arc`.
-    pub fn arc() -> Arc<Self> {
-        Arc::new(Self::new())
+impl BridgeClock {
+    fn new(bridge: JsBridge) -> Arc<Self> {
+        let start_ms = bridge.now_ms();
+        Arc::new(Self { bridge, start_ms })
     }
 }
 
-impl Default for WasmClock {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+// Safety: WASM is single-threaded.  `JsBridge` is a JS reference-counted
+// handle that is never accessed from multiple threads simultaneously.
+unsafe impl Send for BridgeClock {}
+unsafe impl Sync for BridgeClock {}
 
-// Safety: WASM is single-threaded; `WasmClock` only holds a plain `f64`.
-unsafe impl Send for WasmClock {}
-unsafe impl Sync for WasmClock {}
-
-impl Clock for WasmClock {
-    /// Monotonic elapsed time in milliseconds since this clock was created.
+impl Clock for BridgeClock {
+    /// Monotonic milliseconds elapsed since this clock was created.
     fn now_ms(&self) -> f64 {
-        let current = web_sys::window()
-            .and_then(|w| w.performance())
-            .map(|p| p.now())
-            .unwrap_or(0.0);
-        current - self.start_ms
+        self.bridge.now_ms() - self.start_ms
     }
 
-    /// Current UTC time as seconds since the Unix epoch (`Date.now() / 1000`).
+    /// Seconds since the Unix epoch (`Date.now() / 1000`).
     fn unix_s(&self) -> f64 {
-        js_sys::Date::now() / 1_000.0
+        self.bridge.unix_now_s()
     }
 }
 
-// ── WasmSegmentFetcher ────────────────────────────────────────────────────────
+// ── BridgeSourceBuffer ────────────────────────────────────────────────────────
 
-/// [`SegmentFetcher`] implementation backed by the browser's `window.fetch()`
-/// API.
+/// [`SourceBuffer`] implementation that delegates every operation to the JS
+/// bridge.
 ///
-/// Supports optional byte-range requests via the `Range:` HTTP header.  All
-/// fetches use CORS mode so cross-origin streams are supported when the server
-/// sends appropriate `Access-Control-Allow-Origin` headers.
-pub struct WasmSegmentFetcher;
-
-#[async_trait(?Send)]
-impl SegmentFetcher for WasmSegmentFetcher {
-    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
-        let opts = web_sys::RequestInit::new();
-        opts.set_method("GET");
-        opts.set_mode(web_sys::RequestMode::Cors);
-
-        // Attach a Range header for byte-range sub-requests (SegmentBase /
-        // SegmentList with @mediaRange).
-        if let Some((start, end)) = request.byte_range {
-            let headers = web_sys::Headers::new()
-                .map_err(|_| FetchError::Network {
-                    url: request.url.clone(),
-                    message: "failed to create Headers".to_owned(),
-                })?;
-            headers
-                .set("Range", &format!("bytes={}-{}", start, end))
-                .map_err(|_| FetchError::Network {
-                    url: request.url.clone(),
-                    message: "failed to set Range header".to_owned(),
-                })?;
-            opts.set_headers_headers(&headers);
-        }
-
-        let js_request =
-            web_sys::Request::new_with_str_and_init(request.url.as_str(), &opts).map_err(|_| {
-                FetchError::InvalidUrl(request.url.to_string())
-            })?;
-
-        let window = web_sys::window().expect("no window");
-
-        // Record wall-clock start for throughput measurement.
-        let t0 = window
-            .performance()
-            .map(|p| p.now())
-            .unwrap_or(0.0);
-
-        let resp_value = JsFuture::from(window.fetch_with_request(&js_request))
-            .await
-            .map_err(|e| FetchError::Network {
-                url: request.url.clone(),
-                message: js_err(e),
-            })?;
-
-        let resp: web_sys::Response = resp_value.dyn_into().map_err(|_| FetchError::Network {
-            url: request.url.clone(),
-            message: "response is not a Response object".to_owned(),
-        })?;
-
-        let status = resp.status();
-        if !resp.ok() {
-            return Err(FetchError::Http {
-                status,
-                url: request.url,
-            });
-        }
-
-        // Capture the final URL (after any redirects) before consuming the body.
-        let final_url = Url::parse(resp.url().as_str()).unwrap_or_else(|_| request.url.clone());
-
-        // Read the body as an ArrayBuffer.
-        let body_promise = resp.array_buffer().map_err(|e| FetchError::Network {
-            url: final_url.clone(),
-            message: js_err(e),
-        })?;
-        let array_buf = JsFuture::from(body_promise)
-            .await
-            .map_err(|e| FetchError::Network {
-                url: final_url.clone(),
-                message: js_err(e),
-            })?;
-
-        let uint8_array = Uint8Array::new(&array_buf);
-        let data = Bytes::from(uint8_array.to_vec());
-
-        let t1 = web_sys::window()
-            .and_then(|w| w.performance())
-            .map(|p| p.now())
-            .unwrap_or(t0);
-        let transfer_duration_ms = (t1 - t0).max(0.0) as u64;
-        let bytes_received = data.len() as u64;
-
-        Ok(FetchResponse {
-            final_url,
-            data,
-            transfer_duration_ms,
-            bytes_received,
-        })
-    }
-
-    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let opts = web_sys::RequestInit::new();
-        opts.set_method("HEAD");
-        opts.set_mode(web_sys::RequestMode::Cors);
-
-        let js_request = web_sys::Request::new_with_str_and_init(url.as_str(), &opts)
-            .map_err(|_| FetchError::InvalidUrl(url.to_string()))?;
-
-        let window = web_sys::window().expect("no window");
-        let resp_value = JsFuture::from(window.fetch_with_request(&js_request))
-            .await
-            .map_err(|e| FetchError::Network {
-                url: url.clone(),
-                message: js_err(e),
-            })?;
-
-        let resp: web_sys::Response = resp_value.dyn_into().map_err(|_| FetchError::Network {
-            url: url.clone(),
-            message: "response is not a Response object".to_owned(),
-        })?;
-
-        Ok(resp.ok())
-    }
-
-    fn abort(&self) {
-        // The Fetch API does not expose a global abort handle; dropping the
-        // in-flight future is sufficient to cancel the request in most
-        // browsers when an AbortController is not used.
-    }
-}
-
-// ── WasmSourceBuffer ──────────────────────────────────────────────────────────
-
-/// [`SourceBuffer`] implementation wrapping the browser's MSE `SourceBuffer`.
+/// `sb_id` is the opaque identifier returned by `bridge.addSourceBuffer()`.
+/// The JS side uses it to look up the corresponding browser `SourceBuffer`
+/// object.
 ///
-/// `append_buffer`, `remove`, and `abort` all poll `SourceBuffer.updating`
-/// with a 4 ms `setTimeout` loop rather than registering persistent event
-/// listeners.  This keeps the implementation simple and avoids closure
-/// lifetime complexity at the cost of up to ~4 ms of extra latency per
-/// operation — well within the tolerance for a segment-based player.
-pub struct WasmSourceBuffer {
+/// Append and remove operations return Promises in JS (resolved on the
+/// `updateend` event), so they are event-driven rather than polled — an
+/// improvement over the polling approach used by the previous `web_sys`-based
+/// implementation.
+struct BridgeSourceBuffer {
+    bridge:    JsBridge,
+    sb_id:     String,
     mime_type: String,
-    inner: web_sys::SourceBuffer,
-}
-
-impl WasmSourceBuffer {
-    fn new(mime_type: String, inner: web_sys::SourceBuffer) -> Self {
-        Self { mime_type, inner }
-    }
-
-    /// Convert the browser `TimeRanges` object to a `Vec<TimeRange>`.
-    fn time_ranges_from_js(tr: web_sys::TimeRanges) -> Vec<TimeRange> {
-        let len = tr.length();
-        let mut out = Vec::with_capacity(len as usize);
-        for i in 0..len {
-            // `start()` / `end()` return `Result` in web-sys; ignore bad indices.
-            if let (Ok(s), Ok(e)) = (tr.start(i), tr.end(i)) {
-                out.push(TimeRange::new(s, e));
-            }
-        }
-        out
-    }
-
-    /// Wait until `SourceBuffer.updating` is `false`.
-    async fn wait_not_updating(inner: &web_sys::SourceBuffer) {
-        while inner.updating() {
-            sleep_ms(4).await;
-        }
-    }
 }
 
 #[async_trait(?Send)]
-impl SourceBuffer for WasmSourceBuffer {
+impl SourceBuffer for BridgeSourceBuffer {
     fn mime_type(&self) -> &str {
         &self.mime_type
     }
 
     fn is_updating(&self) -> bool {
-        self.inner.updating()
+        self.bridge.is_updating(&self.sb_id)
     }
 
     fn buffered(&self) -> Vec<TimeRange> {
-        self.inner
-            .buffered()
-            .map(Self::time_ranges_from_js)
-            .unwrap_or_default()
+        // JS returns a flat Float64Array: [start0, end0, start1, end1, …]
+        self.bridge
+            .get_buffered(&self.sb_id)
+            .to_vec()
+            .chunks_exact(2)
+            .map(|c| TimeRange::new(c[0], c[1]))
+            .collect()
     }
 
     fn timestamp_offset(&self) -> f64 {
-        self.inner.timestamp_offset()
+        self.bridge.get_timestamp_offset(&self.sb_id)
     }
 
     fn set_timestamp_offset(&mut self, offset: f64) {
-        // Ignore errors — only possible if the buffer is detached.
-        let _ = self.inner.set_timestamp_offset(offset);
+        self.bridge.set_timestamp_offset(&self.sb_id, offset);
     }
 
     fn append_window_start(&self) -> f64 {
-        self.inner.append_window_start()
+        self.bridge.get_append_window_start(&self.sb_id)
     }
 
     fn set_append_window_start(&mut self, start: f64) {
-        let _ = self.inner.set_append_window_start(start);
+        self.bridge.set_append_window_start(&self.sb_id, start);
     }
 
     fn append_window_end(&self) -> f64 {
-        self.inner.append_window_end()
+        self.bridge.get_append_window_end(&self.sb_id)
     }
 
     fn set_append_window_end(&mut self, end: f64) {
-        let _ = self.inner.set_append_window_end(end);
+        self.bridge.set_append_window_end(&self.sb_id, end);
     }
 
     async fn append_buffer(&mut self, chunk: Chunk) -> Result<(), DashError> {
-        // Serialise: wait for any prior append / remove to finish.
-        Self::wait_not_updating(&self.inner).await;
-
         tracing::debug!(
             mime_type = %self.mime_type,
             label     = %chunk.label,
             bytes     = chunk.data.len(),
-            "WasmSourceBuffer: appendBuffer"
+            "BridgeSourceBuffer: appendBuffer"
         );
-
         let array = Uint8Array::from(chunk.data.as_ref());
-        self.inner
-            .append_buffer_with_array_buffer_view(&array)
+        JsFuture::from(self.bridge.append_buffer(&self.sb_id, &array))
+            .await
             .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-
-        // Wait for `updateend` by polling.
-        Self::wait_not_updating(&self.inner).await;
-
         Ok(())
     }
 
     async fn remove(&mut self, start: f64, end: f64) -> Result<(), DashError> {
-        Self::wait_not_updating(&self.inner).await;
-
         tracing::debug!(
             mime_type = %self.mime_type,
             start,
             end,
-            "WasmSourceBuffer: remove"
+            "BridgeSourceBuffer: remove"
         );
-
-        self.inner
-            .remove(start, end)
+        JsFuture::from(self.bridge.remove_range(&self.sb_id, start, end))
+            .await
             .map_err(|e| DashError::RemoveFailed(js_err(e)))?;
-
-        Self::wait_not_updating(&self.inner).await;
-
         Ok(())
     }
 
     async fn abort(&mut self) -> Result<(), DashError> {
-        tracing::debug!(mime_type = %self.mime_type, "WasmSourceBuffer: abort");
-        self.inner
-            .abort()
+        tracing::debug!(mime_type = %self.mime_type, "BridgeSourceBuffer: abort");
+        self.bridge
+            .abort_buffer(&self.sb_id)
             .map_err(|e| DashError::AppendFailed(js_err(e)))?;
         Ok(())
     }
@@ -410,150 +365,151 @@ impl SourceBuffer for WasmSourceBuffer {
         tracing::debug!(
             old = %self.mime_type,
             new = mime_type,
-            "WasmSourceBuffer: changeType"
+            "BridgeSourceBuffer: changeType"
         );
-        self.inner
-            .change_type(mime_type)
+        self.bridge
+            .change_type(&self.sb_id, mime_type)
             .map_err(|e| DashError::AppendFailed(js_err(e)))?;
         self.mime_type = mime_type.to_owned();
         Ok(())
     }
 }
 
-// ── WasmMediaSource ───────────────────────────────────────────────────────────
+// ── BridgeMediaSource ─────────────────────────────────────────────────────────
 
-/// [`MediaSource`] implementation wrapping the browser's MSE `MediaSource`.
+/// [`MediaSource`] implementation that delegates every operation to the JS
+/// bridge.
 ///
-/// # Lifecycle
-///
-/// 1. Call [`WasmMediaSource::attach`] with a `<video>` element.  This
-///    creates a `MediaSource` object, sets it as the video `src` via an object
-///    URL, and awaits the `sourceopen` event before returning.
-/// 2. Pass the `WasmMediaSource` to [`DashSession::from_url_with_clock`].
-/// 3. The session calls [`add_source_buffer`] for each track and then feeds
-///    segments until [`end_of_stream`] is called.
-pub struct WasmMediaSource {
-    inner: web_sys::MediaSource,
-    /// Object URL created via `URL.createObjectURL(mediaSource)`.  Kept so
-    /// we can call `URL.revokeObjectURL` on `close()`.
-    blob_url: String,
-    /// Tracks (mime_type, SourceBuffer) pairs so `remove_source_buffer` can
-    /// find the right browser `SourceBuffer` without needing `SourceBufferList`.
-    added_buffers: Vec<(String, web_sys::SourceBuffer)>,
+/// `mime_to_id` maps a MIME type string (e.g. `"video/mp4;codecs=avc1…"`) to
+/// the opaque source-buffer ID assigned by `bridge.addSourceBuffer()`, so that
+/// `remove_source_buffer` can find the right browser object by MIME type.
+struct BridgeMediaSource {
+    bridge:     JsBridge,
+    mime_to_id: HashMap<String, String>,
 }
 
-impl WasmMediaSource {
-    /// Create a `MediaSource`, attach it to `video_el`, and wait for
-    /// `sourceopen` before returning.
-    pub async fn attach(video_el: web_sys::HtmlVideoElement) -> Result<Self, JsValue> {
-        let ms = web_sys::MediaSource::new()?;
-
-        // Register a one-shot `sourceopen` listener using a oneshot channel
-        // so we can `.await` it ergonomically.
-        let (tx, rx) = futures::channel::oneshot::channel::<()>();
-        let tx = Rc::new(RefCell::new(Some(tx)));
-        let closure = Closure::once(move || {
-            if let Some(sender) = tx.borrow_mut().take() {
-                let _ = sender.send(());
-            }
-        });
-        ms.set_onsourceopen(Some(closure.as_ref().unchecked_ref()));
-        // `forget()` leaks ~pointer-sized memory once per session, which is
-        // acceptable for a one-shot initialisation callback.
-        closure.forget();
-
-        // Attach to the video element — this triggers the browser to fire
-        // `sourceopen` once the MediaSource is ready.
-        let blob_url = web_sys::Url::create_object_url_with_source(&ms)?;
-        video_el.set_src(&blob_url);
-
-        // Await `sourceopen`.
-        rx.await
-            .map_err(|_| JsValue::from_str("sourceopen channel dropped unexpectedly"))?;
-
-        tracing::info!("WasmMediaSource: sourceopen received — MediaSource is open");
-
-        Ok(Self {
-            inner: ms,
-            blob_url,
-            added_buffers: Vec::new(),
-        })
+impl BridgeMediaSource {
+    fn new(bridge: JsBridge) -> Self {
+        Self { bridge, mime_to_id: HashMap::new() }
     }
 }
 
 #[async_trait(?Send)]
-impl MediaSource for WasmMediaSource {
+impl MediaSource for BridgeMediaSource {
     fn ready_state(&self) -> ReadyState {
-        match self.inner.ready_state() {
-            web_sys::MediaSourceReadyState::Open   => ReadyState::Open,
-            web_sys::MediaSourceReadyState::Ended  => ReadyState::Ended,
-            _                                       => ReadyState::Closed,
+        match self.bridge.get_ready_state().as_str() {
+            "open"  => ReadyState::Open,
+            "ended" => ReadyState::Ended,
+            _       => ReadyState::Closed,
         }
     }
 
     fn duration(&self) -> Option<f64> {
-        let d = self.inner.duration();
-        if d.is_nan() || d < 0.0 {
-            None
-        } else {
-            Some(d)
-        }
+        let d = self.bridge.get_duration();
+        if d.is_nan() || d < 0.0 { None } else { Some(d) }
     }
 
     fn set_duration(&mut self, duration: f64) -> Result<(), DashError> {
-        // set_duration is a plain setter in web-sys (returns ()); JS exceptions
-        // would surface as panics only in debug builds, which is acceptable here.
-        self.inner.set_duration(duration);
-        Ok(())
+        self.bridge
+            .set_duration(duration)
+            .map_err(|e| DashError::AppendFailed(js_err(e)))
     }
 
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
-        tracing::debug!(mime_type, "WasmMediaSource: addSourceBuffer");
-        let sb = self
-            .inner
+        tracing::debug!(mime_type, "BridgeMediaSource: addSourceBuffer");
+        let sb_id = self.bridge
             .add_source_buffer(mime_type)
             .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-        // Keep a handle so we can pass the reference to remove_source_buffer later.
-        self.added_buffers.push((mime_type.to_owned(), sb.clone()));
-        Ok(Box::new(WasmSourceBuffer::new(mime_type.to_owned(), sb)))
+        self.mime_to_id.insert(mime_type.to_owned(), sb_id.clone());
+        Ok(Box::new(BridgeSourceBuffer {
+            bridge:    self.bridge.clone().unchecked_into(),
+            sb_id,
+            mime_type: mime_type.to_owned(),
+        }))
     }
 
     fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
-        if let Some(pos) = self.added_buffers.iter().position(|(m, _)| m == mime_type) {
-            let (_, sb) = self.added_buffers.remove(pos);
-            self.inner
-                .remove_source_buffer(&sb)
-                .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-            tracing::debug!(mime_type, "WasmMediaSource: removeSourceBuffer");
-            Ok(())
-        } else {
-            Err(DashError::SourceBufferNotFound {
-                mime_type: mime_type.to_owned(),
-            })
-        }
+        let sb_id = self.mime_to_id.remove(mime_type).ok_or_else(|| {
+            DashError::SourceBufferNotFound { mime_type: mime_type.to_owned() }
+        })?;
+        self.bridge
+            .remove_source_buffer_by_id(&sb_id)
+            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
+        tracing::debug!(mime_type, "BridgeMediaSource: removeSourceBuffer");
+        Ok(())
     }
 
     async fn end_of_stream(&mut self) -> Result<(), DashError> {
-        tracing::info!("WasmMediaSource: endOfStream");
-        self.inner
+        tracing::info!("BridgeMediaSource: endOfStream");
+        self.bridge
             .end_of_stream()
             .map_err(|e| DashError::AppendFailed(js_err(e)))
     }
 
     fn close(&mut self) {
-        tracing::info!("WasmMediaSource: close");
-        // Revoke the object URL to free browser resources.
-        let _ = web_sys::Url::revoke_object_url(&self.blob_url);
+        tracing::info!("BridgeMediaSource: close — revoking object URL");
+        self.bridge.close_bridge();
+    }
+}
+
+// ── BridgeFetcher ─────────────────────────────────────────────────────────────
+
+/// [`SegmentFetcher`] implementation backed by `window.fetch()` called from
+/// the JS bridge.
+///
+/// Byte-range requests (for `SegmentBase` and `SegmentList` with
+/// `@mediaRange`) pass a `Range: bytes=<start>-<end>` header to JS, where the
+/// explicit `fetch()` call is visible.
+struct BridgeFetcher {
+    bridge: JsBridge,
+}
+
+#[async_trait(?Send)]
+impl SegmentFetcher for BridgeFetcher {
+    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+        let range_header = request
+            .byte_range
+            .map(|(s, e)| format!("bytes={s}-{e}"));
+
+        let resolved = JsFuture::from(
+            self.bridge.fetch_bytes(request.url.as_str(), range_header),
+        )
+        .await
+        .map_err(|e| FetchError::Network {
+            url:     request.url.clone(),
+            message: js_err(e),
+        })?;
+
+        // Cast the resolved JS object to our typed FetchResult accessor.
+        let result: FetchResult = resolved.unchecked_into();
+        let data              = Bytes::from(result.data().to_vec());
+        let bytes_received    = data.len() as u64;
+        let transfer_duration_ms = result.duration_ms() as u64;
+        let final_url         = Url::parse(&result.final_url())
+            .unwrap_or_else(|_| request.url.clone());
+
+        Ok(FetchResponse { final_url, data, transfer_duration_ms, bytes_received })
+    }
+
+    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
+        let ok = JsFuture::from(self.bridge.check_exists(url.as_str()))
+            .await
+            .map_err(|e| FetchError::Network { url: url.clone(), message: js_err(e) })?;
+        Ok(ok.as_bool().unwrap_or(false))
+    }
+
+    fn abort(&self) {
+        // No-op: dropping the in-flight JsFuture cancels the underlying fetch
+        // in most browsers when no AbortController is attached.
     }
 }
 
 // ── WASM entry point ──────────────────────────────────────────────────────────
 
-/// Initialise WASM infrastructure.
+/// Initialise WASM infrastructure (panic hook + tracing).
 ///
-/// Must be called once before any other exported function.  Sets up the
-/// panic hook (so Rust panics appear as proper errors in the browser console)
-/// and configures `tracing-wasm` as the global tracing subscriber.
+/// Called automatically by the WASM module initialiser before any exported
+/// function runs.
 #[wasm_bindgen(start)]
 pub fn init() {
     console_error_panic_hook::set_once();
@@ -562,38 +518,26 @@ pub fn init() {
 
 /// Start MPEG-DASH playback.
 ///
-/// Looks for a `<video id="video">` element in the document, attaches a
-/// `MediaSource`, and runs a continuous segment fetch loop until the stream
-/// ends.
-///
 /// # Arguments
 ///
 /// * `mpd_url` — fully qualified URL to the `.mpd` manifest.
+/// * `bridge`  — JS object that implements every browser Web API that dash-rs
+///   needs.  See `index.html` for the full annotated implementation.
 ///
 /// # Usage from JavaScript
 ///
 /// ```js
 /// import init, { play } from './pkg/wasm_player.js';
 /// await init();
-/// await play('https://example.com/manifest.mpd');
+/// await play('https://example.com/manifest.mpd', bridge);
 /// ```
 #[wasm_bindgen]
-pub async fn play(mpd_url: String) -> Result<(), JsValue> {
-    // ── Find the <video> element ───────────────────────────────────────────
-
-    let window   = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
-    let document = window.document().ok_or_else(|| JsValue::from_str("no document"))?;
-    let video: web_sys::HtmlVideoElement = document
-        .get_element_by_id("video")
-        .ok_or_else(|| JsValue::from_str("no element with id=\"video\""))?
-        .dyn_into()
-        .map_err(|_| JsValue::from_str("#video is not a <video> element"))?;
-
+pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     tracing::info!(mpd_url = %mpd_url, "dash-rs WASM player starting");
 
-    // ── Create & attach MediaSource ────────────────────────────────────────
-
-    let media_source = WasmMediaSource::attach(video)
+    // ── Attach MediaSource to the <video> element ──────────────────────────
+    // JS: new MediaSource() → URL.createObjectURL() → video.src= → sourceopen
+    JsFuture::from(bridge.setup_media_source())
         .await
         .map_err(|e| JsValue::from_str(&js_err(e)))?;
 
@@ -602,13 +546,14 @@ pub async fn play(mpd_url: String) -> Result<(), JsValue> {
     let url = Url::parse(&mpd_url)
         .map_err(|e| JsValue::from_str(&format!("invalid MPD URL: {e}")))?;
 
-    let fetcher = WasmSegmentFetcher;
-    let clock   = WasmClock::arc();
+    // Each struct gets its own clone of the bridge (cheap JS reference copy).
+    let clock   = BridgeClock::new(bridge.clone().unchecked_into());
+    let fetcher = BridgeFetcher { bridge: bridge.clone().unchecked_into() };
+    let ms      = BridgeMediaSource::new(bridge.clone().unchecked_into());
 
-    let mut session =
-        DashSession::from_url_with_clock(&url, fetcher, media_source, clock)
-            .await
-            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let mut session = DashSession::from_url_with_clock(&url, fetcher, ms, clock)
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     tracing::info!(
         has_video = session.has_video(),
@@ -620,10 +565,6 @@ pub async fn play(mpd_url: String) -> Result<(), JsValue> {
     session.notify_playing();
 
     // ── Segment fetch loop ─────────────────────────────────────────────────
-    //
-    // Simple loop: fetch the next video segment, then the next audio segment.
-    // The ABR controller uses initial placeholder metrics; a production player
-    // would measure real throughput from WasmSegmentFetcher and feed it back.
 
     let mut video_done = !session.has_video();
     let mut audio_done = !session.has_audio();
@@ -633,25 +574,20 @@ pub async fn play(mpd_url: String) -> Result<(), JsValue> {
             break;
         }
 
-        // ── Buffer gate (mirrors dash.js ScheduleController) ──────────────
-        // Pause fetching while the buffer is ahead of the target level.
-        while session.estimated_buffer_level_ms(&MediaType::Video)
-            >= session.buffer_target_ms()
-        {
-            sleep_ms(500).await;
+        // Buffer gate: mirrors dash.js ScheduleController.
+        // JS: new Promise(r => setTimeout(r, 500))
+        while session.estimated_buffer_level_ms(&MediaType::Video) >= session.buffer_target_ms() {
+            JsFuture::from(bridge.sleep(500.0)).await.ok();
         }
 
-        // ── Video segment ─────────────────────────────────────────────────
         if !video_done {
             let metrics = session.current_metrics(MediaType::Video);
             match session.fetch_next_segment(MediaType::Video, &metrics).await {
-                Ok(decision) => {
-                    tracing::debug!(
-                        quality_index = decision.index,
-                        reason        = ?decision.reason,
-                        "video segment fetched"
-                    );
-                }
+                Ok(d) => tracing::debug!(
+                    quality_index = d.index,
+                    reason        = ?d.reason,
+                    "video segment fetched"
+                ),
                 Err(DashError::EndOfStream { .. }) => {
                     tracing::info!("video: end of stream");
                     video_done = true;
@@ -660,17 +596,14 @@ pub async fn play(mpd_url: String) -> Result<(), JsValue> {
             }
         }
 
-        // ── Audio segment ─────────────────────────────────────────────────
         if !audio_done {
             let metrics = session.current_metrics(MediaType::Audio);
             match session.fetch_next_segment(MediaType::Audio, &metrics).await {
-                Ok(decision) => {
-                    tracing::debug!(
-                        quality_index = decision.index,
-                        reason        = ?decision.reason,
-                        "audio segment fetched"
-                    );
-                }
+                Ok(d) => tracing::debug!(
+                    quality_index = d.index,
+                    reason        = ?d.reason,
+                    "audio segment fetched"
+                ),
                 Err(DashError::EndOfStream { .. }) => {
                     tracing::info!("audio: end of stream");
                     audio_done = true;
@@ -681,13 +614,12 @@ pub async fn play(mpd_url: String) -> Result<(), JsValue> {
     }
 
     // ── Signal end of stream ───────────────────────────────────────────────
-
+    // JS: mediaSource.endOfStream()
     session
         .end_of_stream()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
     tracing::info!("playback complete — end of stream signalled");
-
     Ok(())
 }
