@@ -61,7 +61,7 @@ async fn main() -> Result<(), DashError> {
     // 2. Parse the MPD and construct a session directly from the parsed MPD.
     //    In a real application you would call `DashSession::from_url` instead.
     let base_url = Url::parse("https://example.com/").unwrap();
-    let mpd: MPD = dash_mpd::parse(EXAMPLE_MPD).map_err(DashError::ManifestParse)?;
+    let mpd: MPD = dash_rs::manifest::parse(EXAMPLE_MPD).map_err(DashError::ManifestParse)?;
 
     let fetcher = Arc::new(StubSegmentFetcher);
     let mut session = DashSession::from_mpd(mpd, base_url, fetcher, media_source)?;

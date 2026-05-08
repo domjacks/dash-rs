@@ -1,3 +1,6 @@
+pub mod mpd_types;
+pub mod parser;
+
 use std::sync::Arc;
 
 use url::Url;
@@ -7,9 +10,9 @@ use crate::{
     fetch::{FetchRequest, RequestType, SegmentFetcher},
 };
 
-// Re-export the MPD root type so callers don't need a direct dash-mpd dep
-// for basic usage.
-pub use dash_mpd::MPD;
+// Re-export the vendored types so callers don't need to reach into sub-modules.
+pub use mpd_types::MPD;
+pub use parser::{parse, MpdParseError};
 
 /// Loads and parses MPEG-DASH manifests from a URL.
 ///
@@ -17,7 +20,7 @@ pub use dash_mpd::MPD;
 /// - Fetches the raw XML text via the provided [`SegmentFetcher`].
 /// - Handles redirect tracking (the `final_url` from the response is used
 ///   as the manifest's base URI for relative segment URL resolution).
-/// - Delegates XML parsing to `dash-mpd::parse`.
+/// - Delegates XML parsing to [`parse`].
 ///
 /// Manifest refreshing (live streams) is the responsibility of the caller
 /// or a higher-level `ManifestUpdater` component.
@@ -52,7 +55,7 @@ impl<F: SegmentFetcher> ManifestLoader<F> {
             "manifest fetched, parsing"
         );
 
-        let mpd = dash_mpd::parse(&text)?;
+        let mpd = parse(&text)?;
 
         tracing::info!(
             url = %base_url,

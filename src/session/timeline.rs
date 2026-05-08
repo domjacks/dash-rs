@@ -6,7 +6,7 @@
 //!
 //! Mirrors `TimelineSegmentsGetter.js` in dash.js.
 
-use dash_mpd::S;
+use crate::manifest::mpd_types::S;
 
 /// Walk a SegmentTimeline's `S` entries and find the segment whose start time
 /// equals `target_time`, or — when `target_time` is `None` — return the very
@@ -96,7 +96,7 @@ pub(super) fn count_timeline_segments(segments: &[S]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{count_timeline_segments, find_timeline_segment};
-    use dash_mpd::S;
+use crate::manifest::mpd_types::S;
 
     fn s(t: Option<u64>, d: u64, r: Option<i64>) -> S {
         S { t, d, r, ..Default::default() }

@@ -13,7 +13,7 @@
 //!
 //! Mirrors `TemplateSegmentsGetter.js` and parts of `URLLoader.js` in dash.js.
 
-use dash_mpd::{AdaptationSet, BaseURL, Period};
+use crate::manifest::mpd_types::{AdaptationSet, BaseURL, Period};
 use url::Url;
 
 /// A resolved CDN candidate URL paired with its blacklist key.

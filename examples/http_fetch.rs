@@ -57,7 +57,7 @@ impl HttpSegmentFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for HttpSegmentFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         let mut builder = self.client.get(request.url.as_str());

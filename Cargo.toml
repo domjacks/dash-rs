@@ -14,16 +14,22 @@ categories = ["multimedia", "network-programming"]
 sink-gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
 
 [dependencies]
-dash-mpd      = "0.20"
-bytes         = "1"
-url           = "2"
-thiserror     = "2"
-async-trait   = "0.1"
-tracing       = "0.1"
-rand          = "0.8"
-tokio         = { version = "1", features = ["time", "sync"] }
-gstreamer     = { version = "0.24", optional = true, features = ["v1_22"] }
-gstreamer-app = { version = "0.24", optional = true }
+quick-xml        = { version = "0.36", features = ["serialize"] }
+serde            = { version = "1", features = ["derive"] }
+bytes            = "1"
+url              = "2"
+thiserror        = "2"
+async-trait      = "0.1"
+tracing          = "0.1"
+rand             = "0.8"
+async-broadcast  = "0.5"
+futures-timer    = "3"
+futures          = { version = "0.3", default-features = false, features = ["std"] }
+gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
+gstreamer-app    = { version = "0.24", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["full"] }

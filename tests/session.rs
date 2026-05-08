@@ -96,7 +96,7 @@ impl MockFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for MockFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         let data = if request.request_type == RequestType::Manifest {
@@ -138,7 +138,7 @@ fn open_stub_source() -> StubMediaSource {
 fn session_from_xml(
     xml: &str,
 ) -> DashSession<dash_rs::fetch::stub::StubSegmentFetcher, StubMediaSource> {
-    let mpd = dash_mpd::parse(xml).expect("MPD parse failed");
+    let mpd = dash_rs::manifest::parse(xml).expect("MPD parse failed");
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     DashSession::from_mpd(mpd, base_url, fetcher, open_stub_source()).expect("from_mpd failed")
@@ -331,7 +331,7 @@ impl RecordingFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for RecordingFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         let data = if request.request_type == RequestType::Manifest {
@@ -952,7 +952,7 @@ impl UtcMockFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for UtcMockFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         let data = match request.request_type {
@@ -1162,7 +1162,7 @@ impl EmsgMockFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for EmsgMockFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         let data = if request.request_type == RequestType::Manifest {
@@ -1327,7 +1327,7 @@ impl TimedSegmentFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for TimedSegmentFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         let (data, transfer_ms) = if request.request_type == RequestType::Manifest {
@@ -1668,7 +1668,7 @@ impl SegmentBaseFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for SegmentBaseFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         self.log
@@ -2330,7 +2330,7 @@ impl RoutesFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for RoutesFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         if request.request_type != RequestType::Manifest {
@@ -2548,7 +2548,7 @@ impl CdnFetcher {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for CdnFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         if request.request_type == RequestType::Manifest {
@@ -2661,7 +2661,7 @@ async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
         attempted: Arc<Mutex<Vec<String>>>,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl SegmentFetcher for AllBlacklistedFetcher {
         async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
             if request.request_type == RequestType::Manifest {

@@ -17,7 +17,7 @@
 
 use url::Url;
 
-use dash_mpd::{AdaptationSet, MPD, Period};
+use crate::manifest::mpd_types::{AdaptationSet, MPD, Period};
 
 use crate::{
     error::DashError,
@@ -259,7 +259,7 @@ async fn fetch_text<F: SegmentFetcher>(
 /// in a synthetic MPD envelope.
 fn parse_periods(xml: &str) -> Option<Vec<Period>> {
     // First try: the resource is already a complete MPD.
-    if let Ok(mpd) = dash_mpd::parse(xml) {
+    if let Ok(mpd) = crate::manifest::parse(xml) {
         if !mpd.periods.is_empty() {
             return Some(mpd.periods);
         }
@@ -270,7 +270,7 @@ fn parse_periods(xml: &str) -> Option<Vec<Period>> {
     let wrapped = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011">{xml}</MPD>"#
     );
-    let mpd = dash_mpd::parse(&wrapped).ok()?;
+    let mpd = crate::manifest::parse(&wrapped).ok()?;
     if mpd.periods.is_empty() {
         return None;
     }
@@ -280,10 +280,10 @@ fn parse_periods(xml: &str) -> Option<Vec<Period>> {
 /// Parse a remote resource as one or more `<AdaptationSet>` elements.
 ///
 /// Wrapped inside a synthetic `<MPD><Period>…</Period></MPD>` so that
-/// `dash_mpd::parse()` can deserialise a bare AdaptationSet fragment.
+/// `crate::manifest::parse()` can deserialise a bare AdaptationSet fragment.
 fn parse_adaptation_sets(xml: &str) -> Option<Vec<AdaptationSet>> {
     // First try: maybe the resource is a full MPD (unusual, but be lenient).
-    if let Ok(mpd) = dash_mpd::parse(xml) {
+    if let Ok(mpd) = crate::manifest::parse(xml) {
         if let Some(p) = mpd.periods.into_iter().next() {
             if !p.adaptations.is_empty() {
                 return Some(p.adaptations);
@@ -295,7 +295,7 @@ fn parse_adaptation_sets(xml: &str) -> Option<Vec<AdaptationSet>> {
     let wrapped = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?><MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period>{xml}</Period></MPD>"#
     );
-    let mpd = dash_mpd::parse(&wrapped).ok()?;
+    let mpd = crate::manifest::parse(&wrapped).ok()?;
     let period = mpd.periods.into_iter().next()?;
     if period.adaptations.is_empty() {
         return None;

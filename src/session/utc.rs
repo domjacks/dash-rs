@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use dash_mpd::MPD;
+use crate::manifest::mpd_types::MPD;
 use url::Url;
 
 use crate::{

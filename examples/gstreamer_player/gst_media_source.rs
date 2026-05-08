@@ -94,7 +94,7 @@ impl GstSourceBuffer {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SourceBuffer for GstSourceBuffer {
     fn mime_type(&self) -> &str {
         &self.mime_type
@@ -331,7 +331,7 @@ impl GstMediaSource {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl MediaSource for GstMediaSource {
     fn ready_state(&self) -> ReadyState {
         self.ready_state.clone()

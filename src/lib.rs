@@ -43,6 +43,7 @@
 //! ```
 
 pub mod abr;
+pub mod clock;
 pub mod error;
 pub mod fetch;
 pub mod manifest;
@@ -53,6 +54,7 @@ pub mod util;
 
 // Top-level re-exports for the most commonly used types.
 pub use abr::{AbrController, AbrMetrics, QualityDecision};
+pub use clock::{Clock, SystemClock};
 pub use error::DashError;
 pub use manifest::MPD;
 pub use mp4::{parse_all_emsg, parse_sidx, EmsgInfo, SidxInfo};

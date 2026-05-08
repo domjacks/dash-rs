@@ -14,7 +14,7 @@ use crate::fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
 /// own implementation of [`SegmentFetcher`].
 pub struct StubSegmentFetcher;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for StubSegmentFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
         tracing::debug!(

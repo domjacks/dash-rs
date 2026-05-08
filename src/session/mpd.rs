@@ -6,7 +6,7 @@
 //! Mirrors `MpdHelper.js`, `DashManifestModel.js`, and parts of
 //! `TemplateSegmentsGetter.js` in dash.js.
 
-use dash_mpd::{AdaptationSet, Period, Representation, SegmentBase, SegmentList, SegmentTemplate};
+use crate::manifest::mpd_types::{AdaptationSet, Period, Representation, SegmentBase, SegmentList, SegmentTemplate};
 
 use crate::abr::RepresentationInfo;
 use super::MediaType;
@@ -71,6 +71,27 @@ pub(super) fn merge_segment_templates(
     Some(merged)
 }
 
+/// Returns `true` when `adaptation` is a video track.
+///
+/// Checks `@contentType` first; falls back to the `@mimeType` attribute of
+/// the `AdaptationSet` and its `Representation` children.
+fn is_video_adaptation(a: &AdaptationSet) -> bool {
+    a.contentType.as_deref() == Some("video")
+        || a.mimeType.as_deref().is_some_and(|m| m.starts_with("video/"))
+        || a.representations
+            .iter()
+            .any(|r| r.mimeType.as_deref().is_some_and(|m| m.starts_with("video/")))
+}
+
+/// Returns `true` when `adaptation` is an audio track.
+fn is_audio_adaptation(a: &AdaptationSet) -> bool {
+    a.contentType.as_deref() == Some("audio")
+        || a.mimeType.as_deref().is_some_and(|m| m.starts_with("audio/"))
+        || a.representations
+            .iter()
+            .any(|r| r.mimeType.as_deref().is_some_and(|m| m.starts_with("audio/")))
+}
+
 /// Return a reference to the best-matching adaptation set for `media_type`
 /// within `period`.
 ///
@@ -92,11 +113,11 @@ pub(super) fn find_adaptation<'a>(
         MediaType::Video => period
             .adaptations
             .iter()
-            .find(dash_mpd::is_video_adaptation),
+            .find(|a| is_video_adaptation(a)),
         MediaType::Audio => period
             .adaptations
             .iter()
-            .filter(dash_mpd::is_audio_adaptation)
+            .filter(|a| is_audio_adaptation(a))
             .max_by_key(|a| {
                 a.representations
                     .iter()
@@ -343,7 +364,7 @@ pub(super) fn segment_base_media_path(
 #[cfg(test)]
 mod tests {
     use super::merge_segment_templates;
-    use dash_mpd::{AdaptationSet, Period, Representation, SegmentTemplate};
+    use crate::manifest::mpd_types::{AdaptationSet, Period, Representation, SegmentTemplate};
 
     /// Template present only at the Representation level.
     #[test]

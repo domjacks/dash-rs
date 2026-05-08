@@ -84,8 +84,8 @@ impl Chunk {
 /// A real implementation targeting, for example, GStreamer `appsrc` or a
 /// custom demuxer would implement this trait and be injected via
 /// [`MediaSource::add_source_buffer`].
-#[async_trait]
-pub trait SourceBuffer: Send {
+#[async_trait(?Send)]
+pub trait SourceBuffer {
     /// The MIME type string this buffer was created for (e.g.
     /// `"video/mp4;codecs=\"avc1.42E01E\""`)
     fn mime_type(&self) -> &str;
@@ -144,8 +144,8 @@ pub trait SourceBuffer: Send {
 /// ([`stub::StubMediaSource`]) is fully in-memory.
 ///
 /// Mirrors `ExternalMediaSource.js` from dash.js.
-#[async_trait]
-pub trait MediaSource: Send {
+#[async_trait(?Send)]
+pub trait MediaSource {
     /// Current ready state.
     fn ready_state(&self) -> ReadyState;
 

@@ -34,16 +34,18 @@ pub use gap::{GapController, GapControllerSettings, GapSeekReason, GapSeekTarget
 use std::{
     collections::HashMap,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use async_broadcast;
 use bytes::Bytes;
-use dash_mpd::{AdaptationSet, MPD, Period, Representation};
-use tokio::sync::broadcast;
+use crate::manifest::mpd_types::{AdaptationSet, MPD, Period, Representation};
+use futures::future::{self as fut, Either};
+use futures_timer::Delay;
 use url::Url;
 
 use crate::{
     abr::{AbrController, AbrMetrics, QualityDecision, RepresentationInfo},
+    clock::{Clock, SystemClock},
     error::DashError,
     fetch::{FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     manifest::ManifestLoader,
@@ -90,9 +92,9 @@ impl std::fmt::Display for MediaType {
 /// media segment.
 ///
 /// Subscribers receive these via the channel returned by
-/// [`DashSession::subscribe_events`].  The channel is a
-/// `tokio::sync::broadcast` channel with a buffer of 64 events; slow
-/// consumers may see [`tokio::sync::broadcast::error::RecvError::Lagged`] if
+/// [`DashSession::subscribe_events`].  The channel is an
+/// `async-broadcast` channel with a buffer of 64 events; slow
+/// consumers may see [`async_broadcast::RecvError::Overflowed`] if
 /// they fall too far behind.
 ///
 /// # Presentation time semantics
@@ -455,12 +457,20 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// level drops below this value — mirrors `bufferTimeDefault` (12 s) in
     /// dash.js's `ScheduleController`.
     buffer_target_ms: f64,
-    /// Wall-clock instant when the pipeline transitioned to Playing.
-    playback_started_at: Option<Instant>,
+    /// Pluggable clock used for all time measurements.
+    ///
+    /// Defaults to [`SystemClock`] (backed by `std::time::Instant` and
+    /// `SystemTime::now()`).  Inject a custom clock via
+    /// [`Self::from_mpd_with_clock`] or [`Self::from_url_with_clock`] to run
+    /// on platforms where those APIs are unavailable (e.g. WASM).
+    clock: Arc<dyn Clock>,
+    /// Clock reading (`clock.now_ms()`) when the pipeline transitioned to Playing.
+    /// `None` until [`Self::notify_playing`] is called.
+    playback_started_at: Option<f64>,
     /// True while the pipeline is in the Paused state.
     paused: bool,
-    /// Wall-clock instant when the pipeline entered Paused.
-    paused_at: Option<Instant>,
+    /// Clock reading (`clock.now_ms()`) when the pipeline entered Paused.
+    paused_at: Option<f64>,
     /// Cumulative milliseconds spent in the Paused state since playback started.
     total_paused_ms: f64,
     /// When `true`, the fetch loop continues even while the pipeline is paused.
@@ -473,8 +483,8 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     abandon_timeout_ms: Option<u64>,
     /// Milliseconds between live-manifest refreshes.
     minimum_update_period_ms: Option<u64>,
-    /// Wall-clock instant of the most recent manifest load or refresh.
-    last_manifest_refresh: Option<Instant>,
+    /// `clock.now_ms()` reading at the most recent manifest load or refresh.
+    last_manifest_refresh: Option<f64>,
     /// Cache of initialisation segment bytes, keyed by `"{media_type}/{rep_id}"`.
     ///
     /// Populated by [`Self::fetch_init_segment`].  On a quality switch inside
@@ -484,7 +494,7 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// also populates the cache entry for future switches.
     init_cache: HashMap<String, bytes::Bytes>,
     /// Signed offset in seconds applied to the wall clock before live-edge
-    /// segment calculations: `adjusted_now = SystemTime::now() + utc_clock_offset_s`.
+    /// segment calculations: `adjusted_now = clock.unix_s() + utc_clock_offset_s`.
     ///
     /// Set to `server_time − client_time` by [`Self::from_url`] after querying
     /// the first successful `UTCTiming` element in the manifest.  Stays `0.0`
@@ -494,9 +504,15 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// Broadcast sender for in-band DASH events extracted from `emsg` boxes.
     ///
     /// Callers subscribe via [`Self::subscribe_events`].  If no subscribers
-    /// are present, sends are silently dropped (the `broadcast` channel
-    /// discards messages when there are zero receivers).
-    event_tx: broadcast::Sender<DashEvent>,
+    /// are present, sends are silently dropped (the `async-broadcast` channel
+    /// returns `Inactive` when there are zero receivers — we discard the error).
+    event_tx: async_broadcast::Sender<DashEvent>,
+    /// Keeps `inactive_receiver_count > 0` so that dropping the initial
+    /// receiver (created by `broadcast()`) does not cause `close_channel()`
+    /// to set `is_closed = true`.  Without this anchor, any subscriber
+    /// obtained via `subscribe_events()` / `new_receiver()` would immediately
+    /// see `TryRecvError::Closed` on the first call to `try_recv()`.
+    _event_rx_anchor: async_broadcast::InactiveReceiver<DashEvent>,
     /// Optional maximum bitrate cap for video, in bits per second.
     ///
     /// When set, [`Self::fetch_next_segment`] clamps the ABR decision to the
@@ -543,7 +559,24 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// If the manifest contains `UTCTiming` elements, the first successful one
     /// is queried to compute a signed clock offset that corrects live-edge
     /// calculations for any skew between the client and server wall clocks.
+    ///
+    /// The session uses a [`SystemClock`] for all time measurements.  To
+    /// inject a different clock (e.g. on WASM), use
+    /// [`Self::from_url_with_clock`].
     pub async fn from_url(url: &Url, fetcher: F, media_source: M) -> Result<Self, DashError> {
+        Self::from_url_with_clock(url, fetcher, media_source, SystemClock::arc()).await
+    }
+
+    /// Like [`Self::from_url`] but accepts a custom [`Clock`] implementation.
+    ///
+    /// Use this on platforms where `std::time::Instant` / `SystemTime::now()`
+    /// are unavailable (e.g. `wasm32-unknown-unknown`).
+    pub async fn from_url_with_clock(
+        url: &Url,
+        fetcher: F,
+        media_source: M,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, DashError> {
         let fetcher = Arc::new(fetcher);
         let loader = ManifestLoader::new(Arc::clone(&fetcher));
         let (mpd, base_url) = loader.load(url).await?;
@@ -554,14 +587,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         // Compute UTC clock offset before constructing the session so that
         // live-edge snapping inside `from_mpd` can use the corrected time.
-        let client_now_s = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0);
+        let client_now_s = clock.unix_s();
         let utc_offset = utc::resolve_utc_timing(&mpd, &fetcher, client_now_s).await;
 
-        let mut session = Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, utc_offset)?;
-        session.last_manifest_refresh = Some(Instant::now());
+        let mut session =
+            Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, utc_offset, clock)?;
+        session.last_manifest_refresh = Some(session.clock.now_ms());
         Ok(session)
     }
 
@@ -571,22 +602,41 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The UTC clock offset is set to `0.0` — the system wall clock is used
     /// as-is for live-edge snapping.  Use [`Self::from_url`] to get automatic
     /// `UTCTiming` resolution.
+    ///
+    /// The session uses a [`SystemClock`] for all time measurements.  To
+    /// inject a different clock, use [`Self::from_mpd_with_clock`].
     pub fn from_mpd(
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
         media_source: M,
     ) -> Result<Self, DashError> {
-        Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, 0.0)
+        Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, 0.0, SystemClock::arc())
     }
 
-    /// Internal constructor shared by [`Self::from_url`] and [`Self::from_mpd`].
+    /// Like [`Self::from_mpd`] but accepts a custom [`Clock`] implementation.
+    ///
+    /// Use this on platforms where `std::time::Instant` / `SystemTime::now()`
+    /// are unavailable (e.g. `wasm32-unknown-unknown`).
+    pub fn from_mpd_with_clock(
+        mpd: MPD,
+        base_url: Url,
+        fetcher: Arc<F>,
+        media_source: M,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, DashError> {
+        Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, 0.0, clock)
+    }
+
+    /// Internal constructor shared by [`Self::from_url_with_clock`] and
+    /// [`Self::from_mpd_with_clock`].
     fn from_mpd_with_utc(
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
         mut media_source: M,
         utc_clock_offset_s: f64,
+        clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
         if mpd.periods.is_empty() {
             return Err(DashError::EmptyManifest);
@@ -666,18 +716,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         // Apply live-edge starting segment for dynamic streams.
         let is_dynamic = mpd.mpdtype.as_deref() == Some("dynamic");
-        let ast_s: Option<f64> = mpd.availabilityStartTime.map(|dt| dt.timestamp() as f64);
+        let ast_s: Option<f64> = mpd.availabilityStartTime;
         let spd_s: Option<f64> = mpd.suggestedPresentationDelay.map(|d| d.as_secs_f64());
         if is_dynamic {
             if let Some(ast) = ast_s {
                 // Apply the UTC clock offset so that the live-edge calculation
                 // uses the server's time rather than the (potentially skewed)
                 // client wall clock.
-                let now_s = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0)
-                    + utc_clock_offset_s;
+                let now_s = clock.unix_s() + utc_clock_offset_s;
                 if let Some(ref mut track) = video_track {
                     let seg = compute_live_edge_segment(
                         ast,
@@ -731,7 +777,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             );
         }
 
-        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
+        let (event_tx, event_rx_anchor) = async_broadcast::broadcast(EVENT_CHANNEL_CAPACITY);
+        let _event_rx_anchor = event_rx_anchor.deactivate();
 
         Ok(Self {
             mpd,
@@ -744,6 +791,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             audio_track,
             current_period_index: 0,
             buffer_target_ms: 12_000.0,
+            clock,
             playback_started_at: None,
             paused: false,
             paused_at: None,
@@ -756,6 +804,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             init_cache: HashMap::new(),
             utc_clock_offset_s,
             event_tx,
+            _event_rx_anchor,
             video_max_bitrate_bps: None,
             audio_max_bitrate_bps: None,
             cdn_blacklist: CdnBlacklist::new(),
@@ -878,7 +927,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     }
 
     /// Signed clock offset applied to live-edge calculations:
-    /// `adjusted_now = SystemTime::now() + utc_clock_offset_s`.
+    /// `adjusted_now = clock.unix_s() + utc_clock_offset_s`.
     ///
     /// Set by [`Self::from_url`] after querying the first successful
     /// `UTCTiming` element in the manifest.  `0.0` when no `UTCTiming` is
@@ -926,14 +975,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// missed.  Events are broadcast from within [`Self::fetch_next_segment`]
     /// immediately after the segment bytes are received and parsed.
     ///
-    /// The returned [`broadcast::Receiver`] is a multi-producer,
+    /// The returned [`async_broadcast::Receiver`] is a multi-producer,
     /// multi-consumer channel — multiple subscribers each receive every event
     /// independently.  If a subscriber's internal buffer fills up (capacity
     /// [`EVENT_CHANNEL_CAPACITY`] = 64), the oldest events are overwritten and
     /// the next `recv()` call will return
-    /// [`tokio::sync::broadcast::error::RecvError::Lagged`].
-    pub fn subscribe_events(&self) -> broadcast::Receiver<DashEvent> {
-        self.event_tx.subscribe()
+    /// [`async_broadcast::RecvError::Overflowed`].
+    pub fn subscribe_events(&self) -> async_broadcast::Receiver<DashEvent> {
+        self.event_tx.new_receiver()
     }
 
     /// Shared reference to the underlying [`MediaSource`].
@@ -1004,11 +1053,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     pub fn notify_playing(&mut self) {
         if self.paused {
             if let Some(paused_at) = self.paused_at.take() {
-                self.total_paused_ms += paused_at.elapsed().as_millis() as f64;
+                self.total_paused_ms += self.clock.now_ms() - paused_at;
             }
             self.paused = false;
         } else {
-            self.playback_started_at = Some(Instant::now());
+            self.playback_started_at = Some(self.clock.now_ms());
             self.total_paused_ms = 0.0;
         }
     }
@@ -1017,7 +1066,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     pub fn notify_paused(&mut self) {
         if !self.paused {
             self.paused = true;
-            self.paused_at = Some(Instant::now());
+            self.paused_at = Some(self.clock.now_ms());
         }
     }
 
@@ -1049,11 +1098,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
         let elapsed_ms = self
             .playback_started_at
-            .map(|started| {
-                let total_elapsed = started.elapsed().as_millis() as f64;
+            .map(|started_ms| {
+                let total_elapsed = self.clock.now_ms() - started_ms;
                 let current_pause_ms = if self.paused {
                     self.paused_at
-                        .map(|pa| pa.elapsed().as_millis() as f64)
+                        .map(|pa_ms| self.clock.now_ms() - pa_ms)
                         .unwrap_or(0.0)
                 } else {
                     0.0
@@ -1068,11 +1117,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// time spent paused.
     pub fn estimated_playback_position_s(&self) -> f64 {
         self.playback_started_at
-            .map(|started| {
-                let total_elapsed = started.elapsed().as_millis() as f64;
+            .map(|started_ms| {
+                let total_elapsed = self.clock.now_ms() - started_ms;
                 let current_pause_ms = if self.paused {
                     self.paused_at
-                        .map(|pa| pa.elapsed().as_millis() as f64)
+                        .map(|pa_ms| self.clock.now_ms() - pa_ms)
                         .unwrap_or(0.0)
                 } else {
                     0.0
@@ -1293,7 +1342,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         };
         match self.last_manifest_refresh {
             None => true,
-            Some(last) => last.elapsed().as_millis() as u64 >= period_ms,
+            Some(last_ms) => (self.clock.now_ms() - last_ms) as u64 >= period_ms,
         }
     }
 
@@ -1330,7 +1379,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 Ok(pair) => pair,
                 Err(primary_err) => {
                     let mut last_err = primary_err;
-                    let mut found: Option<(dash_mpd::MPD, Url)> = None;
+                    let mut found: Option<(MPD, Url)> = None;
                     for location_url in &self.location_urls {
                         tracing::warn!(
                             primary_url = %self.base_url,
@@ -1360,7 +1409,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         };
 
-        self.last_manifest_refresh = Some(Instant::now());
+        self.last_manifest_refresh = Some(self.clock.now_ms());
         self.base_url = new_base_url.clone();
         self.minimum_update_period_ms = new_mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
 
@@ -1885,15 +1934,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             };
 
             let fetch_result: Result<FetchResponse, DashError> = if let Some(ms) = abandon_ms {
-                match tokio::time::timeout(
-                    std::time::Duration::from_millis(ms),
-                    fetcher.fetch(request),
+                let delay = Delay::new(std::time::Duration::from_millis(ms));
+                match fut::select(
+                    Box::pin(fetcher.fetch(request)),
+                    Box::pin(delay),
                 )
                 .await
                 {
-                    Ok(Ok(resp)) => Ok(resp),
-                    Ok(Err(e)) => Err(e.into()),
-                    Err(_elapsed) => {
+                    Either::Left((Ok(resp), _)) => Ok(resp),
+                    Either::Left((Err(e), _)) => Err(e.into()),
+                    Either::Right(_) => {
                         return Err(DashError::SegmentAbandoned {
                             media_type: mt_str.clone(),
                         });
@@ -1985,8 +2035,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     id: emsg.id,
                     message_data: emsg.message_data,
                 };
-                // Errors here mean no subscribers — that is fine.
-                let _ = self.event_tx.send(event);
+                // Errors here mean no subscribers or channel full — both are fine.
+                let _ = self.event_tx.try_broadcast(event);
             }
         }
 

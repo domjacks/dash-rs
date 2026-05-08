@@ -111,8 +111,8 @@ impl FetchResponse {
 ///
 /// A real HTTP implementation can be provided by the caller or by a future
 /// `fetch-http` crate feature.
-#[async_trait]
-pub trait SegmentFetcher: Send + Sync {
+#[async_trait(?Send)]
+pub trait SegmentFetcher {
     /// Fetch a resource and return the response.
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError>;
 

@@ -8,7 +8,7 @@ pub enum DashError {
     ManifestFetch(#[from] crate::fetch::FetchError),
 
     #[error("manifest parse failed: {0}")]
-    ManifestParse(#[from] dash_mpd::DashMpdError),
+    ManifestParse(#[from] crate::manifest::MpdParseError),
 
     #[error("manifest is empty or contains no periods")]
     EmptyManifest,

@@ -79,7 +79,7 @@ impl StubSourceBuffer {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SourceBuffer for StubSourceBuffer {
     fn mime_type(&self) -> &str {
         &self.mime_type
@@ -222,7 +222,7 @@ impl StubMediaSource {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl MediaSource for StubMediaSource {
     fn ready_state(&self) -> ReadyState {
         self.ready_state.clone()
