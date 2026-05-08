@@ -1,0 +1,121 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>dash-rs WASM player</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+      gap: 1rem;
+    }
+    h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: 0.03em; }
+    video {
+      width: 100%;
+      max-width: 900px;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 6px;
+    }
+    form {
+      display: flex;
+      gap: 0.5rem;
+      width: 100%;
+      max-width: 900px;
+    }
+    input[type=text] {
+      flex: 1;
+      padding: 0.45rem 0.75rem;
+      border: 1px solid #444;
+      border-radius: 4px;
+      background: #222;
+      color: #eee;
+      font-size: 0.85rem;
+    }
+    button {
+      padding: 0.45rem 1rem;
+      border: none;
+      border-radius: 4px;
+      background: #1a7fd4;
+      color: #fff;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    button:hover { background: #1569b0; }
+    #status {
+      font-size: 0.8rem;
+      color: #aaa;
+      min-height: 1.2em;
+      text-align: center;
+    }
+    #status.error { color: #f55; }
+  </style>
+</head>
+<body>
+  <h1>dash-rs &mdash; WASM player</h1>
+
+  <video id="video" controls autoplay muted></video>
+
+  <form id="form">
+    <input
+      id="url-input"
+      type="text"
+      placeholder="MPEG-DASH manifest URL (.mpd)"
+      value="https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd"
+    />
+    <button type="submit">Play</button>
+  </form>
+
+  <div id="status">Loading WASM module…</div>
+
+  <!--
+    wasm-pack build --target web outputs:
+      pkg/wasm_player.js       ES module (glue)
+      pkg/wasm_player_bg.wasm  compiled WASM binary
+
+    Build command (from workspace root):
+      wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player/pkg
+  -->
+  <script type="module">
+    import init, { play } from './pkg/wasm_player.js';
+
+    const status = document.getElementById('status');
+    const form   = document.getElementById('form');
+    const input  = document.getElementById('url-input');
+
+    // Pre-fill URL from query string if present.
+    const searchUrl = new URLSearchParams(window.location.search).get('url');
+    if (searchUrl) input.value = searchUrl;
+
+    // Initialise the WASM module (loads + compiles the .wasm binary).
+    await init();
+    status.textContent = 'Ready. Enter a manifest URL and press Play.';
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const url = input.value.trim();
+      if (!url) return;
+
+      status.className = '';
+      status.textContent = `Starting playback: ${url}`;
+
+      try {
+        // play() runs the full fetch loop and resolves when EOS is reached.
+        await play(url);
+        status.textContent = 'Playback complete.';
+      } catch (err) {
+        status.className   = 'error';
+        status.textContent = `Error: ${err}`;
+        console.error('dash-rs error:', err);
+      }
+    });
+  </script>
+</body>
+</html>

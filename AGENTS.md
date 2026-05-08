@@ -1,7 +1,8 @@
 # AGENTS.md
 
 dash-rs — a Rust implementation of MPEG-DASH playback logic.
-Pure Rust (edition 2021), async via `tokio` / `async-trait`.
+Pure Rust (edition 2021), async via `async-trait` (`?Send` everywhere);
+WASM-compatible (`wasm32-unknown-unknown`).
 
 ---
 
@@ -33,6 +34,12 @@ cargo run --example http_fetch -- https://your-stream/manifest.mpd
 cargo run --features sink-gstreamer --example gstreamer_player
 cargo run --features sink-gstreamer --example gstreamer_player -- https://your-stream/manifest.mpd
 
+# WASM player (requires wasm-pack)
+wasm-pack build examples/wasm_player --target web --out-dir pkg
+# Then serve examples/wasm_player/ with any static file server, e.g.:
+#   python3 -m http.server 8080
+# and open http://localhost:8080
+
 # Lint
 cargo clippy -- -D warnings
 
@@ -42,18 +49,8 @@ cargo fmt --check
 
 ### Prerequisites
 
-`dash-mpd` pulls in `pssh-box`, which generates Rust from `.proto` files at
-build time.  `protoc` must be on `PATH`:
-
-```bash
-# macOS
-brew install protobuf
-
-# Debian / Ubuntu
-apt-get install protobuf-compiler
-
-# Windows — download from https://github.com/protocolbuffers/protobuf/releases
-```
+No C toolchain or system library dependencies are required for the default
+build.  All MPD parsing is handled by `quick-xml` + `serde` (pure Rust).
 
 #### `sink-gstreamer` feature
 
@@ -84,11 +81,14 @@ apply it:
 ```rust
 use async_trait::async_trait;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SourceBuffer for MyBuffer { … }
 ```
 
-Forgetting the macro produces cryptic "associated type not found" errors.
+Forgetting the macro, or using `#[async_trait]` (without `?Send`), produces
+cryptic "associated type not found" errors.  All trait implementations must
+use `?Send` because the library targets `wasm32-unknown-unknown` where most
+types are not `Send`.
 
 ### `representations` must be sorted ascending by bandwidth
 
@@ -150,7 +150,6 @@ There is no explicit queue struct.  Concurrent callers must not interleave
 The fetch loop pattern mirrors dash.js:
 
 ```rust
-session.media_source_mut().set_playing()?;
 session.notify_playing();
 
 loop {
@@ -322,6 +321,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
+| WASM player example (`WasmClock`, `WasmSegmentFetcher`, `WasmMediaSource`) | `examples/wasm_player/src/lib.rs` |
 
 ---
 

@@ -52,7 +52,7 @@ two traits.
 | Tool | Version | Notes |
 |---|---|---|
 | Rust | stable ≥ 1.75 | Earlier versions may work but are untested |
-| protoc | any recent | Required by the `pssh-box` transitive dependency of `dash-mpd`. On macOS: `brew install protobuf` |
+| wasm-pack | any recent | Required only for the `wasm_player` example. `cargo install wasm-pack` |
 
 ---
 
@@ -66,6 +66,34 @@ dash-rs = { git = "https://github.com/jacksd60/dash-rs" }
 
 # dash-rs uses async traits; bring a runtime of your choice
 tokio = { version = "1", features = ["full"] }
+```
+
+### Injecting a custom clock (WASM / embedded)
+
+`DashSession` accepts a pluggable [`Clock`] implementation for platforms where
+`std::time::Instant` is unavailable:
+
+```rust
+use std::sync::Arc;
+use dash_rs::{clock::Clock, session::DashSession};
+
+struct MyPlatformClock;
+
+// Clock must be Send + Sync; on WASM this is trivially satisfied.
+unsafe impl Send for MyPlatformClock {}
+unsafe impl Sync for MyPlatformClock {}
+
+impl Clock for MyPlatformClock {
+    fn now_ms(&self) -> f64  { /* platform monotonic time */ 0.0 }
+    fn unix_s(&self) -> f64  { /* platform UTC time       */ 0.0 }
+}
+
+let session = DashSession::from_url_with_clock(
+    &url,
+    fetcher,
+    media_source,
+    Arc::new(MyPlatformClock),
+).await?;
 ```
 
 ### Minimal example
@@ -128,7 +156,7 @@ use dash_rs::{
 
 struct MySourceBuffer { /* ... */ }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SourceBuffer for MySourceBuffer {
     fn mime_type(&self) -> &str { "video/mp4" }
     fn is_updating(&self) -> bool { false }
@@ -159,7 +187,7 @@ use url::Url;
 
 struct HttpFetcher { client: reqwest::Client }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl SegmentFetcher for HttpFetcher {
     async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse, FetchError> {
         let resp = self.client.get(req.url.as_str()).send().await
@@ -272,6 +300,30 @@ Video representations (sorted by bandwidth):
   ...
 ```
 
+### `wasm_player` — browser playback via WebAssembly
+
+Runs the full MPEG-DASH session in the browser using the native MSE
+(`MediaSource` / `SourceBuffer`) and Fetch APIs.  Implements
+[`WasmClock`], [`WasmSegmentFetcher`], [`WasmSourceBuffer`], and
+[`WasmMediaSource`] — all in `examples/wasm_player/src/lib.rs`.
+
+**Prerequisites:** `wasm-pack` (`cargo install wasm-pack`)
+
+```bash
+# Build the WASM module into examples/wasm_player/pkg/
+wasm-pack build examples/wasm_player --target web --out-dir pkg
+
+# Serve the player with any static file server
+python3 -m http.server 8080 --directory examples/wasm_player
+# then open http://localhost:8080
+```
+
+Pass a custom manifest URL via the `?url=` query parameter:
+
+```
+http://localhost:8080/?url=https://your-stream/manifest.mpd
+```
+
 ### `gstreamer_player` — full AV playback (`sink-gstreamer` feature)
 
 Fetches and plays back the BBC R&D Big Buck Bunny stream using GStreamer as the
@@ -347,7 +399,8 @@ tracing_subscriber::fmt()
 ```
 DashSession
 ├── ManifestLoader ──── SegmentFetcher (trait) ←── StubSegmentFetcher
-│       └── dash-mpd (MPD parse)                └── (your HttpFetcher, etc.)
+│       └── quick-xml + serde (pure-Rust MPD parser)   └── WasmSegmentFetcher  (wasm_player)
+│                                              └── HttpSegmentFetcher  (http_fetch example)
 ├── AbrController
 │   ├── ThroughputRule
 │   ├── BufferOccupancyRule
@@ -355,7 +408,8 @@ DashSession
 │   └── SwitchHistoryRule
 └── SourceBufferSink (per track)
         └── SourceBuffer (trait) ←── StubSourceBuffer
-                                 └── GstSourceBuffer  (sink-gstreamer feature)
+                                 └── WasmSourceBuffer  (wasm_player)
+                                 └── GstSourceBuffer   (sink-gstreamer feature)
                                  └── (your implementation)
 
 GapController  (owned by DashSession; caller drives via session.tick_gap())

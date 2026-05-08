@@ -1,3 +1,8 @@
+[workspace]
+members  = ["examples/wasm_player"]
+# Only build the root crate by default; the WASM player is a separate target.
+default-members = ["."]
+
 [package]
 name = "dash-rs"
 version = "0.1.0"
