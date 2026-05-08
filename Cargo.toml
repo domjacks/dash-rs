@@ -31,7 +31,7 @@ async-broadcast  = "0.5"
 futures-timer    = "3"
 futures          = { version = "0.3", default-features = false, features = ["std"] }
 gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
-gstreamer-app    = { version = "0.24", optional = true }
+gstreamer-app    = { version = "0.25", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom     = { version = "0.2", features = ["js"] }
