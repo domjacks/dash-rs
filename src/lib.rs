@@ -58,5 +58,5 @@ pub use abr::{AbrController, AbrMetrics, QualityDecision};
 pub use clock::{Clock, SystemClock};
 pub use error::DashError;
 pub use manifest::MPD;
-pub use mp4::{parse_all_emsg, parse_sidx, EmsgInfo, SidxInfo};
+pub use mp4::{parse_all_emsg, parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 pub use session::{DashEvent, DashSession, GapControllerSettings, GapSeekReason, GapSeekTarget, MediaType};

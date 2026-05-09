@@ -25,6 +25,10 @@ pub struct MPD {
     #[serde(rename = "@type")]
     pub mpdtype: Option<String>,
 
+    /// `@profiles` — comma-separated list of DASH profiles (informational).
+    #[serde(rename = "@profiles")]
+    pub profiles: Option<String>,
+
     /// `@mediaPresentationDuration` — total VOD duration (ISO 8601 duration).
     #[serde(rename = "@mediaPresentationDuration", deserialize_with = "de::opt_duration")]
     pub mediaPresentationDuration: Option<Duration>,
@@ -33,6 +37,11 @@ pub struct MPD {
     #[serde(rename = "@minimumUpdatePeriod", deserialize_with = "de::opt_duration")]
     pub minimumUpdatePeriod: Option<Duration>,
 
+    /// `@minBufferTime` — minimum time of data a client should have buffered
+    /// before starting playback (ISO 8601 duration, DASH spec §5.3.1.2).
+    #[serde(rename = "@minBufferTime", deserialize_with = "de::opt_duration")]
+    pub minBufferTime: Option<Duration>,
+
     /// `@availabilityStartTime` — Unix epoch seconds when content became available.
     ///
     /// Stored as `f64` seconds (instead of `DateTime<Utc>`) to avoid a `chrono`
@@ -40,9 +49,29 @@ pub struct MPD {
     #[serde(rename = "@availabilityStartTime", deserialize_with = "de::opt_xs_datetime")]
     pub availabilityStartTime: Option<f64>,
 
+    /// `@availabilityEndTime` — Unix epoch seconds when the live stream ends.
+    ///
+    /// When present, `DashSession::fetch_next_segment` returns
+    /// [`DashError::EndOfStream`] as soon as the adjusted wall clock exceeds
+    /// this value, allowing cleanly scheduled broadcasts (sport events, etc.)
+    /// to terminate without spurious 404 errors (DASH spec §5.3.1.2).
+    #[serde(rename = "@availabilityEndTime", deserialize_with = "de::opt_xs_datetime")]
+    pub availabilityEndTime: Option<f64>,
+
     /// `@suggestedPresentationDelay` — recommended presentation delay for live streams.
     #[serde(rename = "@suggestedPresentationDelay", deserialize_with = "de::opt_duration")]
     pub suggestedPresentationDelay: Option<Duration>,
+
+    /// `@timeShiftBufferDepth` — maximum DVR window depth for live streams
+    /// (ISO 8601 duration, DASH spec §5.3.1.2).
+    ///
+    /// The presentation time of segments older than
+    /// `availabilityStartTime + (now - timeShiftBufferDepth)` is outside the
+    /// DVR window and those segments may no longer be available on the CDN.
+    /// `DashSession::fetch_next_segment` advances `segment_number` past the
+    /// DVR floor automatically and warns when content has expired.
+    #[serde(rename = "@timeShiftBufferDepth", deserialize_with = "de::opt_duration")]
+    pub timeShiftBufferDepth: Option<Duration>,
 
     /// `<Period>` children.
     #[serde(rename = "Period")]
@@ -124,6 +153,14 @@ pub struct AdaptationSet {
 
     #[serde(rename = "@lang")]
     pub lang: Option<String>,
+
+    /// `@codecs` — codec string shared by all representations in the set.
+    ///
+    /// When present at the `AdaptationSet` level all representations use the
+    /// same codec; individual `Representation@codecs` attributes override this
+    /// per-representation (DASH spec §5.3.7.2).
+    #[serde(rename = "@codecs")]
+    pub codecs: Option<String>,
 
     /// `<Representation>` children.
     #[serde(rename = "Representation")]
@@ -214,6 +251,25 @@ pub struct SegmentTemplate {
 
     #[serde(rename = "@presentationTimeOffset")]
     pub presentationTimeOffset: Option<u64>,
+
+    /// `@availabilityTimeOffset` — seconds a segment becomes available *before* its
+    /// nominal availability time, enabling low-latency CMAF chunk delivery
+    /// (DASH spec §5.3.9.4, DASH-LL profile).
+    ///
+    /// A non-zero value allows the client to start fetching a segment before it
+    /// is fully produced.  `compute_live_edge_segment` adds this offset to
+    /// `elapsed` so that partially-produced segments at the live edge are
+    /// included in the fetch window.
+    #[serde(rename = "@availabilityTimeOffset")]
+    pub availabilityTimeOffset: Option<f64>,
+
+    /// `@availabilityTimeComplete` — when `false`, the segment is available for
+    /// download before it is fully written (chunked transfer / CMAF chunk delivery).
+    ///
+    /// Parsed and stored for future use; full chunked-segment support
+    /// (streaming body) is deferred to P1-4.
+    #[serde(rename = "@availabilityTimeComplete")]
+    pub availabilityTimeComplete: Option<bool>,
 
     /// `<Initialization>` child element — alternative to the `@initialization` attribute.
     #[serde(rename = "Initialization")]

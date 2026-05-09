@@ -53,8 +53,9 @@ use crate::{
         sink::{SourceBufferSink, StreamInfo},
         Chunk, MediaSource,
     },
-    mp4::{parse_all_emsg, parse_sidx, parse_sidx_entries, SidxEntry},
+    mp4::{parse_all_emsg, parse_prft, parse_sidx, parse_sidx_entries, ProducerReferenceTime, SidxEntry},
 };
+use crate::abr::throughput::ThroughputTracker;
 
 use self::{
     live::compute_live_edge_segment,
@@ -155,17 +156,6 @@ pub struct DashEvent {
 /// [`tokio::sync::broadcast::error::RecvError::Lagged`].
 const EVENT_CHANNEL_CAPACITY: usize = 64;
 
-/// Smoothing factor for the per-track throughput exponential moving average.
-///
-/// `α = 0.3` weights the newest sample at 30 % and the accumulated history at
-/// 70 %, giving a half-life of roughly 1.9 segments.  This is intentionally
-/// somewhat reactive: the first few segments after a network change will shift
-/// the estimate meaningfully, while random per-segment variance is smoothed
-/// out.  dash.js uses a pair of EWMAs (3 s and 8 s half-lives) and takes the
-/// minimum; a single EMA with `α = 0.3` is a pragmatic starting point that
-/// can be refined once real download timing data is available.
-const THROUGHPUT_EMA_ALPHA: f64 = 0.3;
-
 // ── AddressingMode ────────────────────────────────────────────────────────────
 
 /// How segment URLs are constructed for a given track.
@@ -212,8 +202,20 @@ struct TrackReinit {
     seg_dur_ms: f64,
     total_segments: Option<u64>,
     addressing_mode: AddressingMode,
-    /// `presentationTimeOffset` converted to seconds (0.0 when absent).
+    /// MSE `SourceBuffer.timestampOffset` = `Period@start − PTO/timescale`.
     timestamp_offset_s: f64,
+    /// `Period@start` in seconds (0.0 for the first/only period).
+    ///
+    /// Used by [`seek_to`] to map presentation-timeline positions back to
+    /// segment numbers: `N = start_number + ⌊(pos − period_start_s) / seg_dur_s⌋`.
+    period_start_s: f64,
+    /// Timescale ticks per second from merged `SegmentTemplate@timescale` (default 1).
+    timescale: u64,
+    /// `SegmentTemplate@availabilityTimeOffset` in seconds (0.0 when absent).
+    ///
+    /// Passed to [`compute_live_edge_segment`] so that low-latency CMAF streams
+    /// can access partially-produced segments at the live edge.
+    availability_time_offset_s: f64,
 }
 
 /// Compute a [`TrackReinit`] from the given adaptation set and period.
@@ -236,13 +238,38 @@ fn compute_track_reinit(
     let tmpl = merge_segment_templates(first_repr, adaptation, period);
     let has_segment_list = merge_segment_lists(first_repr, adaptation, period).is_some();
 
-    let timestamp_offset_s = tmpl.as_ref()
-        .and_then(|t| {
-            let pto = t.presentationTimeOffset?;
-            let ts = t.timescale.unwrap_or(1);
-            Some(pto as f64 / ts as f64)
-        })
-        .unwrap_or(0.0);
+    // Extract timescale for SegmentTimeline seek re-anchoring (DASH spec §5.3.9.4).
+    let timescale: u64 = tmpl.as_ref().and_then(|t| t.timescale).unwrap_or(1);
+
+    // Extract @availabilityTimeOffset for low-latency CMAF live-edge widening.
+    let availability_time_offset_s: f64 =
+        tmpl.as_ref().and_then(|t| t.availabilityTimeOffset).unwrap_or(0.0);
+
+    // Warn when @availabilityTimeComplete=false is present — chunked segment
+    // delivery is not yet supported (P1-4).
+    if tmpl.as_ref().and_then(|t| t.availabilityTimeComplete) == Some(false) {
+        tracing::warn!(
+            "SegmentTemplate@availabilityTimeComplete=false detected; \
+             chunked (partial) segment delivery is not yet supported — \
+             fetching will wait for complete segments (P1-4)"
+        );
+    }
+
+    // DASH spec §5.3.9.6: timestampOffset = Period@start − PTO/timescale.
+    // Period@start is the presentation-timeline start of this period (0 for the
+    // first/only period; non-zero in multi-period VOD).  PTO shifts decode
+    // timestamps so that DTS=PTO maps to presentation time Period@start.
+    let timestamp_offset_s = {
+        let pto_s = tmpl.as_ref()
+            .and_then(|t| {
+                let pto = t.presentationTimeOffset?;
+                let ts = t.timescale.unwrap_or(1);
+                Some(pto as f64 / ts as f64)
+            })
+            .unwrap_or(0.0);
+        let period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+        period_start_s - pto_s
+    };
 
     let (start_number, seg_dur_ms, total_segments, addressing_mode) =
         if let Some(ref t) = tmpl {
@@ -279,6 +306,9 @@ fn compute_track_reinit(
         total_segments,
         addressing_mode,
         timestamp_offset_s,
+        period_start_s: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
+        timescale,
+        availability_time_offset_s,
     }
 }
 
@@ -286,7 +316,7 @@ fn compute_track_reinit(
 ///
 /// Updates the MIME type (via `change_type` if it changed), append window,
 /// timestamp offset, and all timing/addressing fields.  Intentionally
-/// preserves `throughput_ema_bps`, `last_transfer_ms`, and `current_index`
+/// preserves `throughput_tracker`, `last_transfer_ms`, and `current_index`
 /// for ABR continuity across period boundaries.
 async fn apply_track_reinit(
     track: &mut TrackState,
@@ -309,6 +339,9 @@ async fn apply_track_reinit(
     track.next_segment_time = None;
     track.segment_byte_ranges = None;
     track.init_segment_sent = false;
+    track.period_start_s = ri.period_start_s;
+    track.timescale = ri.timescale;
+    track.availability_time_offset_s = ri.availability_time_offset_s;
     Ok(())
 }
 
@@ -350,14 +383,13 @@ struct TrackState {
     /// **next** segment to fetch.  `None` means start from the first entry in
     /// the current timeline.  Ignored when `uses_timeline` is `false`.
     next_segment_time: Option<u64>,
-    /// Exponential moving average of measured download throughput in bits per
-    /// second, updated after every successful media-segment fetch.
+    /// Dual-EWMA + harmonic-mean throughput estimator, updated after every
+    /// successful media-segment fetch.
     ///
-    /// `0.0` until the first segment has been fetched.  The smoothing factor
-    /// is [`THROUGHPUT_EMA_ALPHA`].  Seeded directly from the first sample
-    /// rather than from zero, to avoid the EMA taking many segments to climb
-    /// out of a low initial value.
-    throughput_ema_bps: f64,
+    /// Seeded on the first sample; returns `0.0` until then via
+    /// [`ThroughputTracker::estimate`].  Replaces the old single-α EMA
+    /// to better match dash.js's `ThroughputController.js` model.
+    throughput_tracker: ThroughputTracker,
     /// Transfer duration of the most recently completed media-segment fetch,
     /// in milliseconds.
     ///
@@ -375,9 +407,36 @@ struct TrackState {
     /// current period.  Reset to `false` by [`apply_track_reinit`] at period
     /// boundaries so that the new period's init segment is fetched automatically.
     init_segment_sent: bool,
+    /// `Period@start` in seconds (0.0 for the first/only period).
+    ///
+    /// Used by [`DashSession::seek_to`] to map a presentation-timeline position
+    /// back to a segment number:
+    /// `N = start_number + ⌊(position_s − period_start_s) / seg_dur_s⌋`.
+    period_start_s: f64,
+    /// Timescale ticks per second from the merged `SegmentTemplate@timescale`.
+    ///
+    /// Used by [`DashSession::seek_to`] to convert a wall-clock seek position
+    /// into `next_segment_time` ticks for `SegmentTimeline` (`$Time$`) tracks,
+    /// so that the timeline walk starts from the correct entry rather than the
+    /// beginning of the timeline (which would be wrong for live streams with
+    /// large absolute tick values).  Default 1.
+    timescale: u64,
+    /// `SegmentTemplate@availabilityTimeOffset` in seconds (0.0 when absent).
+    ///
+    /// Passed to [`compute_live_edge_segment`] so that low-latency CMAF streams
+    /// can access partially-produced segments at the live edge.  A positive ATO
+    /// widens the effective fetch window by `ATO` seconds.
+    availability_time_offset_s: f64,
+    /// The most recently decoded `ProducerReferenceTimeBox` (`prft`) from a
+    /// fetched media segment, or `None` if no `prft` has been seen yet.
+    ///
+    /// Callers can read this via [`DashSession::last_producer_reference_time`]
+    /// to compute end-to-end latency for low-latency live streams.
+    last_prft: Option<ProducerReferenceTime>,
 }
 
 impl TrackState {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         media_type: MediaType,
         representations: Vec<RepresentationInfo>,
@@ -386,6 +445,9 @@ impl TrackState {
         segment_duration_ms: f64,
         total_segments: Option<u64>,
         addressing_mode: AddressingMode,
+        period_start_s: f64,
+        timescale: u64,
+        availability_time_offset_s: f64,
     ) -> Self {
         Self {
             _media_type: media_type,
@@ -399,10 +461,14 @@ impl TrackState {
             sink,
             addressing_mode,
             next_segment_time: None,
-            throughput_ema_bps: 0.0,
+            throughput_tracker: ThroughputTracker::new(),
             last_transfer_ms: 0.0,
             segment_byte_ranges: None,
             init_segment_sent: false,
+            period_start_s,
+            timescale,
+            availability_time_offset_s,
+            last_prft: None,
         }
     }
 }
@@ -432,7 +498,7 @@ impl TrackState {
 /// ).await?;
 ///
 /// // Drive the fetch loop.
-/// let metrics = session.current_metrics(MediaType::Video);
+/// let metrics = session.current_metrics(MediaType::Video, 0.0);
 /// let _ = session.fetch_next_segment(MediaType::Video, &metrics).await?;
 /// # Ok(())
 /// # }
@@ -541,6 +607,15 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// automatically at period boundaries.  Callers drive detection via
     /// [`Self::tick_gap`].
     gap_controller: GapController,
+    /// DVR window depth in milliseconds, parsed from `MPD@timeShiftBufferDepth`.
+    ///
+    /// For live streams: segment numbers older than
+    /// `live_edge − floor(tsbd / seg_dur)` are outside the sliding window and
+    /// their CDN content may have been deleted.  `fetch_next_segment` advances
+    /// `segment_number` past the floor when it detects this condition.
+    ///
+    /// `None` when the attribute is absent or for VOD streams.
+    time_shift_buffer_depth_ms: Option<f64>,
 }
 
 // Re-export for convenience in examples.
@@ -679,6 +754,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     reinit.seg_dur_ms,
                     reinit.total_segments,
                     reinit.addressing_mode,
+                    reinit.period_start_s,
+                    reinit.timescale,
+                    reinit.availability_time_offset_s,
                 ))
             } else {
                 None
@@ -712,6 +790,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     reinit.seg_dur_ms,
                     reinit.total_segments,
                     reinit.addressing_mode,
+                    reinit.period_start_s,
+                    reinit.timescale,
+                    reinit.availability_time_offset_s,
                 ))
             } else {
                 None
@@ -737,6 +818,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                         track.segment_duration_ms / 1_000.0,
                         track.start_number,
                         spd_s,
+                        track.availability_time_offset_s,
                     );
                     tracing::info!(
                         media_type = "video",
@@ -754,6 +836,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                         track.segment_duration_ms / 1_000.0,
                         track.start_number,
                         spd_s,
+                        track.availability_time_offset_s,
                     );
                     tracing::info!(
                         media_type = "audio",
@@ -768,6 +851,31 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
 
         let mpd_minimum_update_period_ms = mpd.minimumUpdatePeriod.map(|d| d.as_millis() as u64);
+
+        // Parse MPD@timeShiftBufferDepth for live streams (ignored for VOD).
+        let mpd_ref_tsbd: Option<f64> = if is_dynamic {
+            mpd.timeShiftBufferDepth.map(|d| d.as_millis() as f64)
+        } else {
+            None
+        };
+
+        // Seed the buffer target from MPD@minBufferTime when present.
+        // dash.js uses `Math.max(minBufferTime, bufferTimeDefault)` for VOD and
+        // `bufferTimeDefault` for live; we follow the same policy.
+        let buffer_target_ms = {
+            let default_ms = 12_000.0_f64;
+            if let Some(mbt) = mpd.minBufferTime {
+                let mbt_ms = mbt.as_millis() as f64;
+                if mpd.mpdtype.as_deref().is_none_or(|t| t != "dynamic") {
+                    // VOD: use whichever is larger.
+                    default_ms.max(mbt_ms)
+                } else {
+                    default_ms
+                }
+            } else {
+                default_ms
+            }
+        };
 
         // Parse `<Location>` elements — alternative manifest URLs used as
         // fallback on refresh failure (mirrors `LocationSelector.js`).
@@ -796,7 +904,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             video_track,
             audio_track,
             current_period_index: 0,
-            buffer_target_ms: 12_000.0,
+            buffer_target_ms,
             clock,
             playback_started_at: None,
             paused: false,
@@ -815,6 +923,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             audio_max_bitrate_bps: None,
             cdn_blacklist: CdnBlacklist::new(),
             gap_controller: GapController::new(),
+            time_shift_buffer_depth_ms: mpd_ref_tsbd,
         })
     }
 
@@ -917,6 +1026,25 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// ```
     pub fn set_gap_settings(&mut self, settings: GapControllerSettings) {
         self.gap_controller.set_settings(settings);
+    }
+
+    /// `MPD@minBufferTime` in milliseconds, or `None` when the attribute is absent.
+    ///
+    /// DASH spec §5.3.1.2: the minimum amount of data the client should buffer
+    /// before starting playback.  [`Self::buffer_target_ms`] is seeded from
+    /// this value at session construction (VOD only; capped to 12 s minimum).
+    pub fn min_buffer_time_ms(&self) -> Option<f64> {
+        self.mpd.minBufferTime.map(|d| d.as_millis() as f64)
+    }
+
+    /// DVR window depth in milliseconds, parsed from `MPD@timeShiftBufferDepth`.
+    ///
+    /// `None` when the attribute is absent or for VOD streams.
+    /// When present, `fetch_next_segment` silently advances `segment_number`
+    /// past segments that have expired from the live DVR window rather than
+    /// repeatedly failing with `AllBaseUrlsFailed`.
+    pub fn time_shift_buffer_depth_ms(&self) -> Option<f64> {
+        self.time_shift_buffer_depth_ms
     }
 
     /// The number of `Period` elements in the manifest.
@@ -1027,7 +1155,13 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// `latency_ms` is the transfer duration of the most recent fetch (total
     /// bytes-on-the-wire time, not a pure round-trip time).
-    pub fn current_metrics(&self, media_type: MediaType) -> AbrMetrics {
+    ///
+    /// `buffer_level_ms` is computed as `(buffered_end − position_s) * 1000`,
+    /// clamped to `0`.  Pass the current renderer position in seconds (e.g.
+    /// from `query_position` in GStreamer or `currentTime` in MSE).  Passing
+    /// `0.0` gives the absolute buffer-end time, which overestimates the
+    /// available buffer after the first few segments.
+    pub fn current_metrics(&self, media_type: MediaType, position_s: f64) -> AbrMetrics {
         let track = match media_type {
             MediaType::Video => self.video_track.as_ref(),
             MediaType::Audio => self.audio_track.as_ref(),
@@ -1036,8 +1170,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let (buffer_level_ms, current_index, throughput_bps, latency_ms) =
             if let Some(t) = track {
                 let buffered = t.sink.buffered();
-                let level = buffered.last().map(|r| r.end * 1_000.0).unwrap_or(0.0);
-                (level, Some(t.current_index), t.throughput_ema_bps, t.last_transfer_ms)
+                let level = buffered
+                    .last()
+                    .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
+                    .unwrap_or(0.0);
+                (level, Some(t.current_index), t.throughput_tracker.estimate(), t.last_transfer_ms)
             } else {
                 (0.0, None, 0.0, 0.0)
             };
@@ -1281,12 +1418,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             .into_iter()
             .flatten()
         {
-            let seg_dur_s = track.segment_duration_ms / 1_000.0;
-            let offset_segs = if seg_dur_s > 0.0 {
-                (position_s / seg_dur_s).floor() as u64
-            } else {
-                0
-            };
+        let seg_dur_s = track.segment_duration_ms / 1_000.0;
+        // Map the presentation-timeline position into a segment index.
+        // DASH spec: presentation_time(N) = (N − start_number) × seg_dur_s + Period@start
+        // → N = start_number + ⌊(position_s − Period@start) / seg_dur_s⌋
+        let adjusted_pos = (position_s - track.period_start_s).max(0.0);
+        let offset_segs = if seg_dur_s > 0.0 {
+            (adjusted_pos / seg_dur_s).floor() as u64
+        } else {
+            0
+        };
 
             let new_seg = track.start_number + offset_segs;
 
@@ -1302,7 +1443,19 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let new_seg = new_seg.max(track.start_number);
 
             // Reset per-addressing-mode state.
-            track.next_segment_time = None; // Timeline: restart walk from new entry
+            // For SegmentTimeline ($Time$) tracks, compute the target time in
+            // timescale ticks and set next_segment_time directly — this lets
+            // find_timeline_segment snap to the nearest valid entry instead of
+            // restarting from the first entry (which is wrong for live streams
+            // with large absolute tick values).
+            if track.addressing_mode == AddressingMode::Timeline {
+                let target_ticks = ((position_s - track.period_start_s).max(0.0)
+                    * track.timescale as f64)
+                    .round() as u64;
+                track.next_segment_time = Some(target_ticks);
+            } else {
+                track.next_segment_time = None;
+            }
             if matches!(track.addressing_mode, AddressingMode::Base { .. }) {
                 track.segment_byte_ranges = None; // sidx will be re-fetched
             }
@@ -1313,7 +1466,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             track.initial_segment_number = new_seg;
 
             let snapped_offset = new_seg.saturating_sub(track.start_number);
-            snapped_s = snapped_offset as f64 * seg_dur_s;
+            snapped_s = snapped_offset as f64 * seg_dur_s + track.period_start_s;
         }
 
         tracing::info!(
@@ -1332,23 +1485,109 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.mpd.mpdtype.as_deref() == Some("dynamic")
     }
 
+    /// Returns the DASH presentation-timeline position (in seconds) at which
+    /// the first live segment will be buffered in the MSE `SourceBuffer`.
+    ///
+    /// This matches the dash.js approach: `timestampOffset` is set to
+    /// `Period@start − presentationTimeOffset/timescale`, so fMP4 decode times
+    /// are NOT remapped — they retain their native (potentially large) values.
+    /// The caller must seek the media element to this position so that it finds
+    /// the buffered content.
+    ///
+    /// Formula: `(initial_segment_number − start_number) × seg_dur_s`
+    ///
+    /// Returns `0.0` for VOD streams or when no tracks are present.
+    pub fn live_presentation_start_s(&self) -> f64 {
+        if !self.is_live() {
+            return 0.0;
+        }
+        let track = self.video_track.as_ref().or(self.audio_track.as_ref());
+        track.map_or(0.0, |t| {
+            let seg_dur_s = t.segment_duration_ms / 1_000.0;
+            t.initial_segment_number.saturating_sub(t.start_number) as f64 * seg_dur_s
+        })
+    }
+
     /// The minimum interval (in milliseconds) between manifest refreshes.
     pub fn minimum_update_period_ms(&self) -> Option<u64> {
         self.minimum_update_period_ms
     }
 
+    /// Unix-epoch seconds at which the live stream ends, from
+    /// `MPD@availabilityEndTime`.
+    ///
+    /// `None` for VOD streams or live streams without a declared end time.
+    /// When present, [`Self::fetch_next_segment`] returns
+    /// [`DashError::EndOfStream`] as soon as the wall clock exceeds this value,
+    /// allowing cleanly scheduled broadcasts to terminate without 404 loops
+    /// (DASH spec §5.3.1.2).
+    pub fn availability_end_time_s(&self) -> Option<f64> {
+        self.mpd.availabilityEndTime
+    }
+
+    /// Returns the next segment number that will be fetched for the given media
+    /// track, or `0` when the track is absent.
+    ///
+    /// Useful in tests to verify that live-edge snapping produced the expected
+    /// starting segment number.
+    pub fn current_segment_number(&self, media_type: &MediaType) -> u64 {
+        match media_type {
+            MediaType::Video => self.video_track.as_ref().map(|t| t.segment_number).unwrap_or(0),
+            MediaType::Audio => self.audio_track.as_ref().map(|t| t.segment_number).unwrap_or(0),
+        }
+    }
+
+    /// Returns the most recently decoded `ProducerReferenceTimeBox` (`prft`)
+    /// for the given media track, or `None` if no `prft` has been seen in any
+    /// fetched segment for that track.
+    ///
+    /// Use this to compute end-to-end latency for low-latency live streams:
+    ///
+    /// ```text
+    /// latency_s = now_unix_s - prft.wall_clock_s
+    ///             + (current_position_ticks - prft.media_time) / timescale
+    /// ```
+    ///
+    /// `prft.media_time` is in the timescale ticks of `prft.reference_track_id`.
+    /// Divide by the session's known segment timescale (derived from
+    /// `SegmentTemplate@timescale`) to convert to seconds.
+    pub fn last_producer_reference_time(
+        &self,
+        media_type: &MediaType,
+    ) -> Option<&ProducerReferenceTime> {
+        match media_type {
+            MediaType::Video => self.video_track.as_ref()?.last_prft.as_ref(),
+            MediaType::Audio => self.audio_track.as_ref()?.last_prft.as_ref(),
+        }
+    }
+
     /// Returns `true` when the session should call [`Self::refresh_manifest`]
     /// before the next segment fetch.
+    ///
+    /// For live streams, the DASH spec §5.4 states that when
+    /// `@minimumUpdatePeriod` is absent the client may refresh as often as
+    /// once per segment duration.  We therefore fall back to the video (or
+    /// audio) track's segment duration when the attribute is absent, matching
+    /// the dash.js `ManifestUpdater.js` behaviour.
     pub fn should_refresh_manifest(&self) -> bool {
         if !self.is_live() {
             return false;
         }
-        let Some(period_ms) = self.minimum_update_period_ms else {
-            return false;
+        // Resolve the effective minimum update period.
+        let period_ms: f64 = match self.minimum_update_period_ms {
+            Some(ms) => ms as f64,
+            None => {
+                // Absent → default to one segment duration.
+                let seg_dur = self.video_track.as_ref()
+                    .or(self.audio_track.as_ref())
+                    .map(|t| t.segment_duration_ms)
+                    .unwrap_or(2_000.0);
+                seg_dur
+            }
         };
         match self.last_manifest_refresh {
             None => true,
-            Some(last_ms) => (self.clock.now_ms() - last_ms) as u64 >= period_ms,
+            Some(last_ms) => (self.clock.now_ms() - last_ms) >= period_ms,
         }
     }
 
@@ -1499,6 +1738,117 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
 
         self.mpd = new_mpd;
+
+        // P1-1: Re-parse timeShiftBufferDepth from the refreshed manifest.
+        // DVR window depth may change across refreshes (e.g. broadcaster widens
+        // the window during a live event).
+        if self.is_live() {
+            self.time_shift_buffer_depth_ms =
+                self.mpd.timeShiftBufferDepth.map(|d| d.as_millis() as f64);
+        }
+
+        // P1-2: Re-derive period_start_s for the current period.
+        // In live multi-period streams the broadcaster may correct Period@start
+        // in a refreshed manifest; seek_to() would use the stale value without
+        // this update.
+        {
+            let current_idx = self.current_period_index;
+            if let Some(period) = self.mpd.periods.get(current_idx) {
+                let new_period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                if let Some(track) = self.video_track.as_mut() {
+                    track.period_start_s = new_period_start_s;
+                }
+                if let Some(track) = self.audio_track.as_mut() {
+                    track.period_start_s = new_period_start_s;
+                }
+            }
+        }
+
+        // Re-snap the live edge for both tracks.  If the segment_number has
+        // fallen behind the new live edge by more than the safety margin (e.g.
+        // after a long pause or network outage), advance it so the session does
+        // not attempt to fetch a large backlog of expired segments.
+        if self.is_live() {
+            let ast_s: Option<f64> = self.mpd.availabilityStartTime;
+            let spd_s: Option<f64> = self.mpd.suggestedPresentationDelay
+                .map(|d| d.as_secs_f64());
+            if let Some(ast) = ast_s {
+                let now_s = self.clock.unix_s() + self.utc_clock_offset_s;
+                for (label, track_opt) in [
+                    ("video", self.video_track.as_mut()),
+                    ("audio", self.audio_track.as_mut()),
+                ] {
+                    if let Some(track) = track_opt {
+                        let new_live_edge = compute_live_edge_segment(
+                            ast,
+                            now_s,
+                            track.segment_duration_ms / 1_000.0,
+                            track.start_number,
+                            spd_s,
+                            track.availability_time_offset_s,
+                        );
+                        if track.segment_number < new_live_edge {
+                            tracing::info!(
+                                media_type = label,
+                                old_segment = track.segment_number,
+                                new_live_edge,
+                                "manifest refresh: segment_number behind live edge — snapping"
+                            );
+                            track.segment_number = new_live_edge;
+                            track.initial_segment_number = new_live_edge;
+                        }
+                    }
+                }
+            }
+        }
+
+        // For $Time$-addressed (Timeline) tracks, validate next_segment_time
+        // against the refreshed SegmentTimeline.  If the referenced time is no
+        // longer present (it has slid out of the live window), reset it to None
+        // so the next fetch starts from the earliest available entry rather than
+        // signalling a spurious EndOfStream.
+        if let Some(period) = self.mpd.periods.first() {
+            for (media_type_ref, track_opt) in [
+                (MediaType::Video, self.video_track.as_mut()),
+                (MediaType::Audio, self.audio_track.as_mut()),
+            ] {
+                if let Some(track) = track_opt {
+                    if track.addressing_mode != AddressingMode::Timeline {
+                        continue;
+                    }
+                    if let Some(nst) = track.next_segment_time {
+                        if let Some(adaptation) = find_adaptation(period, &media_type_ref) {
+                            let repr_id = track
+                                .representations
+                                .get(track.current_index)
+                                .map(|ri| ri.id.as_str())
+                                .unwrap_or("");
+                            let repr_obj = adaptation
+                                .representations
+                                .iter()
+                                .find(|r| r.id.as_deref() == Some(repr_id));
+                            if let Some(tmpl) =
+                                merge_segment_templates(repr_obj, adaptation, period)
+                            {
+                                if let Some(tl) = &tmpl.SegmentTimeline {
+                                    if find_timeline_segment(&tl.segments, Some(nst)).is_none()
+                                    {
+                                        tracing::warn!(
+                                            media_type = %media_type_ref,
+                                            next_segment_time = nst,
+                                            "manifest refresh: next_segment_time expired \
+                                             from new timeline — resetting to oldest available"
+                                        );
+                                        track.next_segment_time = None;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         tracing::info!(
             minimum_update_period_ms = ?self.minimum_update_period_ms,
             "manifest refreshed successfully"
@@ -1553,6 +1903,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// For **live streams**, the manifest is refreshed automatically at the
     /// start of each call when `MPD@minimumUpdatePeriod` has elapsed.
     ///
+    /// When a live segment returns HTTP 404 (not yet generated), the call waits
+    /// one segment duration and retries once before propagating the error.
+    ///
     /// Returns [`DashError::EndOfStream`] when all segments in all periods have
     /// been fetched.
     pub async fn fetch_next_segment(
@@ -1570,6 +1923,22 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                         media_type: media_type.to_string(),
                     });
                 }
+                // Live segment not yet generated: wait one segment duration then
+                // retry once.  If still unavailable, propagate as AllBaseUrlsFailed.
+                Err(DashError::SegmentNotYetAvailable { .. }) => {
+                    let seg_dur_ms = self
+                        .track(&media_type)
+                        .map(|t| t.segment_duration_ms)
+                        .unwrap_or(2_000.0);
+                    tracing::info!(
+                        media_type = %media_type,
+                        wait_ms = seg_dur_ms as u64,
+                        "live segment not yet available — waiting one segment duration before retry"
+                    );
+                    Delay::new(std::time::Duration::from_millis(seg_dur_ms as u64)).await;
+                    // Single retry: if still 404, propagate the underlying error.
+                    return self.fetch_next_segment_inner(media_type.clone(), metrics).await;
+                }
                 other => return other,
             }
         }
@@ -1585,6 +1954,28 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         metrics: &AbrMetrics,
     ) -> Result<QualityDecision, DashError> {
         self.refresh_manifest_if_due().await;
+
+        // Availability-end-time check (DASH spec §5.3.1.2).
+        //
+        // When MPD@availabilityEndTime is set the live broadcast has a declared
+        // end time. Once the wall clock passes it, no new segments will be
+        // generated; return EndOfStream cleanly rather than looping on 404s.
+        if self.is_live() {
+            if let Some(aet_s) = self.mpd.availabilityEndTime {
+                let now_s = self.clock.unix_s() + self.utc_clock_offset_s;
+                if now_s > aet_s {
+                    tracing::info!(
+                        media_type = %media_type,
+                        availability_end_time_s = aet_s,
+                        now_s,
+                        "availabilityEndTime passed — signalling EndOfStream"
+                    );
+                    return Err(DashError::EndOfStream {
+                        media_type: media_type.to_string(),
+                    });
+                }
+            }
+        }
 
         // Segment-count EOS check.
         {
@@ -1626,6 +2017,45 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     return Err(DashError::EndOfStream {
                         media_type: media_type.to_string(),
                     });
+                }
+            }
+        }
+
+        // DVR window floor check (live streams only).
+        //
+        // If `MPD@timeShiftBufferDepth` is set, segments older than
+        // `live_edge − floor(tsbd / seg_dur)` are outside the DVR window and
+        // their CDN content may have been deleted.  Advance `segment_number`
+        // past the floor so the session does not repeatedly attempt expired
+        // segments (DASH spec §4.5.3).
+        if self.is_live() {
+            if let (Some(tsbd_ms), Some(ast)) = (
+                self.time_shift_buffer_depth_ms,
+                self.mpd.availabilityStartTime,
+            ) {
+                let track = self.track(&media_type)?;
+                let seg_dur_s = track.segment_duration_ms / 1_000.0;
+                let now_s = self.clock.unix_s() + self.utc_clock_offset_s;
+                let live_edge = compute_live_edge_segment(
+                    ast,
+                    now_s,
+                    seg_dur_s,
+                    track.start_number,
+                    self.mpd.suggestedPresentationDelay.map(|d| d.as_secs_f64()),
+                    track.availability_time_offset_s,
+                );
+                let window_segments = (tsbd_ms / 1_000.0 / seg_dur_s).floor() as u64;
+                let dvr_floor = live_edge.saturating_sub(window_segments).max(track.start_number);
+                if track.segment_number < dvr_floor {
+                    tracing::warn!(
+                        media_type = %media_type,
+                        segment_number = track.segment_number,
+                        dvr_floor,
+                        live_edge,
+                        "segment outside DVR window — advancing to floor"
+                    );
+                    let track = self.track_mut(&media_type)?;
+                    track.segment_number = dvr_floor;
                 }
             }
         }
@@ -1809,8 +2239,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 let sl = merge_segment_lists(repr_obj, adaptation, period)
                     .ok_or(DashError::SegmentUrlUnresolvable)?;
 
-                // `seg_num` is used as a direct 0-based index (start_number is 0).
-                let seg_idx = seg_num as usize;
+                // `seg_num − start_number` gives the 0-based index into segment_urls.
+                // (start_number defaults to 0 so this is backwards-compatible.)
+                let seg_idx = seg_num.saturating_sub(track.start_number) as usize;
                 let seg_url_entry =
                     sl.segment_urls.get(seg_idx).ok_or_else(|| {
                         tracing::info!(
@@ -1872,7 +2303,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                             media_type: media_type.to_string(),
                         }
                     })?;
-                let p = expand_template(media_tmpl, &rep.id, rep.bandwidth, 0, Some(seg_time));
+                let p = expand_template(media_tmpl, &rep.id, rep.bandwidth, seg_num, Some(seg_time));
                 (p, Some((seg_time, seg_dur)))
             } else {
                 let p = expand_template(media_tmpl, &rep.id, rep.bandwidth, seg_num, None);
@@ -1973,42 +2404,59 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     break 'candidates;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        url = %segment_url,
-                        service_location = %candidate.service_location,
-                        error = %e,
-                        "segment fetch failed — blacklisting CDN and trying next base URL"
-                    );
-                    self.cdn_blacklist.record_failure(&candidate.service_location);
-                    last_err = DashError::AllBaseUrlsFailed {
-                        last_error: e.to_string(),
-                    };
+                    // HTTP 404 on a live stream means the segment has not been
+                    // generated yet (we are too close to the live edge).  Do
+                    // not blacklist the CDN — the failure is transient.  Signal
+                    // SegmentNotYetAvailable so fetch_next_segment can wait and
+                    // retry (mirrors FragmentLoader.js behaviour in dash.js).
+                    let is_live_404 = self.is_live()
+                        && matches!(
+                            e,
+                            DashError::ManifestFetch(
+                                crate::fetch::FetchError::Http { status: 404, .. }
+                            )
+                        );
+                    if is_live_404 {
+                        tracing::debug!(
+                            url = %segment_url,
+                            segment_number = seg_number,
+                            "live segment not yet available (HTTP 404) — will wait and retry"
+                        );
+                        last_err = DashError::SegmentNotYetAvailable {
+                            media_type: mt_str.clone(),
+                        };
+                    } else {
+                        tracing::warn!(
+                            url = %segment_url,
+                            service_location = %candidate.service_location,
+                            error = %e,
+                            "segment fetch failed — blacklisting CDN and trying next base URL"
+                        );
+                        self.cdn_blacklist.record_failure(&candidate.service_location);
+                        last_err = DashError::AllBaseUrlsFailed {
+                            last_error: e.to_string(),
+                        };
+                    }
                 }
             }
         }
 
         let response = opt_response.ok_or(last_err)?;
 
-        // Update per-track throughput EMA and transfer latency from this response.
+        // Update per-track throughput tracker and transfer latency from this response.
         {
             let track = self.track_mut(&media_type)?;
             track.last_transfer_ms = response.transfer_duration_ms as f64;
             if let Some(bps) = response.throughput_bps() {
-                if track.throughput_ema_bps == 0.0 {
-                    // First sample: seed the EMA directly so it does not spend
-                    // many segments climbing out of an artificially low value.
-                    track.throughput_ema_bps = bps;
-                } else {
-                    track.throughput_ema_bps = THROUGHPUT_EMA_ALPHA * bps
-                        + (1.0 - THROUGHPUT_EMA_ALPHA) * track.throughput_ema_bps;
-                }
+                let elapsed_s = response.transfer_duration_ms as f64 / 1_000.0;
+                track.throughput_tracker.record(bps, elapsed_s);
             }
             tracing::debug!(
                 media_type = %media_type,
                 segment_number = seg_number,
-                throughput_bps = track.throughput_ema_bps,
+                throughput_bps = track.throughput_tracker.estimate(),
                 transfer_ms = track.last_transfer_ms,
-                "throughput EMA updated"
+                "throughput updated"
             );
         }
 
@@ -2021,6 +2469,20 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 end_s   = sidx.map(|s| s.end_s).unwrap_or(0.0),
                 "sidx timing extracted"
             );
+        }
+
+        // Parse ProducerReferenceTime (prft) box for latency measurement.
+        if let Some(prft) = parse_prft(&response.data) {
+            tracing::debug!(
+                media_type = %media_type,
+                segment_number = seg_number,
+                wall_clock_s = prft.wall_clock_s,
+                media_time = prft.media_time,
+                reference_track_id = prft.reference_track_id,
+                "prft: producer reference time extracted"
+            );
+            let track = self.track_mut(&media_type)?;
+            track.last_prft = Some(prft);
         }
 
         // Parse and broadcast any in-band DASH events embedded in this segment.
@@ -2369,6 +2831,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// Used by [`Self::fetch_init_segment`] to implement CDN-aware fallback for
     /// init segment fetches (same logic as the media segment candidate loop).
+    #[allow(clippy::type_complexity)]
     fn resolve_init_path_and_candidates(
         &self,
         media_type: &MediaType,
@@ -2395,11 +2858,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         );
 
         // ─ SegmentTemplate init ──────────────────────────────────────────────
+        // DASH spec §5.3.9.5: the <Initialization> child element takes
+        // precedence over the @initialization attribute when both are present.
         if let Some(tmpl) = merge_segment_templates(repr_obj, adaptation, period) {
             let init_tmpl = tmpl
-                .initialization
-                .as_deref()
-                .or_else(|| tmpl.Initialization.as_ref()?.sourceURL.as_deref());
+                .Initialization.as_ref().and_then(|i| i.sourceURL.as_deref())
+                .or(tmpl.initialization.as_deref());
 
             if let Some(init_tmpl) = init_tmpl {
                 let path = expand_template(init_tmpl, &rep.id, rep.bandwidth, 0, None);

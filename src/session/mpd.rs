@@ -60,6 +60,12 @@ pub(super) fn merge_segment_templates(
         if merged.presentationTimeOffset.is_none() {
             merged.presentationTimeOffset = tmpl.presentationTimeOffset;
         }
+        if merged.availabilityTimeOffset.is_none() {
+            merged.availabilityTimeOffset = tmpl.availabilityTimeOffset;
+        }
+        if merged.availabilityTimeComplete.is_none() {
+            merged.availabilityTimeComplete = tmpl.availabilityTimeComplete;
+        }
         if merged.Initialization.is_none() {
             merged.Initialization.clone_from(&tmpl.Initialization);
         }
@@ -232,22 +238,37 @@ pub(super) fn extract_representations(adaptation: &AdaptationSet) -> Vec<Represe
 
 /// Derive a MIME type string suitable for `addSourceBuffer` from an
 /// [`AdaptationSet`].
+///
+/// Resolution order (DASH spec §5.3.7.2):
+/// 1. `AdaptationSet@mimeType` combined with the best available codec string:
+///    - `AdaptationSet@codecs` (shared across all representations), or
+///    - the first `Representation@codecs` found in the set.
+/// 2. The first `Representation` that declares its own `@mimeType` (plus its
+///    `@codecs` if present).
+/// 3. `"application/octet-stream"` as a last-resort fallback.
+///
+/// Searching *all* representations (not just the first) ensures the codec
+/// string is found even when lower-bandwidth representations omit it.
 pub(super) fn adaptation_mime_type(adaptation: &AdaptationSet) -> String {
+    // Helper: first codec string declared in any representation.
+    let rep_codecs = || adaptation.representations.iter().find_map(|r| r.codecs.as_deref());
+
     if let Some(mime) = &adaptation.mimeType {
-        if let Some(rep) = adaptation.representations.first() {
-            if let Some(codecs) = &rep.codecs {
-                return format!("{};codecs=\"{}\"", mime, codecs);
-            }
-        }
-        return mime.clone();
+        // Prefer AS-level @codecs; fall back to first Representation that has them.
+        let codecs = adaptation.codecs.as_deref().or_else(rep_codecs);
+        return match codecs {
+            Some(c) => format!("{};codecs=\"{}\"", mime, c),
+            None => mime.clone(),
+        };
     }
 
-    if let Some(rep) = adaptation.representations.first() {
+    // No AS-level MIME: use the first Representation that declares one.
+    for rep in &adaptation.representations {
         if let Some(mime) = &rep.mimeType {
-            if let Some(codecs) = &rep.codecs {
-                return format!("{};codecs=\"{}\"", mime, codecs);
-            }
-            return mime.clone();
+            return match &rep.codecs {
+                Some(c) => format!("{};codecs=\"{}\"", mime, c),
+                None => mime.clone(),
+            };
         }
     }
 
@@ -301,10 +322,12 @@ pub(super) fn merge_segment_lists(
 /// Extract `(start_number, segment_duration_ms, total_segments)` for a track
 /// that uses `SegmentList` addressing.
 ///
-/// `start_number` is always `0` for `SegmentList` streams because the
-/// addressing is index-based (`segment_urls[segment_number]`), not
-/// number-based.  `total_segments` is `segment_urls.len()` (or `None` when
-/// the merged list is empty).
+/// `start_number` is taken from `SegmentList@startNumber` (default 0).
+/// The segment index into `segment_urls` is computed as
+/// `segment_number − start_number`, so a `startNumber="1"` SegmentList
+/// works just like a `SegmentTemplate` with the same `startNumber`.
+/// `total_segments` is `segment_urls.len()` (or `None` when the merged list
+/// is empty).
 pub(super) fn extract_segment_list_timing(
     adaptation: &AdaptationSet,
     period: &Period,
@@ -313,6 +336,8 @@ pub(super) fn extract_segment_list_timing(
     let Some(sl) = merge_segment_lists(first_repr, adaptation, period) else {
         return (0, 2_000.0, None);
     };
+
+    let start_number = sl.startNumber.unwrap_or(0);
 
     let seg_dur_ms = match (sl.duration, sl.timescale) {
         (Some(dur), Some(ts)) => dur as f64 / ts as f64 * 1_000.0,
@@ -326,7 +351,7 @@ pub(super) fn extract_segment_list_timing(
         Some(sl.segment_urls.len() as u64)
     };
 
-    (0, seg_dur_ms, total)
+    (start_number, seg_dur_ms, total)
 }
 
 /// Walk the element hierarchy (Representation → AdaptationSet → Period) for

@@ -211,32 +211,50 @@ pub(super) fn resolve_effective_base_url(
 }
 
 /// Sort a slice of `BaseURL` elements by priority ascending with
-/// weight-proportional random ordering within each same-priority tier.
+/// weight-proportional ordering within each same-priority tier.
 ///
-/// Uses the Efraimidis–Spirakis algorithm: each item receives a score
-/// `U^(1/weight)` where U is uniform random; higher scores come first.
-/// This produces a correctly weighted random permutation within each tier.
+/// **Within a tier**, ordering is determined as follows:
+/// - If every element in the tier has the same effective weight (or no `@weight`
+///   attribute), document order is preserved.  This is deterministic and matches
+///   the DASH-IF IOP recommendation.
+/// - If weights differ, the Efraimidis–Spirakis algorithm is applied: each item
+///   receives a score `U^(1/weight)` where U is uniform random; higher scores
+///   come first.  This produces a correctly weighted random permutation.
 fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    // Group by priority (preserving document order within each group).
+    let mut by_priority: std::collections::BTreeMap<u64, Vec<&BaseURL>> =
+        std::collections::BTreeMap::new();
+    for b in bases {
+        by_priority.entry(b.priority.unwrap_or(1)).or_default().push(b);
+    }
 
-    let mut scored: Vec<(u64, f64, &BaseURL)> = bases
-        .iter()
-        .map(|b| {
-            let priority = b.priority.unwrap_or(1);
-            let weight = b.weight.unwrap_or(1).max(1) as f64;
-            let u: f64 = rng.gen::<f64>().max(1e-10_f64);
-            let score = u.powf(1.0 / weight);
-            (priority, score, b)
-        })
-        .collect();
+    let mut result = Vec::with_capacity(bases.len());
+    for (_, tier) in by_priority {
+        // Check whether all items in this tier share the same effective weight.
+        let first_w = tier[0].weight.unwrap_or(1);
+        let all_same = tier.iter().all(|b| b.weight.unwrap_or(1) == first_w);
 
-    scored.sort_by(|a, b| {
-        a.0.cmp(&b.0)
-            .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
-    });
-
-    scored.into_iter().map(|(_, _, b)| b).collect()
+        if all_same {
+            // Document order is sufficient.
+            result.extend(tier);
+        } else {
+            // Weighted random permutation (Efraimidis–Spirakis).
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let mut scored: Vec<(f64, &BaseURL)> = tier
+                .iter()
+                .map(|&b| {
+                    let weight = b.weight.unwrap_or(1).max(1) as f64;
+                    let u: f64 = rng.gen::<f64>().max(1e-10_f64);
+                    (u.powf(1.0 / weight), b)
+                })
+                .collect();
+            // Higher score = higher priority within the tier.
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            result.extend(scored.into_iter().map(|(_, b)| b));
+        }
+    }
+    result
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

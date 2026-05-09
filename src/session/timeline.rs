@@ -22,47 +22,80 @@ use crate::manifest::mpd_types::S;
 pub(super) fn find_timeline_segment(segments: &[S], target_time: Option<u64>) -> Option<(u64, u64)> {
     let mut cursor: u64 = 0; // inferred running start time
 
-    for s in segments {
+    for (idx, s) in segments.iter().enumerate() {
         // `t` overrides the running cursor when present.
         let seg_start = s.t.unwrap_or(cursor);
         cursor = seg_start;
         let dur = s.d;
 
         // `r` is the *extra* repeat count (on top of the first occurrence).
-        // `r = -1` means infinite (live sliding window); treated as 1 copy for
-        // EOS purposes — `find_timeline_segment` will always find it on the
-        // first pass (the `target_time` check below will match any time that
-        // falls in the infinite-repeat block).
+        // `r = -1` means infinite (live sliding window).
         let repeats: i64 = s.r.unwrap_or(0);
-        let repeat_count = if repeats < 0 { i64::MAX } else { repeats };
 
-        // Iterate over the (1 + repeats) occurrences this S entry covers.
-        for _ in 0..=repeat_count {
+        if repeats < 0 {
+            // ── Infinite-repeat entry (r = -1) ───────────────────────────────
+            // Use arithmetic snapping to avoid an unbounded inner loop.
+            // The block's upper bound is the explicit `t` of the next S entry,
+            // when present — targets at or beyond that point belong to the
+            // subsequent entry.
+            let next_explicit_t: Option<u64> = segments
+                .get(idx + 1)
+                .and_then(|next| next.t);
+
             match target_time {
                 None => {
-                    // Caller wants the very first segment in the timeline.
+                    // Caller wants the very first segment — return immediately.
                     return Some((cursor, dur));
                 }
-                Some(t) if cursor == t => {
-                    return Some((cursor, dur));
+                Some(t) => {
+                    if t < cursor {
+                        // Overshot without a match.
+                        return None;
+                    }
+                    if dur == 0 {
+                        // Degenerate duration — cannot advance; let subsequent
+                        // S entries be checked.
+                        break;
+                    }
+                    // If the next S entry has an explicit `t` and the requested
+                    // time falls at or beyond it, skip this block entirely.
+                    if let Some(nt) = next_explicit_t {
+                        if t >= nt {
+                            // Advance cursor to the start of the next block
+                            // so its implicit-cursor path (no `t`) is correct.
+                            cursor = nt;
+                            continue;
+                        }
+                    }
+                    let offset = t - cursor;
+                    if offset.is_multiple_of(dur) {
+                        // t falls exactly on this entry's grid → match.
+                        return Some((t, dur));
+                    }
+                    // t is not aligned to this entry's grid.  Advance cursor
+                    // past t so that any subsequent S entry can be checked.
+                    let steps = offset / dur + 1;
+                    cursor += steps * dur;
                 }
-                Some(t) if cursor > t => {
-                    // Overshot without a match — timeline is exhausted for this target.
-                    return None;
-                }
-                _ => {}
             }
-            cursor += dur;
-
-            // For infinite-repeat entries, stop advancing once we've found
-            // that the target falls within this block (handled above via the
-            // `cursor == t` arm) or that the target is still ahead.  We must
-            // also guard against looping forever when `target_time = None`
-            // (handled by the early return above), so this arm is only reached
-            // when `target_time = Some(t)` with `t > cursor_after_step`.
-            // Break the inner loop so the outer `for s in segments` continues.
-            if repeats < 0 {
-                break;
+        } else {
+            // ── Finite-repeat entry (r ≥ 0) ──────────────────────────────────
+            // Iterate over the (1 + r) occurrences this S entry covers.
+            for _ in 0..=repeats as u64 {
+                match target_time {
+                    None => {
+                        return Some((cursor, dur));
+                    }
+                    Some(t) if cursor == t => {
+                        return Some((cursor, dur));
+                    }
+                    Some(t) if cursor > t => {
+                        // Overshot without a match.
+                        return None;
+                    }
+                    _ => {}
+                }
+                cursor += dur;
             }
         }
     }
@@ -151,14 +184,40 @@ use crate::manifest::mpd_types::S;
         assert_eq!(find_timeline_segment(&segs, Some(270_000)), None);
     }
 
-    /// `r = -1` (infinite repeat) — target at the first position is found.
+    /// `r = -1` (infinite repeat) — any target on the entry's grid is found.
+    ///
+    /// Live streams call `find_timeline_segment` once per segment, each time
+    /// passing `next_segment_time = previous_start + duration`.  The arithmetic
+    /// snapping must therefore handle targets arbitrarily far into the future.
     #[test]
     fn infinite_repeat() {
         let segs = vec![s(Some(0), 90_000, Some(-1))];
+        // First occurrence.
         assert_eq!(find_timeline_segment(&segs, Some(0)), Some((0, 90_000)));
-        // The inner loop breaks after one iteration for r=-1 entries,
-        // so only the first occurrence is returned by a single call.
-        // Live streams advance next_segment_time explicitly after each fetch.
+        // Second occurrence (simulates next_segment_time = 0 + 90_000).
+        assert_eq!(find_timeline_segment(&segs, Some(90_000)), Some((90_000, 90_000)));
+        // Far-future occurrence (simulates many segments later).
+        assert_eq!(
+            find_timeline_segment(&segs, Some(90_000 * 5)),
+            Some((90_000 * 5, 90_000))
+        );
+        // Misaligned target returns None.
+        assert_eq!(find_timeline_segment(&segs, Some(1)), None);
+    }
+
+    /// `r = -1` block followed by another `S` entry — targets in both ranges
+    /// are found correctly, and the boundary belongs to the second entry.
+    #[test]
+    fn infinite_repeat_then_next_entry() {
+        // r=-1 block: t=0, d=100 covers t=0, 100, 200, 300, 400 (i.e. [0, 500)).
+        // Second block: t=500, d=200.
+        let segs = vec![s(Some(0), 100, Some(-1)), s(Some(500), 200, None)];
+        assert_eq!(find_timeline_segment(&segs, Some(0)), Some((0, 100)));
+        assert_eq!(find_timeline_segment(&segs, Some(300)), Some((300, 100)));
+        // t=500 belongs to the second S entry, not the r=-1 block.
+        assert_eq!(find_timeline_segment(&segs, Some(500)), Some((500, 200)));
+        // t=700 is beyond the second entry (500+200) → None.
+        assert_eq!(find_timeline_segment(&segs, Some(700)), None);
     }
 
     /// Exhausted timeline (target beyond all entries) returns `None`.

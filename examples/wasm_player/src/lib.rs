@@ -12,6 +12,7 @@
 //! | Clock | `performance.now()` | `bridge.nowMs()` |
 //! | Clock | `Date.now()` | `bridge.unixNowS()` |
 //! | Utility | `setTimeout()` | `bridge.sleep(ms)` |
+//! | Utility | `video.currentTime =` | `bridge.seekTo(time_s)` |
 //! | MSE | `new MediaSource()` | `bridge.setupMediaSource()` |
 //! | MSE | `URL.createObjectURL()` | `bridge.setupMediaSource()` |
 //! | MSE | `video.src = objectUrl` | `bridge.setupMediaSource()` |
@@ -118,6 +119,11 @@ extern "C" {
     // new Promise(r => setTimeout(r, ms))
     #[wasm_bindgen(method)]
     fn sleep(this: &JsBridge, ms: f64) -> Promise;
+
+    // video.currentTime = time_s  — seek the media element to the live edge
+    // presentation position before any segments are appended.
+    #[wasm_bindgen(method, js_name = seekTo)]
+    fn seek_to(this: &JsBridge, time_s: f64);
 
     // ── MediaSource lifecycle ─────────────────────────────────────────────
     // new MediaSource() + URL.createObjectURL() + video.src= + sourceopen
@@ -562,6 +568,22 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         "session constructed"
     );
 
+    // ── Live-stream pre-seek ───────────────────────────────────────────────
+    // dash.js approach: timestampOffset = Period@start − PTO/timescale, so
+    // fMP4 decode times are left at their native (potentially epoch-scale)
+    // values.  The video element must be seeked to where the buffered content
+    // will actually live; otherwise it waits at currentTime = 0 forever.
+    //
+    // We set duration = Infinity first so the browser does not clamp the seek.
+    if session.is_live() {
+        bridge
+            .set_duration(f64::INFINITY)
+            .map_err(|e| JsValue::from_str(&js_err(e)))?;
+        let seek_time = session.live_presentation_start_s();
+        bridge.seek_to(seek_time);
+        tracing::info!(seek_time, "live stream: seeked video element to live edge");
+    }
+
     session.notify_playing();
 
     // ── Segment fetch loop ─────────────────────────────────────────────────
@@ -581,7 +603,7 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         }
 
         if !video_done {
-            let metrics = session.current_metrics(MediaType::Video);
+            let metrics = session.current_metrics(MediaType::Video, 0.0);
             match session.fetch_next_segment(MediaType::Video, &metrics).await {
                 Ok(d) => tracing::debug!(
                     quality_index = d.index,
@@ -597,7 +619,7 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         }
 
         if !audio_done {
-            let metrics = session.current_metrics(MediaType::Audio);
+            let metrics = session.current_metrics(MediaType::Audio, 0.0);
             match session.fetch_next_segment(MediaType::Audio, &metrics).await {
                 Ok(d) => tracing::debug!(
                     quality_index = d.index,

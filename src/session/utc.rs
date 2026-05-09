@@ -13,7 +13,7 @@
 //! | `urn:mpeg:dash:utc:direct:2014` | Parse `@value` as an XS datetime — no network request needed |
 //! | `urn:mpeg:dash:utc:http-xsdate:2014` | GET `@value` URL; parse body as XS datetime |
 //! | `urn:mpeg:dash:utc:http-iso:2014` | GET `@value` URL; parse body as ISO 8601 (same parser) |
-//! | `urn:mpeg:dash:utc:http-head:2014` | Requires response headers — **not supported**; skipped with a warning |
+//! | `urn:mpeg:dash:utc:http-head:2014` | HEAD `@value` URL; parse `Date:` response header as RFC 2822 / XS datetime |
 //! | `urn:mpeg:dash:utc:ntp:2014` | Requires raw UDP NTP — **not supported**; skipped with a warning |
 //!
 //! The resolver tries elements in manifest order and stops at the first
@@ -116,11 +116,71 @@ pub(crate) async fn resolve_utc_timing<F: SegmentFetcher>(
             }
 
             SCHEME_HTTP_HEAD => {
-                tracing::warn!(
-                    scheme = SCHEME_HTTP_HEAD,
-                    "UTCTiming: http-head scheme requires response headers \
-                     and is not yet supported — trying next element"
-                );
+                // DASH spec §5.8.5.7: issue a HEAD request to the value URL and
+                // read the server's current time from the `Date:` response header.
+                // Requires the `SegmentFetcher::head_date` method to be implemented
+                // by the concrete fetcher; the default returns `Ok(None)` (not
+                // supported), causing this element to be skipped.
+                if let Some(url_str) = &entry.value {
+                    match Url::parse(url_str) {
+                        Ok(url) => {
+                            match fetcher.head_date(&url).await {
+                                Ok(Some(date_str)) => {
+                                    // The Date: header is RFC 2822 / HTTP-date format
+                                    // (e.g. "Sat, 09 May 2026 12:00:00 GMT").
+                                    // Our parser also accepts XS dateTime strings — try
+                                    // both formats by attempting the parse directly.
+                                    if let Some(server_s) = parse_http_date(&date_str) {
+                                        let offset = server_s - client_now_s;
+                                        tracing::info!(
+                                            scheme = SCHEME_HTTP_HEAD,
+                                            url = %url_str,
+                                            offset_s = offset,
+                                            "UTCTiming: clock offset resolved via http-head"
+                                        );
+                                        return offset;
+                                    }
+                                    tracing::warn!(
+                                        scheme = SCHEME_HTTP_HEAD,
+                                        url = %url_str,
+                                        date_header = %date_str,
+                                        "UTCTiming: http-head Date header could not be parsed \
+                                         — trying next element"
+                                    );
+                                }
+                                Ok(None) => {
+                                    tracing::warn!(
+                                        scheme = SCHEME_HTTP_HEAD,
+                                        url = %url_str,
+                                        "UTCTiming: http-head not supported by this fetcher \
+                                         (head_date returned None) — trying next element"
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        scheme = SCHEME_HTTP_HEAD,
+                                        url = %url_str,
+                                        error = %e,
+                                        "UTCTiming: http-head request failed — trying next element"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                scheme = SCHEME_HTTP_HEAD,
+                                url = %url_str,
+                                error = %e,
+                                "UTCTiming: invalid URL for http-head — trying next element"
+                            );
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        scheme = SCHEME_HTTP_HEAD,
+                        "UTCTiming: http-head element has no @value URL — trying next element"
+                    );
+                }
             }
 
             SCHEME_NTP => {
@@ -157,4 +217,108 @@ async fn query_http_utc<F: SegmentFetcher>(
     let body = std::str::from_utf8(&response.data).ok()?.trim().to_owned();
     let server_s = parse_xs_datetime(&body)?;
     Some(server_s - client_now_s)
+}
+
+/// Parse an HTTP `Date:` header value (RFC 2822 / IMF-fixdate) into a Unix
+/// timestamp in seconds.
+///
+/// Examples of accepted formats:
+/// - `"Sat, 09 May 2026 12:00:00 GMT"` (IMF-fixdate / RFC 2822)
+/// - `"2026-05-09T12:00:00Z"` (XS dateTime — falls through to `parse_xs_datetime`)
+///
+/// Returns `None` when the string cannot be parsed in any known format.
+fn parse_http_date(s: &str) -> Option<f64> {
+    // First try our XS dateTime parser (handles ISO 8601 variants).
+    if let Some(ts) = parse_xs_datetime(s) {
+        return Some(ts);
+    }
+
+    // Fall back to a minimal RFC 2822 / IMF-fixdate parser.
+    // Format: "<day-name>, <DD> <Mon> <YYYY> <HH>:<MM>:<SS> GMT"
+    // Example: "Sat, 09 May 2026 12:00:00 GMT"
+    parse_rfc2822_date(s)
+}
+
+/// Minimal parser for the RFC 2822 date format used in HTTP `Date:` headers.
+///
+/// Only parses the IMF-fixdate form (the only form allowed in HTTP/1.1):
+/// `<day-of-week>, <DD> <MMM> <YYYY> <HH>:<MM>:<SS> GMT`
+///
+/// Leap seconds and non-UTC zones are not supported.
+fn parse_rfc2822_date(s: &str) -> Option<f64> {
+    // Strip optional "<day-of-week>, " prefix.
+    let s = if let Some(comma_pos) = s.find(',') {
+        s[comma_pos + 1..].trim()
+    } else {
+        s.trim()
+    };
+
+    // Expected remaining: "DD Mon YYYY HH:MM:SS TZ"
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 5 {
+        return None;
+    }
+
+    let day: u64 = parts[0].parse().ok()?;
+    let month: u64 = match parts[1] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: u64 = parts[2].parse().ok()?;
+    let time_parts: Vec<&str> = parts[3].split(':').collect();
+    if time_parts.len() != 3 {
+        return None;
+    }
+    let hour: u64 = time_parts[0].parse().ok()?;
+    let minute: u64 = time_parts[1].parse().ok()?;
+    let second: u64 = time_parts[2].parse().ok()?;
+
+    // Convert to Unix timestamp using the proleptic Gregorian calendar.
+    // Days from epoch (1970-01-01) to (year-01-01).
+    let days_from_epoch = days_since_epoch(year, month, day)?;
+
+    let total_secs = days_from_epoch * 86_400 + hour * 3_600 + minute * 60 + second;
+    Some(total_secs as f64)
+}
+
+/// Compute the number of days since 1970-01-01 for the given (year, month, day).
+fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
+    if year < 1970 || !(1..=12).contains(&month) || day < 1 {
+        return None;
+    }
+
+    // Days in each month (non-leap year).
+    const DAYS_IN_MONTH: [u64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    let is_leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+
+    // Days from 1970-01-01 to start of `year`.
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+
+    // Days within the year up to the start of `month`.
+    for m in 1..month {
+        let idx = (m - 1) as usize;
+        days += DAYS_IN_MONTH[idx];
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+
+    // Day of month (1-based → 0-based offset).
+    days += day - 1;
+    Some(days)
 }

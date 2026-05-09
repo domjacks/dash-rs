@@ -236,7 +236,7 @@ async fn main() -> Result<(), DashError> {
         // ── Video ──────────────────────────────────────────────────────────────
         let t_fetch = Instant::now();
         let (vid_idx, vid_reason) = if !video_done {
-            let mut metrics = session.current_metrics(MediaType::Video);
+            let mut metrics = session.current_metrics(MediaType::Video, session.estimated_playback_position_s());
             metrics.throughput_bps = throughput_bps;
             metrics.buffer_level_ms = buf_ms;
             match session.fetch_next_segment(MediaType::Video, &metrics).await {
@@ -254,7 +254,7 @@ async fn main() -> Result<(), DashError> {
 
         // ── Audio ──────────────────────────────────────────────────────────────
         let (aud_idx, aud_reason) = if !audio_done {
-            let mut metrics = session.current_metrics(MediaType::Audio);
+            let mut metrics = session.current_metrics(MediaType::Audio, session.estimated_playback_position_s());
             metrics.throughput_bps = throughput_bps;
             metrics.buffer_level_ms = buf_ms;
             match session.fetch_next_segment(MediaType::Audio, &metrics).await {

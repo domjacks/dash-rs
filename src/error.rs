@@ -63,4 +63,14 @@ pub enum DashError {
     /// The caller should lower quality and retry.
     #[error("segment fetch abandoned (too slow) for {media_type}")]
     SegmentAbandoned { media_type: String },
+
+    /// A live segment returned HTTP 404, indicating it has not yet been
+    /// generated on the CDN.
+    ///
+    /// [`crate::session::DashSession::fetch_next_segment`] handles this
+    /// internally by waiting one segment duration before retrying.  If the
+    /// segment is still unavailable after the retry, `AllBaseUrlsFailed` is
+    /// returned instead.
+    #[error("live segment not yet available for {media_type} (HTTP 404)")]
+    SegmentNotYetAvailable { media_type: String },
 }

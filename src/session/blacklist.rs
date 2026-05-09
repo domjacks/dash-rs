@@ -119,12 +119,12 @@ mod tests {
     #[test]
     fn record_failure_resets_expiry() {
         let mut bl = CdnBlacklist::new();
-        bl.set_cooldown(Duration::from_millis(20));
+        bl.set_cooldown(Duration::from_millis(100));
         bl.record_failure("cdn1");
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(50));
         // Reset the expiry — should be blacklisted for another full cooldown.
         bl.record_failure("cdn1");
-        thread::sleep(Duration::from_millis(15));
+        thread::sleep(Duration::from_millis(60));
         assert!(
             bl.is_blacklisted("cdn1"),
             "expiry should have been extended by the second record_failure"

@@ -95,6 +95,11 @@ impl SourceBufferSink {
         );
     }
 
+    /// Current MSE timestamp offset in seconds.
+    pub fn timestamp_offset(&self) -> f64 {
+        self.inner.timestamp_offset()
+    }
+
     /// Set the MSE timestamp offset.
     ///
     /// Mirrors `SourceBufferSink.updateTimestampOffset()`.

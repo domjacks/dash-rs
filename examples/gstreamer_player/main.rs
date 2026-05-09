@@ -316,7 +316,7 @@ async fn run_session(
             // Use current_metrics() so SwitchHistoryRule sees the real
             // current_index; then overwrite throughput and buffer with live
             // measurements (current_metrics leaves those at 0).
-            let mut metrics = session.current_metrics(MediaType::Video);
+            let mut metrics = session.current_metrics(MediaType::Video, pos_s);
             metrics.throughput_bps = throughput_bps;
             metrics.buffer_level_ms = session.estimated_buffer_level_ms(&MediaType::Video);
 
@@ -359,7 +359,7 @@ async fn run_session(
             }
 
             let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-            let mut audio_metrics = session.current_metrics(MediaType::Audio);
+            let mut audio_metrics = session.current_metrics(MediaType::Audio, pos_s);
             audio_metrics.throughput_bps = throughput_bps;
             audio_metrics.buffer_level_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
             match session

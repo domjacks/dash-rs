@@ -666,6 +666,109 @@ fn parse_sidx_entries_fullbox(data: &[u8], index_end_offset: u64) -> Option<Vec<
     Some(entries)
 }
 
+// ── ProducerReferenceTime / parse_prft ───────────────────────────────────────
+
+/// Seconds between the NTP epoch (1900-01-01 00:00:00 UTC) and the Unix epoch
+/// (1970-01-01 00:00:00 UTC), accounting for 17 leap years in the 70-year span.
+const NTP_UNIX_EPOCH_DELTA_S: f64 = 2_208_988_800.0;
+
+/// Decoded data from a `ProducerReferenceTimeBox` (`prft`, ISO 14496-12 §8.10.5).
+///
+/// The `prft` box maps a media timeline position to a wall-clock producer
+/// time, enabling accurate end-to-end latency measurement for low-latency
+/// live streams.
+///
+/// # Wall-clock conversion
+///
+/// `ntp_timestamp` is a 64-bit NTP fixed-point value:
+/// - Upper 32 bits: seconds since 1900-01-01 00:00:00 UTC.
+/// - Lower 32 bits: sub-second fraction (1/2³² seconds per tick).
+///
+/// `wall_clock_s` is the pre-computed Unix-epoch equivalent:
+/// ```text
+/// wall_clock_s = (ntp_timestamp >> 32) + (ntp_timestamp & 0xFFFF_FFFF) / 2³² − NTP_DELTA
+/// ```
+///
+/// # Media time
+///
+/// `media_time` is in the timescale ticks of the track identified by
+/// `reference_track_id`.  Divide by the track's known timescale to obtain
+/// the equivalent presentation-timeline position in seconds.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProducerReferenceTime {
+    /// Box version: `0` (32-bit `media_time`) or `1` (64-bit `media_time`).
+    pub version: u8,
+    /// ID of the track whose timescale `media_time` is expressed in.
+    pub reference_track_id: u32,
+    /// Raw NTP 64-bit fixed-point timestamp.
+    ///
+    /// Upper 32 bits = seconds since 1900-01-01; lower 32 bits = fractional.
+    pub ntp_timestamp: u64,
+    /// Producer wall-clock time as a Unix timestamp in seconds.
+    ///
+    /// Pre-computed from `ntp_timestamp` by subtracting the NTP-to-Unix delta
+    /// (2 208 988 800 s) and adding the fractional part.
+    pub wall_clock_s: f64,
+    /// Media timeline position in timescale ticks of `reference_track_id`.
+    ///
+    /// Divide by the track's timescale to get the equivalent seconds.
+    pub media_time: u64,
+}
+
+/// Scan `data` for the first ISO BMFF `prft` (ProducerReferenceTimeBox) box
+/// and decode it.
+///
+/// Returns `None` when no `prft` box is present or the box is malformed.
+///
+/// # Wire format (FullBox)
+///
+/// ```text
+/// version(1) + flags(3) + reference_track_id(4) + ntp_timestamp(8)
+/// + media_time(4 if version==0, 8 if version==1)
+/// ```
+///
+/// Minimum body size: 20 bytes (version 0) or 24 bytes (version 1).
+pub fn parse_prft(data: &[u8]) -> Option<ProducerReferenceTime> {
+    let (box_data, fullbox_start) = find_box(data, *b"prft")?;
+    let payload = &box_data[fullbox_start..];
+    // FullBox: version(1) + flags(3) = 4 bytes.
+    if payload.len() < 4 {
+        return None;
+    }
+    let version = payload[0];
+    // Minimum payload after version+flags: ref_id(4) + ntp(8) + media_time(4 or 8).
+    let min_len = if version == 0 { 4 + 4 + 8 + 4 } else { 4 + 4 + 8 + 8 };
+    if payload.len() < min_len {
+        return None;
+    }
+    let reference_track_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+    let ntp_timestamp = u64::from_be_bytes([
+        payload[8], payload[9], payload[10], payload[11],
+        payload[12], payload[13], payload[14], payload[15],
+    ]);
+    let media_time = if version == 0 {
+        u32::from_be_bytes([payload[16], payload[17], payload[18], payload[19]]) as u64
+    } else {
+        u64::from_be_bytes([
+            payload[16], payload[17], payload[18], payload[19],
+            payload[20], payload[21], payload[22], payload[23],
+        ])
+    };
+
+    // Convert NTP timestamp to Unix epoch seconds.
+    let ntp_secs = (ntp_timestamp >> 32) as f64;
+    let ntp_frac = (ntp_timestamp & 0xFFFF_FFFF) as f64 / 4_294_967_296.0; // 2^32
+    let wall_clock_s = ntp_secs + ntp_frac - NTP_UNIX_EPOCH_DELTA_S;
+
+    Some(ProducerReferenceTime {
+        version,
+        reference_track_id,
+        ntp_timestamp,
+        wall_clock_s,
+        media_time,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1094,5 +1197,119 @@ mod tests {
         let events = parse_all_emsg(&data);
         assert_eq!(events.len(), 1);
         assert_eq!(&events[0].message_data[..], payload.as_slice());
+    }
+
+    // ── prft tests ────────────────────────────────────────────────────────────
+
+    /// Build a minimal version-0 `prft` box.
+    ///
+    /// Layout (fullbox payload, after standard 8-byte header):
+    ///   version(1) flags(3) reference_track_id(4) ntp_timestamp(8) media_time(4)
+    fn make_prft_v0(reference_track_id: u32, ntp_timestamp: u64, media_time: u32) -> Vec<u8> {
+        // Body size: 4 (version+flags) + 4 (ref_id) + 8 (ntp) + 4 (media_time) = 20
+        let body_size: u32 = 20;
+        let total_size: u32 = 8 + body_size;
+        let mut buf = Vec::with_capacity(total_size as usize);
+        buf.extend_from_slice(&total_size.to_be_bytes());
+        buf.extend_from_slice(b"prft");
+        buf.push(0); // version = 0
+        buf.extend_from_slice(&[0u8; 3]); // flags
+        buf.extend_from_slice(&reference_track_id.to_be_bytes());
+        buf.extend_from_slice(&ntp_timestamp.to_be_bytes());
+        buf.extend_from_slice(&media_time.to_be_bytes());
+        buf
+    }
+
+    /// Build a minimal version-1 `prft` box (64-bit media_time).
+    fn make_prft_v1(reference_track_id: u32, ntp_timestamp: u64, media_time: u64) -> Vec<u8> {
+        // Body: 4 + 4 + 8 + 8 = 24
+        let body_size: u32 = 24;
+        let total_size: u32 = 8 + body_size;
+        let mut buf = Vec::with_capacity(total_size as usize);
+        buf.extend_from_slice(&total_size.to_be_bytes());
+        buf.extend_from_slice(b"prft");
+        buf.push(1); // version = 1
+        buf.extend_from_slice(&[0u8; 3]); // flags
+        buf.extend_from_slice(&reference_track_id.to_be_bytes());
+        buf.extend_from_slice(&ntp_timestamp.to_be_bytes());
+        buf.extend_from_slice(&media_time.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn prft_v0_parses_correctly() {
+        // NTP timestamp for 2024-01-01 00:00:00 UTC:
+        // Unix: 1704067200 s → NTP: 1704067200 + 2208988800 = 3913056000 s
+        // As 64-bit fixed-point: 3913056000u64 << 32 (no fractional part)
+        let ntp_secs: u64 = 3_913_056_000;
+        let ntp_ts = ntp_secs << 32; // no fractional part
+        let data = make_prft_v0(1, ntp_ts, 48_000);
+        let prft = parse_prft(&data).expect("should parse v0 prft");
+        assert_eq!(prft.version, 0);
+        assert_eq!(prft.reference_track_id, 1);
+        assert_eq!(prft.ntp_timestamp, ntp_ts);
+        assert_eq!(prft.media_time, 48_000);
+        // wall_clock_s = 3913056000 - 2208988800 = 1704067200
+        assert!((prft.wall_clock_s - 1_704_067_200.0).abs() < 1.0,
+            "wall_clock_s = {}", prft.wall_clock_s);
+    }
+
+    #[test]
+    fn prft_v1_parses_64bit_media_time() {
+        let ntp_secs: u64 = 3_913_056_000;
+        let ntp_ts = ntp_secs << 32;
+        // Large 64-bit media_time that would overflow u32.
+        let media_time: u64 = 0x1_0000_0000_u64;
+        let data = make_prft_v1(2, ntp_ts, media_time);
+        let prft = parse_prft(&data).expect("should parse v1 prft");
+        assert_eq!(prft.version, 1);
+        assert_eq!(prft.reference_track_id, 2);
+        assert_eq!(prft.media_time, media_time);
+    }
+
+    #[test]
+    fn prft_fractional_ntp_converts_correctly() {
+        // NTP timestamp with 0.5 s fractional part:
+        // ntp_fraction = 0x8000_0000 ≈ 2^31 / 2^32 = 0.5
+        let ntp_secs: u64 = 3_913_056_000;
+        let ntp_ts = (ntp_secs << 32) | 0x8000_0000;
+        let data = make_prft_v0(1, ntp_ts, 0);
+        let prft = parse_prft(&data).unwrap();
+        // wall_clock_s should be 1704067200.5 approximately
+        assert!((prft.wall_clock_s - 1_704_067_200.5).abs() < 1e-6,
+            "wall_clock_s = {}", prft.wall_clock_s);
+    }
+
+    #[test]
+    fn prft_not_present_returns_none() {
+        // A buffer with only a sidx: parse_prft should return None.
+        let data = make_sidx_v0(1000, 0, &[1000]);
+        assert!(parse_prft(&data).is_none());
+    }
+
+    #[test]
+    fn prft_truncated_box_returns_none() {
+        // Build a valid v0 prft then truncate it.
+        let ntp_ts = 3_913_056_000u64 << 32;
+        let mut data = make_prft_v0(1, ntp_ts, 0);
+        data.truncate(data.len() - 5); // chop off 5 bytes
+        assert!(parse_prft(&data).is_none());
+    }
+
+    #[test]
+    fn prft_mixed_with_other_boxes() {
+        // sidx before prft — both should be parseable.
+        let sidx = make_sidx_v0(1000, 0, &[2000]);
+        let ntp_ts = 3_913_056_000u64 << 32;
+        let prft_box = make_prft_v0(1, ntp_ts, 96_000);
+        let mut data = sidx.clone();
+        data.extend_from_slice(&prft_box);
+
+        let sidx_info = parse_sidx(&data).unwrap();
+        assert!((sidx_info.start_s).abs() < 1e-9);
+
+        let prft = parse_prft(&data).unwrap();
+        assert_eq!(prft.reference_track_id, 1);
+        assert_eq!(prft.media_time, 96_000);
     }
 }

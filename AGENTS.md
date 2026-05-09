@@ -175,6 +175,9 @@ at session construction time (`extract_segment_timing()` in `src/session/mpd.rs`
   For VOD this equals `start_number`.  For live streams it is set to the live-edge
   segment after snapping so that `estimated_buffer_level_ms` counts only segments
   pushed in this session, not from the beginning of the broadcast.
+- `period_start_s: f64` — `Period@start` in seconds (0.0 for the first/only period).
+  Used by `seek_to` to map presentation-timeline positions back to segment numbers:
+  `N = start_number + ⌊(position_s − period_start_s) / seg_dur_s⌋`.
 
 `segments_fetched_for_eos` is computed as `segment_number − start_number` (used by the
 VOD EOS segment-count check in `fetch_next_segment`; live streams use `total_segments = None`
@@ -198,6 +201,63 @@ initial_segment_number = segment_number   (set at the same time)
 overrides it when present.  `segment_number` is clamped to at least
 `start_number`.  The helper is `compute_live_edge_segment()` in
 `src/session/live.rs`.
+
+After every **live manifest refresh** (`refresh_manifest`), both tracks are
+re-snapped: if `segment_number` has fallen behind the new live edge (e.g. after
+a long pause), it is advanced to `new_live_edge`.  `initial_segment_number` is
+updated simultaneously so that `estimated_buffer_level_ms` counts from the new
+position.
+
+### `SegmentTimeline` r=-1 (infinite-repeat) walk
+
+`find_timeline_segment` (`src/session/timeline.rs`) uses **arithmetic snapping**
+for `r=-1` entries to avoid an infinite loop:
+
+```
+if (target_time − entry.t) % entry.d == 0 → match at target_time
+```
+
+An `r=-1` block is bounded by the next `S` entry's explicit `t` attribute
+(when present).  Targets that fall at or beyond that `t` belong to the subsequent
+entry and are not matched by the `r=-1` block.  This matches the BBC CMAF pattern
+where the live window is represented as a single `<S t="…" d="…" r="-1"/>`.
+
+### `timestampOffset` formula (DASH spec §5.3.9.6)
+
+`SourceBuffer.timestampOffset = Period@start − presentationTimeOffset/timescale`.
+
+- `Period@start` is the presentation-timeline start of the period (0 for the
+  first/only period; non-zero in multi-period VOD).
+- `presentationTimeOffset` shifts decode timestamps within the period relative
+  to `Period@start`.
+- Together they ensure `DTS + timestampOffset` maps to the correct
+  presentation-timeline position.
+
+`compute_track_reinit` in `src/session/mod.rs` computes this correctly.
+`seek_to` uses `period_start_s` (stored in `TrackState`) — not `timestampOffset`
+directly — so that PTO does not affect the seek formula.
+
+### `SegmentList@startNumber`
+
+`extract_segment_list_timing` (`src/session/mpd.rs`) honours the
+`@startNumber` attribute.  The segment-URL array index is computed as
+`segment_number − start_number`, so a `SegmentList` with `startNumber="1"` works
+identically to a `SegmentTemplate` with the same attribute.
+
+### `MPD@minBufferTime` and `buffer_target_ms`
+
+`DashSession::from_mpd_with_utc` seeds `buffer_target_ms` from `MPD@minBufferTime`
+for VOD streams: `max(minBufferTime_ms, 12_000)`.  For live streams the default
+12 000 ms is used regardless.  `DashSession::min_buffer_time_ms()` exposes the
+parsed value.
+
+### `should_refresh_manifest` when `minimumUpdatePeriod` absent
+
+Per DASH spec §5.4, when `@minimumUpdatePeriod` is absent the client may refresh
+as often as once per segment duration.  `should_refresh_manifest` therefore
+falls back to the video (or audio) track's `segment_duration_ms` as the effective
+update period.  Streams that omit this attribute will trigger a manifest refresh
+before every segment fetch once the first segment duration has elapsed.
 
 ### Multi-period playback
 
@@ -288,6 +348,11 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 ---
 
+## Documentation
+
+- Ensure you keep the AGENTS.md, README.md and COMPLIANCE.md documents up to date whenever changes are made
+- COMPLIANCE.md is used to track compliance against the DASH specs and Dash.js features. It should also be used to track behavioural differences where they occur along with their reason.
+
 ## Where to look
 
 | What | Where |
@@ -374,7 +439,6 @@ All Tier 1 features are now implemented.  No outstanding items.
 | L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | New file `src/abr/l2a.rs`. Implements the Lyapunov optimisation tuned for low-latency streams. Register in `AbrController::default()`. |
 | LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` / `LearningAbrController.js` | New file `src/abr/lolp.rs`. Requires a QoE evaluator and an online weight-selector; more complex than other rules. |
 | Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Requires `SegmentFetcher` to support progressive byte delivery (streaming body). `FetchResponse` currently holds complete `Bytes`; need a `Stream<Item=Bytes>` variant or callback. |
-| ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Parse the `prft` box from fMP4 segments to measure producer-to-consumer latency. Expose the measurement alongside `AbrMetrics`. |
 | Catch-up playback rate control | `CatchupController.js` | Add `set_playback_rate(f64)` to the `MediaSource` trait. `DashSession` computes the catch-up rate from `target_latency − actual_latency` and calls it. |
 | MPD Patch (`<Patch>`) | `PatchManifestModel.js`, `ManifestUpdater.js` | Parse `PatchLocation` from the manifest. In `refresh_manifest_if_due`, if a patch URL is present, fetch and apply the XPath patch operations instead of re-fetching the full MPD. |
 
@@ -398,7 +462,31 @@ All Tier 1 features are now implemented.  No outstanding items.
 
 - **CDN failover / URL blacklisting**: implemented — `CdnBlacklist` (`src/session/blacklist.rs`) mirrors `BlacklistController.js`.  After a segment-fetch failure the contributing `<BaseURL>` service-location key is blacklisted for a configurable cooldown (default 600 s, matching dash.js).  Subsequent fetches skip blacklisted candidates; when every candidate is blacklisted the exclusion is overridden and all are retried to prevent permanent stalls.  Configure via `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`.
 
-- **Throughput model**: dash.js `ThroughputController` maintains a global throughput estimate with multiple EWMA windows (fast and slow) and uses harmonic mean over the sample distribution to resist outliers.  dash-rs tracks a single α-EMA (`throughput_ema_bps`) per track independently; audio and video can therefore diverge, and the estimate over-reacts on bursty connections compared to dash.js's multi-window model.
+- **BaseURL priority ordering within same-priority tiers**: document order is used when all `@weight` values within a priority tier are equal or absent (deterministic, DASH-IF IOP §6.7 compliant).  Weighted random permutation (`priority_weighted_order` in `src/session/segment_url.rs`) is applied only when weights actually differ within a tier.
+
+- **Live segment HTTP 404 — wait-and-retry**: `fetch_next_segment` detects `FetchError::Http { status: 404 }` on live streams, waits one segment duration (`segment_duration_ms`), and retries once before propagating `AllBaseUrlsFailed`.  The CDN is **not** blacklisted on 404 — the error is transient (segment not yet generated).  Mirrors `FragmentLoader.js` retry logic in dash.js.  `DashError::SegmentNotYetAvailable` is returned internally between the inner fetch and the retry; callers of `fetch_next_segment` never see it.
+
+- **DVR window enforcement (`timeShiftBufferDepth`)**: `fetch_next_segment_inner` computes the DVR floor as `live_edge − floor(tsbd / seg_dur)` on every call when `MPD@timeShiftBufferDepth` is set.  If `segment_number` is behind the floor (content deleted from CDN), it is silently advanced and a `warn!` is emitted.  `DashSession::time_shift_buffer_depth_ms()` exposes the parsed value.  **`time_shift_buffer_depth_ms` is re-parsed on every `refresh_manifest` call** so that DVR window changes in refreshed manifests are picked up immediately.
+
+- **`adaptation_mime_type` codec resolution**: `AdaptationSet@codecs` is now parsed (field added to `AdaptationSet`); `adaptation_mime_type` checks it first, then falls back to searching all `Representation` elements (not just the first) for a codec string.
+
+- **`refresh_manifest` SegmentTimeline expiry**: after refreshing a live manifest, `next_segment_time` for `$Time$`-addressed tracks is validated against the new timeline.  If the referenced time has slid out of the live window, `next_segment_time` is reset to `None` so the next fetch starts from the oldest available entry rather than returning a spurious `EndOfStream`.
+
+- **`current_metrics` buffer level formula**: `buffer_level_ms` is now computed as `(buffered_end − position_s).max(0) × 1000`.  Pass the current renderer position in seconds.  The old formula (`buffered_end × 1000`) overestimated the available buffer after the first few segments.
+
+- **Throughput model upgraded to dual-EWMA + harmonic mean**: `ThroughputTracker` (`src/abr/throughput.rs`) maintains a fast EWMA (3 s half-life) and a slow EWMA (8 s half-life) with time-based α (`1 − exp(−elapsed / halflife)`), plus a ring buffer of the last 4 raw samples for harmonic-mean computation.  `estimate()` returns `min(harmonic_mean, fast_ema, slow_ema)` — conservative, mirroring dash.js `ThroughputController.js`.  The old single-α `throughput_ema_bps` field and `THROUGHPUT_EMA_ALPHA` constant have been removed.
+
+- **`SegmentTemplate@availabilityTimeOffset` implemented**: `availabilityTimeOffset` and `availabilityTimeComplete` are parsed from `SegmentTemplate`, merged through the normal `merge_segment_templates` hierarchy, and propagated into `TrackReinit` → `TrackState`.  `compute_live_edge_segment` gains an `availability_time_offset_s` parameter; the formula is `elapsed = (now − ast + ato).max(0)`, widening the live-edge window so low-latency CMAF segments can be fetched while still being produced.  `@availabilityTimeComplete=false` is parsed and a `warn!` is emitted; chunked-transfer delivery (P1-4) is not yet supported.
+
+- **`prft` (ProducerReferenceTimeBox) implemented**: `parse_prft(data)` (`src/mp4.rs`) extracts version, reference track ID, NTP timestamp, and media time from fMP4 segments.  NTP → Unix wall-clock conversion uses `NTP_UNIX_EPOCH_DELTA_S = 2_208_988_800.0`.  The result is stored in `TrackState::last_prft` after every successful segment fetch and exposed via `DashSession::last_producer_reference_time(&MediaType)`.  Exported from `lib.rs` alongside `parse_sidx` and `parse_all_emsg`.
+
+- **`MPD@availabilityEndTime` enforced**: when present on a dynamic stream, `fetch_next_segment_inner` checks `adjusted_now > availabilityEndTime` immediately after `refresh_manifest_if_due` and returns `DashError::EndOfStream` cleanly.  Without this check, scheduled live events (sport broadcasts etc.) loop on HTTP 404s after the broadcast ends.  `DashSession::availability_end_time_s()` exposes the parsed value.  `MPD@availabilityEndTime` is parsed via the same `de::opt_xs_datetime` deserialiser as `@availabilityStartTime`.
+
+- **UTCTiming `http-head` scheme implemented**: `resolve_utc_timing` (`src/session/utc.rs`) now handles `urn:mpeg:dash:utc:http-head:2014`.  It calls `SegmentFetcher::head_date(&url)` and parses the `Date:` response header using a built-in RFC 2822 / IMF-fixdate parser (`parse_rfc2822_date`), falling back to `parse_xs_datetime` for ISO 8601 values.  Concrete fetcher implementations that can perform HEAD requests should override `head_date`; the default returns `Ok(None)` (skip and try next element).  BBC IPTV and many DVB streams use `http-head` exclusively — previously they would always get `utc_clock_offset_s = 0`.
+
+- **`seek_to` re-anchors `next_segment_time` for SegmentTimeline tracks**: `TrackState` now carries a `timescale: u64` field (from merged `SegmentTemplate@timescale`, default 1).  `seek_to` converts the target position to timescale ticks — `target_ticks = round((position_s − period_start_s) × timescale)` — and sets `next_segment_time = Some(target_ticks)` for Timeline-addressed tracks.  Previously it reset to `None`, causing `find_timeline_segment` to restart from the first timeline entry (wrong for live streams with large absolute tick values such as BBC CMAF where ticks are ~1.75 billion).
+
+- **`period_start_s` updated on manifest refresh**: `refresh_manifest` now re-derives `period_start_s` from the current period in the refreshed MPD.  In live multi-period streams the broadcaster may correct `Period@start` in a refreshed manifest; without this update, `seek_to` would use the stale value.
 
 ### `GapController` usage pattern
 
@@ -438,16 +526,17 @@ stalls at a period boundary, call `session.seek_to(period_end_s)` manually.
 
 ### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
 
-- **Absolute-timestamp live streams (BBC CMAF)**: handled by
-  `GstMediaSource::set_live_mode(true)`, which installs a combined
-  `NEWSEGMENT` + `BUFFER` pad probe on each converter's sink pad.  The probe
-  replaces every qtdemux `NEWSEGMENT` event with a zeroed TIME segment
-  `{start=0, time=0, base=0}` and subtracts the first absolute PTS seen from
-  every decoded buffer's PTS and DTS.  This remaps Unix-epoch timestamps
-  (≈ 1.778 × 10¹⁸ ns for BBC Two HD) to relative values starting at zero so
-  that GStreamer's normal `sync=true` frame-pacing works correctly.  Call
-  `set_live_mode(true)` after `DashSession::from_url` and before `set_playing`
-  whenever `session.is_live()`.
+- **Absolute-timestamp live streams (BBC CMAF)**: `DashSession::from_mpd_with_utc`
+  now automatically adjusts `SourceBuffer.timestampOffset` after live-edge snapping
+  so that the first fetched segment maps to `currentTime ≈ 0` in the media element.
+  Without this, streams like BBC IPTV (`availabilityStartTime` near the Unix epoch)
+  produce fMP4 PTS values ≈ 1.75 billion seconds; the video element starts at
+  `currentTime = 0` and finds nothing buffered, causing a silent stall ("hang").
+  The offset is computed as `existing_pto_offset − (initial_segment − start_number) × seg_dur_s`
+  and is applied to both video and audio sinks immediately after snapping.
+  For GStreamer (`sink-gstreamer` feature), the equivalent remapping is still handled
+  by `GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction) — call it
+  after `DashSession::from_url` and before `set_playing` whenever `session.is_live()`.
 - `buffered()` only tracks ranges from chunks whose `Chunk::start`/`end` are set.
   DASH segments currently do not carry timing (they're set to `None`), so the
   buffer-occupancy ABR rule sees an empty range.  Work-around: parse the fMP4

@@ -120,6 +120,23 @@ pub trait SegmentFetcher {
     /// downloading the body. Mirrors `FragmentLoader.checkForExistence()`.
     async fn check_existence(&self, url: &Url) -> Result<bool, FetchError>;
 
+    /// Issue a `HEAD` request to `url` and return the value of the `Date:`
+    /// response header, if present.
+    ///
+    /// Used for the `urn:mpeg:dash:utc:http-head:2014` `UTCTiming` scheme
+    /// (DASH spec §5.8.5.7): the server's current UTC time is read from the
+    /// `Date:` header of a `HEAD` response, avoiding a body download.
+    ///
+    /// The default implementation returns `Ok(None)` — override it in
+    /// concrete implementations that support `HEAD` requests with header
+    /// access (e.g. a `reqwest`-backed fetcher).  When `Ok(None)` is returned
+    /// the `http-head` scheme is skipped and the resolver tries the next
+    /// `UTCTiming` element in the manifest.
+    async fn head_date(&self, url: &Url) -> Result<Option<String>, FetchError> {
+        let _ = url;
+        Ok(None)
+    }
+
     /// Cancel any in-flight requests. Mirrors `FragmentLoader.abort()`.
     /// Implementations are expected to be cancel-safe; if the future returned
     /// by `fetch` is dropped, the request should also be cancelled.

@@ -142,6 +142,16 @@ const bridge = {
     return new Promise(resolve => setTimeout(resolve, ms));
   },
 
+  // Seek the <video> element to `time_s` seconds.
+  // Required for live streams: fMP4 segments carry their native presentation
+  // timestamp (potentially billions of seconds for BBC-style epoch streams)
+  // so the video element must be seeked to where the buffered content lives.
+  // Called once after session construction, before any segments are fetched.
+  seekTo(time_s) {
+    log('MSE', `video.currentTime = ${time_s.toFixed(3)}`);
+    video.currentTime = time_s;
+  },
+
   // ── MediaSource lifecycle ─────────────────────────────────────────────────────
 
   // 1. Instantiate a MediaSource.
