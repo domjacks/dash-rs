@@ -13,6 +13,7 @@
 //! | Clock | `Date.now()` | `bridge.unixNowS()` |
 //! | Utility | `setTimeout()` | `bridge.sleep(ms)` |
 //! | Utility | `video.currentTime =` | `bridge.seekTo(time_s)` |
+//! | Utility | `video.currentTime` | `bridge.getCurrentTime()` |
 //! | MSE | `new MediaSource()` | `bridge.setupMediaSource()` |
 //! | MSE | `URL.createObjectURL()` | `bridge.setupMediaSource()` |
 //! | MSE | `video.src = objectUrl` | `bridge.setupMediaSource()` |
@@ -125,10 +126,21 @@ extern "C" {
     #[wasm_bindgen(method, js_name = seekTo)]
     fn seek_to(this: &JsBridge, time_s: f64);
 
+    // video.currentTime — current playback position in seconds.
+    // Passed to DashSession::current_metrics() so ABR buffer-level calculations
+    // use the real position rather than 0.0 (which would produce enormous
+    // buffer_level_ms values for epoch-scale live streams like BBC IPTV).
+    #[wasm_bindgen(method, js_name = getCurrentTime)]
+    fn get_current_time(this: &JsBridge) -> f64;
+
     // ── MediaSource lifecycle ─────────────────────────────────────────────
     // new MediaSource() + URL.createObjectURL() + video.src= + sourceopen
     #[wasm_bindgen(method, js_name = setupMediaSource)]
     fn setup_media_source(this: &JsBridge) -> Promise;
+
+    // MediaSource.isTypeSupported(mimeType) — static capability check.
+    #[wasm_bindgen(method, js_name = isTypeSupported)]
+    fn is_type_supported(this: &JsBridge, mime_type: &str) -> bool;
 
     // mediaSource.readyState  →  "open" | "ended" | "closed"
     #[wasm_bindgen(method, js_name = getReadyState)]
@@ -421,6 +433,18 @@ impl MediaSource for BridgeMediaSource {
             .map_err(|e| DashError::AppendFailed(js_err(e)))
     }
 
+    fn is_type_supported(&self, mime_type: &str) -> bool {
+        let supported = self.bridge.is_type_supported(mime_type);
+        if !supported {
+            tracing::warn!(
+                mime_type,
+                "MediaSource.isTypeSupported() returned false — \
+                 track will be skipped (HEVC requires Safari on macOS/iOS)"
+            );
+        }
+        supported
+    }
+
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
         tracing::debug!(mime_type, "BridgeMediaSource: addSourceBuffer");
         let sb_id = self.bridge
@@ -568,20 +592,27 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         "session constructed"
     );
 
-    // ── Live-stream pre-seek ───────────────────────────────────────────────
-    // dash.js approach: timestampOffset = Period@start − PTO/timescale, so
-    // fMP4 decode times are left at their native (potentially epoch-scale)
-    // values.  The video element must be seeked to where the buffered content
-    // will actually live; otherwise it waits at currentTime = 0 forever.
+    // ── Live-stream PTS remap + pre-seek ──────────────────────────────────────
+    // Safari (and some other browsers) reset video.currentTime to 0 when a seek
+    // target is set before content is buffered.  If fMP4 DTS values are
+    // epoch-scale (e.g. BBC IPTV: ~1.778 × 10⁹ s), the element stalls forever
+    // waiting at position 0 while segments are buffered at ~1.778 × 10⁹ s.
     //
-    // We set duration = Infinity first so the browser does not clamp the seek.
+    // Fix: shift timestampOffset on every SourceBuffer sink by
+    //   -(initial_segment_number − start_number) × seg_dur_s
+    // so that the first live-edge segment lands at presentation time ≈ 0.
+    // live_presentation_start_s() then returns ≈ 0, so the seek is trivial.
+    //
+    // GStreamer clients must NOT call apply_live_pts_remap() — they use
+    // GstMediaSource::set_live_mode(true) (probe-based PTS subtraction).
     if session.is_live() {
         bridge
             .set_duration(f64::INFINITY)
             .map_err(|e| JsValue::from_str(&js_err(e)))?;
+        session.apply_live_pts_remap();
         let seek_time = session.live_presentation_start_s();
         bridge.seek_to(seek_time);
-        tracing::info!(seek_time, "live stream: seeked video element to live edge");
+        tracing::info!(seek_time, "live stream: PTS remapped; seeked video element to live edge");
     }
 
     session.notify_playing();
@@ -591,6 +622,16 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     let mut video_done = !session.has_video();
     let mut audio_done = !session.has_audio();
 
+    // Use whichever track is present for the buffer gate.  If only audio
+    // was set up (e.g. video skipped because the browser doesn't support
+    // HEVC), gating on the absent video track would always return 0 ms and
+    // we'd spin-fetch audio with no back-pressure.
+    let gate_type = if session.has_video() {
+        MediaType::Video
+    } else {
+        MediaType::Audio
+    };
+
     loop {
         if video_done && audio_done {
             break;
@@ -598,12 +639,13 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
 
         // Buffer gate: mirrors dash.js ScheduleController.
         // JS: new Promise(r => setTimeout(r, 500))
-        while session.estimated_buffer_level_ms(&MediaType::Video) >= session.buffer_target_ms() {
+        while session.estimated_buffer_level_ms(&gate_type) >= session.buffer_target_ms() {
             JsFuture::from(bridge.sleep(500.0)).await.ok();
         }
 
         if !video_done {
-            let metrics = session.current_metrics(MediaType::Video, 0.0);
+            let position_s = bridge.get_current_time();
+            let metrics = session.current_metrics(MediaType::Video, position_s);
             match session.fetch_next_segment(MediaType::Video, &metrics).await {
                 Ok(d) => tracing::debug!(
                     quality_index = d.index,
@@ -619,7 +661,8 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         }
 
         if !audio_done {
-            let metrics = session.current_metrics(MediaType::Audio, 0.0);
+            let position_s = bridge.get_current_time();
+            let metrics = session.current_metrics(MediaType::Audio, position_s);
             match session.fetch_next_segment(MediaType::Audio, &metrics).await {
                 Ok(d) => tracing::debug!(
                     quality_index = d.index,

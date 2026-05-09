@@ -124,13 +124,20 @@ pub(super) fn find_adaptation<'a>(
             .adaptations
             .iter()
             .filter(|a| is_audio_adaptation(a))
-            .max_by_key(|a| {
-                a.representations
+            .enumerate()
+            .max_by_key(|(i, a)| {
+                let bw = a.representations
                     .iter()
                     .filter_map(|r| r.bandwidth)
                     .max()
-                    .unwrap_or(0)
-            }),
+                    .unwrap_or(0);
+                // Secondary key: `usize::MAX - i` so that when bandwidths are
+                // equal the first AdaptationSet in document order wins.
+                // (The main audio always precedes alternate / audio-description
+                // tracks in well-formed DASH manifests.)
+                (bw, usize::MAX - i)
+            })
+            .map(|(_, a)| a),
     }
 }
 

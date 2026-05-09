@@ -107,7 +107,7 @@ manifest has no corresponding `AdaptationSet`.  Use `session.has_video()` /
 track — calling them on an absent track returns
 `DashError::NoRepresentations`.
 
-### Multiple audio `AdaptationSet`s — highest-bandwidth wins
+### Multiple audio `AdaptationSet`s — highest-bandwidth wins, document order breaks ties
 
 When a `Period` contains more than one audio `AdaptationSet` (e.g. a stream
 offering both AAC-HE at low bitrates and AAC-LC at high bitrates, as in BBC
@@ -116,6 +116,32 @@ Radio One), `find_adaptation` selects the one whose representations have the
 preferred over lower-quality fallback tiers.  All representations within
 the selected `AdaptationSet` must share the same codec (they form a single
 `TrackState` with one MIME type).
+
+When two `AdaptationSet`s have identical maximum bandwidth (e.g. BBC Radio
+streams that offer main audio and an audio-description variant both at 320 kbps),
+the one that appears **first in document order** is preferred.  This is
+implemented by using `(bandwidth, usize::MAX - index)` as the composite key
+in `max_by_key` inside `find_adaptation` (`src/session/mpd.rs`).
+
+### `MediaSource::is_type_supported` — graceful track skip
+
+`MediaSource` has a default method `is_type_supported(&self, mime_type: &str) -> bool`
+that returns `true` for all types (preserving existing GStreamer / stub behaviour).
+
+`from_mpd_with_utc` calls `is_type_supported` on the constructed MIME string
+**before** calling `add_source_buffer`.  If it returns `false`:
+
+- Video track: a `warn!` is emitted and `video_track` is set to `None`.
+  The session continues as audio-only.
+- Audio track: a `warn!` is emitted and `audio_track` is set to `None`.
+
+The `BridgeMediaSource` in `examples/wasm_player/src/lib.rs` overrides this
+method to delegate to `MediaSource.isTypeSupported()` in the browser, so HEVC
+streams on Chrome/Firefox fall back to audio-only rather than crashing with a
+`NotSupportedError` from `addSourceBuffer`.
+
+Per-representation filtering (within a single `AdaptationSet` that mixes
+supported and unsupported codecs) is tracked as P2-14 in `COMPLIANCE.md`.
 
 ### `AbrController::select` takes `&self`; `record_switch` takes `&mut self`
 
@@ -222,6 +248,57 @@ An `r=-1` block is bounded by the next `S` entry's explicit `t` attribute
 entry and are not matched by the `r=-1` block.  This matches the BBC CMAF pattern
 where the live window is represented as a single `<S t="…" d="…" r="-1"/>`.
 
+### Live-edge `next_segment_time` snap for SegmentTimeline tracks
+
+`snap_to_timeline_grid` (`src/session/timeline.rs`) is used during session
+construction to set `TrackState::next_segment_time` for `$Time$`-addressed live
+streams:
+
+1. `compute_live_edge_segment` returns a segment number using the `$Number$` formula.
+2. That number is converted to timescale ticks:
+   `target_ticks = (initial_segment_number − start_number) × round(timescale × seg_dur_ms / 1000)`.
+3. `snap_to_timeline_grid` snaps `target_ticks` **down** to the largest aligned
+   `entry.t + k × entry.d ≤ target_ticks` within the SegmentTimeline.
+4. The snapped value is stored as `next_segment_time` so the first
+   `find_timeline_segment` call fetches the live-edge segment, not the beginning
+   of the time-shift window.
+
+`live_presentation_start_s()` returns `next_segment_time / timescale` for
+SegmentTimeline tracks (when `next_segment_time` is set), so the WASM player's
+`seekTo()` call targets the exact first-segment PTS rather than an approximation.
+After `apply_live_pts_remap()` is called (see below), the method subtracts
+`live_pts_remap_offset_s` and returns ≈ 0 for epoch-scale streams.
+
+### `apply_live_pts_remap` — epoch-scale PTS remapping (WASM / MSE only)
+
+On live streams where fMP4 decode timestamps are large absolute values
+(e.g. BBC IPTV: segment 463 114 411 with `seg_dur = 3.84 s` → DTS start ≈
+1 778 359 334 s), Safari resets `video.currentTime` to 0 before content is
+buffered.  Seeking to 1.778 × 10⁹ s succeeds at the API level but the element
+stalls because no data has yet been appended there.
+
+Fix: call `session.apply_live_pts_remap()` (from `src/session/mod.rs`) **after**
+session construction and **before** the segment fetch loop, for live streams only.
+
+The method computes `offset_s`:
+
+- `$Number$` tracks: `(initial_segment_number − start_number) × seg_dur_s`
+- `$Time$` / SegmentTimeline tracks: `next_segment_time / timescale`
+
+It then calls `sink.set_timestamp_offset(current − offset_s)` on every active
+track sink and stores the result in `DashSession::live_pts_remap_offset_s`.
+The first live-edge segment now lands at presentation time ≈ 0 in the browser.
+`live_presentation_start_s()` subtracts `live_pts_remap_offset_s` and returns ≈ 0,
+so `bridge.seekTo(0)` is a trivial seek that every browser handles.
+
+**GStreamer clients must NOT call `apply_live_pts_remap()`**.  They use
+`GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction).
+Double-applying would shift timestamps by twice the offset and corrupt decoding.
+
+`seek_to` (Rust method) is **not updated** for remapped streams; the WASM player
+uses `bridge.seekTo()` directly and does not call `session.seek_to()` during
+live playback, so this is currently acceptable.  Fix is tracked as a follow-up.
+
 ### `timestampOffset` formula (DASH spec §5.3.9.6)
 
 `SourceBuffer.timestampOffset = Period@start − presentationTimeOffset/timescale`.
@@ -323,16 +400,17 @@ stalls at a period boundary, call `session.seek_to(period_end_s)` manually.
 ### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
 
 - **Absolute-timestamp live streams (BBC CMAF)**: `DashSession::from_mpd_with_utc`
-  automatically adjusts `SourceBuffer.timestampOffset` after live-edge snapping
-  so that the first fetched segment maps to `currentTime ≈ 0` in the media element.
-  Without this, streams like BBC IPTV (`availabilityStartTime` near the Unix epoch)
-  produce fMP4 PTS values ≈ 1.75 billion seconds; the video element starts at
-  `currentTime = 0` and finds nothing buffered, causing a silent stall.
-  The offset is computed as `existing_pto_offset − (initial_segment − start_number) × seg_dur_s`
-  and is applied to both video and audio sinks immediately after snapping.
-  For GStreamer (`sink-gstreamer` feature), the equivalent remapping is handled
-  by `GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction) — call it
-  after `DashSession::from_url` and before `set_playing` whenever `session.is_live()`.
+  snaps `next_segment_time` to the live-edge aligned position in the actual
+  SegmentTimeline after computing the live-edge segment number (via
+  `snap_to_timeline_grid` in `src/session/timeline.rs`).  This ensures the first
+  fetch lands at the live edge rather than at the beginning of the time-shift
+  window (which `find_timeline_segment(None)` would return).  `live_presentation_start_s()`
+  returns the snapped tick value divided by the timescale for Timeline tracks, so
+  the WASM player's `seekTo()` call is accurate.
+  For GStreamer (`sink-gstreamer` feature), absolute-timestamp PTS remapping is
+  handled by `GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction) —
+  call it after `DashSession::from_url` and before `set_playing` whenever
+  `session.is_live()`.
 - `buffered()` only tracks ranges from chunks whose `Chunk::start`/`end` are set.
   DASH segments currently do not carry timing (they are set to `None`), so the
   buffer-occupancy ABR rule sees an empty range.  Work-around: parse the fMP4
@@ -428,8 +506,9 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Manifest loading | `src/manifest/mod.rs` |
 | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
 | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
+| Epoch-scale PTS remapping (`apply_live_pts_remap`, `live_pts_remap_offset_s`) | `src/session/mod.rs` |
 | MPD helpers (`merge_segment_templates`, `extract_segment_timing`, `find_adaptation`, etc.) | `src/session/mpd.rs` |
-| SegmentTimeline / `$Time$` walking | `src/session/timeline.rs` |
+| SegmentTimeline / `$Time$` walking (`find_timeline_segment`, `snap_to_timeline_grid`) | `src/session/timeline.rs` |
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |
 | Live-edge segment calculation | `src/session/live.rs` |
 | UTC clock sync (`resolve_utc_timing`, `query_http_utc`) | `src/session/utc.rs` |

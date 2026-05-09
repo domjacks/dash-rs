@@ -58,6 +58,13 @@ All items below are implemented and covered by tests.
 | 36 | `SegmentTemplate@availabilityTimeOffset` parsed and propagated; `compute_live_edge_segment` adds ATO to elapsed time so low-latency CMAF streams can access partially-produced segments at the live edge; `@availabilityTimeComplete=false` parsed with a warning (chunked transfer not yet supported) | §5.3.9.4 / DASH-LL |
 | 37 | `prft` (ProducerReferenceTimeBox) parsed from fMP4 segments; `DashSession::last_producer_reference_time()` accessor; wall-clock NTP→Unix conversion built-in; enables end-to-end latency measurement for low-latency live streams | §8.10.5 (ISO 14496-12) |
 | 38 | Throughput model upgraded to dual-EWMA (fast 3 s + slow 8 s half-lives, time-based α) + harmonic-mean over last 4 samples; estimate is min(harmonic, fast_ema, slow_ema) — conservative, resists bursty outliers; matches dash.js `ThroughputController.js` strategy | — |
+| 39 | `MediaSource::is_type_supported(mime)` default method (returns `true`); `from_mpd_with_utc` checks it before `add_source_buffer`; unsupported video track is skipped with a `warn!` and the session falls back to audio-only rather than failing; `BridgeMediaSource` in WASM player delegates to `MediaSource.isTypeSupported()` | — |
+| 40 | Audio `AdaptationSet` tie-breaking: when two sets have equal maximum bandwidth the one that appears first in document order is preferred (main audio before alternate / audio-description); `find_adaptation` uses enumerated index as a secondary descending key in `max_by_key` | DASH-IF IOP §4.3 |
+| 41 | WASM player `play()` buffer gate uses whichever track is active (`Video` if present, else `Audio`) so audio-only fallback sessions are back-pressured correctly | — |
+| 42 | Live SegmentTimeline (`r=-1`) live-edge snap: `snap_to_timeline_grid` snaps the computed live-edge tick target down to the nearest grid-aligned entry; `next_segment_time` is set during session construction so the first fetch lands at the live edge, not at the beginning of the time-shift window | §5.3.9.6.4 |
+| 43 | `live_presentation_start_s()` returns the actual snapped `next_segment_time / timescale` for SegmentTimeline tracks, ensuring `seekTo()` in the WASM player seeks to the exact first-segment PTS rather than an approximation from the `$Number$` formula | §5.3.9.4 |
+| 44 | WASM player `current_metrics` now passes `video.currentTime` (via `getCurrentTime()` bridge) as `position_s` instead of a hardcoded `0.0`, fixing the hugely inflated `buffer_level_ms` for epoch-timestamp live streams (BBC IPTV) where content sits at ~1.778×10⁹ s | — |
+| 45 | `DashSession::apply_live_pts_remap()` — opt-in method that shifts `SourceBuffer.timestampOffset` on all active sinks by `-(initial_segment_number − start_number) × seg_dur_s` (Number) or `-(next_segment_time / timescale)` (Timeline) so that epoch-scale fMP4 content lands near presentation time 0 in the browser; `live_presentation_start_s()` returns ≈ 0 after the call; WASM player calls this automatically before the fetch loop on live streams; GStreamer players must NOT call it (they use probe-based PTS subtraction via `set_live_mode(true)`); fixes the Safari stall where `video.currentTime` is reset to 0 before content is buffered at the live-edge PTS | — |
 
 ---
 
@@ -224,11 +231,13 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-14: Codec capability filtering missing
+### P2-14: Per-representation codec capability filtering missing
 
-**Gap**: `DashSession::from_mpd` does not filter representations to those the platform can decode.
+**Gap**: `DashSession::from_mpd` now skips entire tracks whose MIME type is not supported by the `MediaSource` (via `is_type_supported`), but does not filter *individual representations* within a track.  A manifest that mixes supported and unsupported codec variants within one `AdaptationSet` (e.g. `avc1` and `hev1` representations in the same video set) will include all representations in the ABR list, and the fetcher may attempt to append unsupported codec data to the source buffer.
 
-**Fix**: Add a `CodecCapabilities` trait.  GStreamer / MSE implementations belong in examples.
+**Fix**: After `compute_track_reinit` builds the representation list, call `is_type_supported` for each representation's full MIME+codec string and remove those that return `false`.  Only skip the whole track if the filtered list is empty.
+
+**Files**: `src/session/mpd.rs` (`compute_track_reinit`), `src/session/mod.rs` (`from_mpd_with_utc`)
 
 ---
 

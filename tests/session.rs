@@ -16,7 +16,10 @@ use dash_rs::{
     abr::AbrMetrics,
     error::DashError,
     fetch::{FetchError, FetchRequest, FetchResponse, RequestType, SegmentFetcher},
-    media_source::{stub::StubMediaSource, TimeRange},
+    media_source::{
+        stub::StubMediaSource,
+        MediaSource, ReadyState, SourceBuffer, TimeRange,
+    },
     session::{DashSession, MediaType},
     GapSeekReason,
 };
@@ -3210,9 +3213,6 @@ fn time_shift_buffer_depth_none_for_vod() {
 /// up to time T, `current_metrics(type, 0.0).buffer_level_ms` equals T * 1000.
 #[test]
 fn current_metrics_buffer_level_at_position_zero() {
-    use dash_rs::media_source::{stub::StubMediaSource, Chunk, SourceBuffer};
-    use bytes::Bytes;
-
     // Build a session with a static 10-segment stream.
     const MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
@@ -3900,4 +3900,139 @@ async fn throughput_tracker_non_zero_after_first_segment() {
         "expected positive throughput after fetch, got {}",
         after.throughput_bps
     );
+}
+
+// ── Audio tie-breaking ────────────────────────────────────────────────────────
+
+/// When two audio `AdaptationSet`s have equal maximum bandwidth, the one that
+/// appears first in the manifest (document order) must be selected.
+///
+/// Regression test for the `max_by_key` last-wins behaviour that previously
+/// caused the alternate/audio-description track to be preferred over the main
+/// audio track when both had identical bandwidth.
+#[test]
+fn audio_adaptation_first_document_order_wins_on_equal_bandwidth() {
+    // Two audio AdaptationSets with identical max bandwidth (320 000 bps).
+    // The main track comes first (id="main"); the alternate (audio-description)
+    // comes second (id="ad").  We expect the session to pick id="main".
+    const MPD_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="main-$Number$.m4s" initialization="main-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="main" bandwidth="320000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="ad-$Number$.m4s" initialization="ad-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="ad" bandwidth="320000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let session = session_from_xml(MPD_XML);
+    assert!(session.has_audio(), "expected audio track to be present");
+    let reps = session.audio_representations();
+    assert_eq!(reps.len(), 1, "expected exactly one audio representation");
+    assert_eq!(
+        reps[0].id, "main",
+        "expected main audio (first in document) to be selected, got id={}",
+        reps[0].id
+    );
+}
+
+// ── is_type_supported skip ────────────────────────────────────────────────────
+
+/// A `MediaSource` that rejects video MIME types via `is_type_supported`.
+///
+/// Used to simulate a browser that does not support HEVC (or any other codec
+/// that the manifest lists for the video track).
+struct VideoUnsupportedMediaSource(StubMediaSource);
+
+#[async_trait(?Send)]
+impl MediaSource for VideoUnsupportedMediaSource {
+    fn is_type_supported(&self, mime_type: &str) -> bool {
+        !mime_type.starts_with("video/")
+    }
+
+    fn ready_state(&self) -> ReadyState {
+        self.0.ready_state()
+    }
+
+    fn duration(&self) -> Option<f64> {
+        self.0.duration()
+    }
+
+    fn set_duration(&mut self, duration: f64) -> Result<(), DashError> {
+        self.0.set_duration(duration)
+    }
+
+    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
+        self.0.add_source_buffer(mime_type)
+    }
+
+    fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
+        self.0.remove_source_buffer(mime_type)
+    }
+
+    async fn end_of_stream(&mut self) -> Result<(), DashError> {
+        self.0.end_of_stream().await
+    }
+
+    fn close(&mut self) {
+        self.0.close()
+    }
+}
+
+/// When `is_type_supported` returns `false` for the video MIME type,
+/// `from_mpd` must skip the video track (returning `has_video() == false`)
+/// while still setting up the audio track (`has_audio() == true`).
+///
+/// Regression test for BBC HEVC streams where Chrome/Firefox cannot decode
+/// `video/mp4; codecs="hev1.*"`, causing session construction to fail hard
+/// before this fix.
+#[test]
+fn video_track_skipped_when_mime_not_supported() {
+    const MPD_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="5000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="320000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let mpd = dash_rs::manifest::parse(MPD_XML).expect("MPD parse failed");
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+
+    let mut ms = StubMediaSource::new();
+    ms.open();
+    let ms = VideoUnsupportedMediaSource(ms);
+
+    let session =
+        DashSession::from_mpd(mpd, base_url, fetcher, ms).expect("from_mpd must not fail");
+
+    assert!(
+        !session.has_video(),
+        "video track should be absent when MIME not supported"
+    );
+    assert!(
+        session.has_audio(),
+        "audio track should still be present after video is skipped"
+    );
+    let reps = session.audio_representations();
+    assert_eq!(reps[0].id, "a1");
 }

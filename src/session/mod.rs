@@ -65,7 +65,7 @@ use self::{
         merge_segment_templates, segment_base_media_path,
     },
     segment_url::{collect_candidate_base_urls, expand_template, resolve_effective_base_url, CandidateUrl},
-    timeline::find_timeline_segment,
+    timeline::{find_timeline_segment, snap_to_timeline_grid},
 };
 use blacklist::CdnBlacklist;
 
@@ -616,6 +616,18 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     ///
     /// `None` when the attribute is absent or for VOD streams.
     time_shift_buffer_depth_ms: Option<f64>,
+    /// PTS remap offset applied by [`Self::apply_live_pts_remap`], in seconds.
+    ///
+    /// `0.0` until `apply_live_pts_remap` is called.  Once set, all track sinks
+    /// have had their `timestampOffset` shifted by `-live_pts_remap_offset_s`,
+    /// so epoch-scale fMP4 decode times land near presentation time 0 in the
+    /// browser.  [`Self::live_presentation_start_s`] subtracts this offset so
+    /// that the seek target returned to the caller is also near 0.
+    ///
+    /// GStreamer clients must NOT call `apply_live_pts_remap` — they apply a
+    /// probe-based PTS subtraction via `GstMediaSource::set_live_mode(true)`.
+    /// Double-applying would corrupt timing.
+    live_pts_remap_offset_s: f64,
 }
 
 // Re-export for convenience in examples.
@@ -731,7 +743,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         let mut video_track = if let Some(adaptation) = video_adaptation {
             let reinit = compute_track_reinit(adaptation, period, presentation_duration);
-            if !reinit.representations.is_empty() {
+            if reinit.representations.is_empty() {
+                None
+            } else if !media_source.is_type_supported(&reinit.mime) {
+                tracing::warn!(
+                    mime = %reinit.mime,
+                    "video MIME type not supported by this MediaSource — \
+                     video track skipped (audio-only fallback)"
+                );
+                None
+            } else {
                 let sink_buf = media_source.add_source_buffer(&reinit.mime)?;
                 let mut sink = SourceBufferSink::new(sink_buf);
 
@@ -758,8 +779,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     reinit.timescale,
                     reinit.availability_time_offset_s,
                 ))
-            } else {
-                None
             }
         } else {
             None
@@ -767,7 +786,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         let mut audio_track = if let Some(adaptation) = audio_adaptation {
             let reinit = compute_track_reinit(adaptation, period, presentation_duration);
-            if !reinit.representations.is_empty() {
+            if reinit.representations.is_empty() {
+                None
+            } else if !media_source.is_type_supported(&reinit.mime) {
+                tracing::warn!(
+                    mime = %reinit.mime,
+                    "audio MIME type not supported by this MediaSource — \
+                     audio track skipped"
+                );
+                None
+            } else {
                 let sink_buf = media_source.add_source_buffer(&reinit.mime)?;
                 let mut sink = SourceBufferSink::new(sink_buf);
 
@@ -794,8 +822,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     reinit.timescale,
                     reinit.availability_time_offset_s,
                 ))
-            } else {
-                None
             }
         } else {
             None
@@ -846,6 +872,101 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     );
                     track.segment_number = seg;
                     track.initial_segment_number = seg;
+                }
+            }
+        }
+
+        // For SegmentTimeline ($Time$) tracks on live streams, snap
+        // `next_segment_time` to the live-edge aligned position in the actual
+        // SegmentTimeline.  Without this, `find_timeline_segment(None)` would
+        // return the very first entry in the timeline (the beginning of the
+        // time-shift window, potentially many minutes before the live edge),
+        // causing the player to start from there instead of the live edge and
+        // leaving the video element stalled for a long time.
+        //
+        // The live-edge segment number was computed by `compute_live_edge_segment`
+        // using the $Number$ formula.  We convert it to timescale ticks and snap
+        // it down to the nearest grid-aligned `t` in the SegmentTimeline using
+        // `snap_to_timeline_grid`.
+        if is_dynamic {
+            if let Some(ref mut track) = video_track {
+                if track.addressing_mode == AddressingMode::Timeline {
+                    let adaptation = find_adaptation(period, &MediaType::Video);
+                    if let Some(adaptation) = adaptation {
+                        let repr_opt = adaptation.representations.first();
+                        let tmpl = merge_segment_templates(repr_opt, adaptation, period);
+                        if let Some(tl) = tmpl.as_ref().and_then(|t| t.SegmentTimeline.as_ref()) {
+                            let seg_dur_ticks = (track.timescale as f64
+                                * track.segment_duration_ms
+                                / 1_000.0)
+                                .round() as u64;
+                            let target_ticks = track
+                                .initial_segment_number
+                                .saturating_sub(track.start_number)
+                                * seg_dur_ticks;
+                            match snap_to_timeline_grid(&tl.segments, target_ticks) {
+                                Some(snapped) => {
+                                    tracing::info!(
+                                        media_type = "video",
+                                        snapped_t = snapped,
+                                        target_ticks,
+                                        "live-edge snap: next_segment_time set for \
+                                         SegmentTimeline track"
+                                    );
+                                    track.next_segment_time = Some(snapped);
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        media_type = "video",
+                                        target_ticks,
+                                        "live-edge snap: could not snap next_segment_time \
+                                         to SegmentTimeline grid — starting from beginning \
+                                         of live window"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(ref mut track) = audio_track {
+                if track.addressing_mode == AddressingMode::Timeline {
+                    let adaptation = find_adaptation(period, &MediaType::Audio);
+                    if let Some(adaptation) = adaptation {
+                        let repr_opt = adaptation.representations.first();
+                        let tmpl = merge_segment_templates(repr_opt, adaptation, period);
+                        if let Some(tl) = tmpl.as_ref().and_then(|t| t.SegmentTimeline.as_ref()) {
+                            let seg_dur_ticks = (track.timescale as f64
+                                * track.segment_duration_ms
+                                / 1_000.0)
+                                .round() as u64;
+                            let target_ticks = track
+                                .initial_segment_number
+                                .saturating_sub(track.start_number)
+                                * seg_dur_ticks;
+                            match snap_to_timeline_grid(&tl.segments, target_ticks) {
+                                Some(snapped) => {
+                                    tracing::info!(
+                                        media_type = "audio",
+                                        snapped_t = snapped,
+                                        target_ticks,
+                                        "live-edge snap: next_segment_time set for \
+                                         SegmentTimeline track"
+                                    );
+                                    track.next_segment_time = Some(snapped);
+                                }
+                                None => {
+                                    tracing::warn!(
+                                        media_type = "audio",
+                                        target_ticks,
+                                        "live-edge snap: could not snap next_segment_time \
+                                         to SegmentTimeline grid — starting from beginning \
+                                         of live window"
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -924,6 +1045,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             cdn_blacklist: CdnBlacklist::new(),
             gap_controller: GapController::new(),
             time_shift_buffer_depth_ms: mpd_ref_tsbd,
+            live_pts_remap_offset_s: 0.0,
         })
     }
 
@@ -1494,7 +1616,19 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The caller must seek the media element to this position so that it finds
     /// the buffered content.
     ///
-    /// Formula: `(initial_segment_number − start_number) × seg_dur_s`
+    /// For `SegmentTimeline` (`$Time$`) tracks, the snapped `next_segment_time`
+    /// tick value (set during live-edge snapping) is divided by the timescale to
+    /// give the exact presentation time of the first segment.  This is more
+    /// accurate than the number-based formula because it uses the actual
+    /// SegmentTimeline grid rather than an approximation from `initial_segment_number`.
+    ///
+    /// For `$Number$` tracks the formula is:
+    /// `(initial_segment_number − start_number) × seg_dur_s`.
+    ///
+    /// If [`Self::apply_live_pts_remap`] has been called, the stored remap
+    /// offset is subtracted from the native start position so that the returned
+    /// value reflects where the content actually lands in the browser (≈ 0 for
+    /// epoch-scale streams after remapping).
     ///
     /// Returns `0.0` for VOD streams or when no tracks are present.
     pub fn live_presentation_start_s(&self) -> f64 {
@@ -1502,10 +1636,109 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             return 0.0;
         }
         let track = self.video_track.as_ref().or(self.audio_track.as_ref());
-        track.map_or(0.0, |t| {
+        let native_start = track.map_or(0.0, |t| {
+            // For $Time$ tracks, prefer the snapped timeline tick value — it is
+            // aligned to the actual segment grid and avoids the rounding mismatch
+            // between the $Number$ live-edge formula and the SegmentTimeline's `t`
+            // values.  Without this, the seek target can be off by up to one
+            // segment duration, keeping the browser spinner active until enough
+            // segments are appended to cover the gap.
+            if t.addressing_mode == AddressingMode::Timeline {
+                if let Some(ticks) = t.next_segment_time {
+                    return ticks as f64 / t.timescale as f64;
+                }
+            }
+            // Fallback ($Number$ tracks or Timeline tracks where snapping failed).
             let seg_dur_s = t.segment_duration_ms / 1_000.0;
             t.initial_segment_number.saturating_sub(t.start_number) as f64 * seg_dur_s
-        })
+        });
+        // Subtract any remap offset applied by apply_live_pts_remap() so the
+        // caller receives the position where content actually lands in the
+        // browser (≈ 0 for epoch-scale streams after remapping).
+        (native_start - self.live_pts_remap_offset_s).max(0.0)
+    }
+
+    /// Remap epoch-scale fMP4 presentation timestamps to start near zero.
+    ///
+    /// On live streams (e.g. BBC IPTV) fMP4 decode timestamps are large
+    /// absolute values — sometimes tens of billions of timescale ticks.  The
+    /// dash.js approach leaves them as-is and relies on the browser honoring a
+    /// `video.currentTime` seek to the matching live-edge position.  Safari
+    /// (and some other browsers) reset `currentTime` back to 0 before content
+    /// is buffered, so the player stalls forever waiting for data at position 0
+    /// while content is buffered at position ~1.778 × 10⁹ s.
+    ///
+    /// Calling this method after session construction adjusts
+    /// `SourceBuffer.timestampOffset` on every active track sink by
+    /// `-offset_s`, where `offset_s` is:
+    ///
+    /// - `$Number$` tracks: `(initial_segment_number − start_number) × seg_dur_s`
+    /// - `$Time$` (SegmentTimeline) tracks: `next_segment_time / timescale`
+    ///
+    /// After the call, the first live-edge segment lands at presentation
+    /// time ≈ 0 in the browser.  [`Self::live_presentation_start_s`]
+    /// automatically subtracts the stored offset so it also returns ≈ 0,
+    /// and `bridge.seekTo(session.live_presentation_start_s())` becomes a
+    /// no-op seek to 0 that every browser handles correctly.
+    ///
+    /// # When to call
+    ///
+    /// - **WASM / MSE players**: call this after [`Self::from_url_with_clock`]
+    ///   and before the segment fetch loop, for live streams only.
+    /// - **GStreamer players**: do NOT call this.  Use
+    ///   `GstMediaSource::set_live_mode(true)` instead — it performs an
+    ///   equivalent PTS subtraction via a GStreamer probe.  Double-applying
+    ///   would corrupt timing.
+    ///
+    /// # Idempotence
+    ///
+    /// The offset is computed from the track state at the time of the call.
+    /// Calling this a second time would re-apply the (now-zero) offset and
+    /// be a no-op in practice, but it is intended to be called exactly once.
+    pub fn apply_live_pts_remap(&mut self) {
+        if !self.is_live() {
+            return;
+        }
+
+        // Compute the offset from the primary (video, fallback audio) track.
+        let offset_s = {
+            let track = self.video_track.as_ref().or(self.audio_track.as_ref());
+            match track {
+                None => return,
+                Some(t) => {
+                    if t.addressing_mode == AddressingMode::Timeline {
+                        t.next_segment_time
+                            .map(|ticks| ticks as f64 / t.timescale as f64)
+                            .unwrap_or(0.0)
+                    } else {
+                        let seg_dur_s = t.segment_duration_ms / 1_000.0;
+                        t.initial_segment_number.saturating_sub(t.start_number) as f64
+                            * seg_dur_s
+                    }
+                }
+            }
+        };
+
+        if offset_s == 0.0 {
+            tracing::debug!("apply_live_pts_remap: offset is 0 — nothing to do");
+            return;
+        }
+
+        tracing::info!(
+            offset_s,
+            "apply_live_pts_remap: shifting timestampOffset by -{offset_s:.3} s on all sinks"
+        );
+
+        if let Some(track) = self.video_track.as_mut() {
+            let current = track.sink.timestamp_offset();
+            track.sink.set_timestamp_offset(current - offset_s);
+        }
+        if let Some(track) = self.audio_track.as_mut() {
+            let current = track.sink.timestamp_offset();
+            track.sink.set_timestamp_offset(current - offset_s);
+        }
+
+        self.live_pts_remap_offset_s = offset_s;
     }
 
     /// The minimum interval (in milliseconds) between manifest refreshes.

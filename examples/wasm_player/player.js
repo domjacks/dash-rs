@@ -52,7 +52,24 @@ export function createBridge(video, log) {
       video.currentTime = time_s;
     },
 
+    // Return the current playback position of the <video> element in seconds.
+    // Passed to DashSession.current_metrics() so the ABR buffer-level
+    // calculation uses the actual position rather than a hardcoded 0.0 (which
+    // would make buffer_level_ms hugely wrong for epoch-timestamp live streams
+    // where content sits at ~1.78e9 s in the browser timeline).
+    getCurrentTime() {
+      return video.currentTime;
+    },
+
     // ── MediaSource lifecycle ──────────────────────────────────────────────────
+
+    // MediaSource.isTypeSupported(mimeType) — static capability check.
+    // Returns false for codecs the browser cannot decode (e.g. HEVC on Chrome).
+    // dash-rs calls this before addSourceBuffer so unsupported tracks are
+    // skipped gracefully rather than throwing a NotSupportedError.
+    isTypeSupported(mimeType) {
+      return MediaSource.isTypeSupported(mimeType);
+    },
 
     // 1. Instantiate a MediaSource.
     // 2. Create a blob: URL that points at it.

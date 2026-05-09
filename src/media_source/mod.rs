@@ -155,6 +155,18 @@ pub trait MediaSource {
     /// Set the total presentation duration. Only valid while `Open`.
     fn set_duration(&mut self, duration: f64) -> Result<(), DashError>;
 
+    /// Return whether this `MediaSource` can decode the given MIME type.
+    ///
+    /// Mirrors `MediaSource.isTypeSupported(mimeType)`.  The default
+    /// implementation returns `true` so that existing non-browser
+    /// implementations (GStreamer, stub) continue to work unchanged.
+    /// `BridgeMediaSource` in the WASM player overrides this to call the
+    /// real browser API, allowing `DashSession` to skip tracks whose codec
+    /// is not supported by the current browser (e.g. HEVC on Chrome).
+    fn is_type_supported(&self, _mime_type: &str) -> bool {
+        true
+    }
+
     /// Create and attach a new [`SourceBuffer`] for the given MIME type.
     /// Only valid while `Open`.
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError>;

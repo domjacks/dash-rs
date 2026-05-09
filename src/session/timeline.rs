@@ -8,6 +8,66 @@
 
 use crate::manifest::mpd_types::S;
 
+/// Snap `target_ticks` down to the nearest grid-aligned segment start time
+/// within the SegmentTimeline.
+///
+/// Used during live-edge snapping (session construction) to set
+/// `TrackState::next_segment_time` so that the first fetch lands at the
+/// live edge rather than at the beginning of the time-shift window (which is
+/// what `find_timeline_segment(None)` would return).
+///
+/// For infinite-repeat entries (`r = -1`) this returns the largest
+/// `entry.t + k × entry.d ≤ target_ticks`.  For finite-repeat entries an
+/// exact match is required (partial "snap" is not meaningful for discrete
+/// lists of specific timestamps).
+///
+/// Returns `None` when `target_ticks` falls before any timeline entry, the
+/// timeline is empty, or no entry covers the target.
+pub(super) fn snap_to_timeline_grid(segments: &[S], target_ticks: u64) -> Option<u64> {
+    let mut cursor: u64 = 0;
+
+    for (idx, s) in segments.iter().enumerate() {
+        let seg_start = s.t.unwrap_or(cursor);
+        cursor = seg_start;
+        let dur = s.d;
+        if dur == 0 {
+            continue;
+        }
+        let repeats: i64 = s.r.unwrap_or(0);
+
+        if repeats < 0 {
+            // ── Infinite-repeat entry (r = -1) ───────────────────────────────
+            // Snap down to the largest aligned position ≤ target_ticks.
+            if target_ticks < cursor {
+                return None; // target is before this block
+            }
+            // Check upper bound: does the next S entry have an explicit `t`?
+            let next_explicit_t: Option<u64> = segments.get(idx + 1).and_then(|n| n.t);
+            if let Some(nt) = next_explicit_t {
+                if target_ticks >= nt {
+                    cursor = nt;
+                    continue; // target belongs to a later block
+                }
+            }
+            // Snap down: largest `cursor + k * dur ≤ target_ticks`.
+            let steps = (target_ticks - cursor) / dur;
+            return Some(cursor + steps * dur);
+        } else {
+            // ── Finite-repeat entry (r ≥ 0) ──────────────────────────────────
+            for _ in 0..=repeats as u64 {
+                if cursor == target_ticks {
+                    return Some(cursor);
+                }
+                if cursor > target_ticks {
+                    return None; // overshot
+                }
+                cursor += dur;
+            }
+        }
+    }
+    None
+}
+
 /// Walk a SegmentTimeline's `S` entries and find the segment whose start time
 /// equals `target_time`, or — when `target_time` is `None` — return the very
 /// first segment.
@@ -128,8 +188,8 @@ pub(super) fn count_timeline_segments(segments: &[S]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{count_timeline_segments, find_timeline_segment};
-use crate::manifest::mpd_types::S;
+    use super::{count_timeline_segments, find_timeline_segment, snap_to_timeline_grid};
+    use crate::manifest::mpd_types::S;
 
     fn s(t: Option<u64>, d: u64, r: Option<i64>) -> S {
         S { t, d, r, ..Default::default() }
@@ -232,6 +292,90 @@ use crate::manifest::mpd_types::S;
     fn empty_returns_none() {
         assert_eq!(find_timeline_segment(&[], None), None);
         assert_eq!(find_timeline_segment(&[], Some(0)), None);
+    }
+
+    // ── snap_to_timeline_grid ─────────────────────────────────────────────────
+
+    /// Exact-match on a finite entry returns that entry's start time.
+    #[test]
+    fn snap_exact_match_finite() {
+        let segs = vec![s(Some(0), 90_000, None), s(None, 90_000, None)];
+        assert_eq!(snap_to_timeline_grid(&segs, 0), Some(0));
+        assert_eq!(snap_to_timeline_grid(&segs, 90_000), Some(90_000));
+    }
+
+    /// Target before any entry returns `None`.
+    #[test]
+    fn snap_before_all_entries_returns_none() {
+        let segs = vec![s(Some(1_000), 500, None)];
+        assert_eq!(snap_to_timeline_grid(&segs, 0), None);
+    }
+
+    /// Empty timeline always returns `None`.
+    #[test]
+    fn snap_empty_returns_none() {
+        assert_eq!(snap_to_timeline_grid(&[], 12_345), None);
+    }
+
+    /// Infinite-repeat entry: target exactly on grid → returns target.
+    #[test]
+    fn snap_infinite_repeat_exact() {
+        let segs = vec![s(Some(0), 90_000, Some(-1))];
+        assert_eq!(snap_to_timeline_grid(&segs, 0), Some(0));
+        assert_eq!(snap_to_timeline_grid(&segs, 90_000), Some(90_000));
+        assert_eq!(snap_to_timeline_grid(&segs, 270_000), Some(270_000));
+    }
+
+    /// Infinite-repeat: misaligned target snaps DOWN to nearest grid position.
+    #[test]
+    fn snap_infinite_repeat_misaligned_snaps_down() {
+        let segs = vec![s(Some(0), 90_000, Some(-1))];
+        // 1 tick past grid → snaps to 0.
+        assert_eq!(snap_to_timeline_grid(&segs, 1), Some(0));
+        // 89_999 ticks in → snaps to 0.
+        assert_eq!(snap_to_timeline_grid(&segs, 89_999), Some(0));
+        // 90_001 → snaps to 90_000.
+        assert_eq!(snap_to_timeline_grid(&segs, 90_001), Some(90_000));
+        // 200_000 → snaps to 180_000.
+        assert_eq!(snap_to_timeline_grid(&segs, 200_000), Some(180_000));
+    }
+
+    /// BBC-style epoch stream: large absolute timestamps snap correctly.
+    ///
+    /// Simulates an `r=-1` entry starting at a large epoch-scale `t` value
+    /// (analogous to `availabilityStartTime = 1970-01-01`, timescale=48000,
+    /// seg_dur=184320 ticks).  A slightly-off target must snap down to the
+    /// nearest aligned value so that `find_timeline_segment` can find it.
+    #[test]
+    fn snap_epoch_scale_r_minus_one() {
+        let t_start: u64 = 83_855_000_000_000; // epoch-scale start of live window
+        let d: u64 = 184_320;                  // BBC segment duration in ticks
+        let segs = vec![s(Some(t_start), d, Some(-1))];
+
+        // Exact aligned target.
+        let aligned = t_start + 1000 * d;
+        assert_eq!(snap_to_timeline_grid(&segs, aligned), Some(aligned));
+
+        // Target 100 ticks past an aligned position → snaps down.
+        let off_by_100 = t_start + 1000 * d + 100;
+        assert_eq!(snap_to_timeline_grid(&segs, off_by_100), Some(aligned));
+
+        // Target just before the live window → None.
+        assert_eq!(snap_to_timeline_grid(&segs, t_start - 1), None);
+    }
+
+    /// `r=-1` followed by an explicit next entry: target in the r=-1 range
+    /// snaps within that block; target at or past the next `t` belongs to the
+    /// next block.
+    #[test]
+    fn snap_infinite_repeat_with_next_block() {
+        let segs = vec![s(Some(0), 100, Some(-1)), s(Some(500), 200, None)];
+        // 450 → snaps to 400 (within r=-1 block, < 500).
+        assert_eq!(snap_to_timeline_grid(&segs, 450), Some(400));
+        // 500 → belongs to the second block (exact match).
+        assert_eq!(snap_to_timeline_grid(&segs, 500), Some(500));
+        // 600 → beyond the second entry (only has d=200 at t=500) → None.
+        assert_eq!(snap_to_timeline_grid(&segs, 600), None);
     }
 
     // ── count_timeline_segments ───────────────────────────────────────────────
