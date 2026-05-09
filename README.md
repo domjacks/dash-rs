@@ -434,43 +434,8 @@ Data flow per segment:
 
 ---
 
-## What's not yet implemented
+## Spec compliance and missing features
 
-The table below tracks gaps relative to dash.js, grouped by impact.
-
-### Tier 1 — Core stream compatibility (blocks many real-world streams)
-
-All Tier 1 features are now implemented.  No outstanding items.
-
-### Tier 2 — Important for live streams and ABR quality
-
-| Feature | dash.js equivalent | Notes |
-|---|---|---|
-| Content steering server | `ContentSteeringController.js` | Static weighted-random BaseURL failover exists; no dynamic steering server polling |
-| L2ARule (low-latency Lyapunov ABR) | `L2ARule.js` | Not implemented |
-| LoLpRule (learning-based low-latency ABR) | `LoLpRule.js` | Not implemented |
-| Low-latency partial/chunked segments | `PartialSegment.js`, `FetchLoader.js` | Fetcher receives whole segments only; no progressive streaming |
-| ProducerReferenceTime (PRFT) | `ProducerReferenceTime.js` | Not implemented |
-| Catch-up playback rate control | `CatchupController.js` | No library-level API to adjust playback rate for latency catch-up |
-| MPD Patch (`<Patch>`) | `PatchManifestModel.js` | `PatchLocation` in manifest is ignored |
-
-### Tier 3 — Metrics, DRM, text, thumbnails
-
-| Feature | dash.js equivalent | Notes |
-|---|---|---|
-| Formal metrics collection | `DashMetrics.js` / `MetricsModel.js` | `AbrMetrics` is input-only; no buffer-level log, HTTP metrics, or switch history reporting |
-| DVB/ISO metrics reporting | `MetricsReporting.js` | Not implemented |
-| CMCD / CMSD | `CmcdModel.js` / `CmsdModel.js` | Not implemented |
-| UTCTiming `http-head` method | `TimeSyncController.js` | `urn:mpeg:dash:utc:http-head:2014` is logged and skipped; `Date:` header not parsed |
-| Subtitle / text tracks | `TextController.js` / `TTMLParser.js` | `MediaType` has only `Video` and `Audio`; no text type |
-| Thumbnails / trick play | `ThumbnailController.js` | Not implemented |
-| DRM / Content Protection | `streaming/protection/` | No DRM variants in `DashError`; no crypto code |
-| Codec capability filtering | `Capabilities.js` / `CapabilitiesFilter.js` | Environment-specific; not implemented |
-| Common Access Token (CAT) | `CommonAccessTokenController.js` | No JWT auth field on `FetchRequest`; not implemented |
-| Extended URL Query Info | `ExtUrlQueryInfoController.js` | `<ExtendedUrlQueryInfo>` MPD element not parsed; query params not appended |
-| Offline download | `src/offline/` | Browser-specific (IndexedDB); native equivalent would differ |
-
-### Behavioural differences vs dash.js
-
-- **CDN failover / URL blacklisting**: implemented — `CdnBlacklist` mirrors `BlacklistController.js`.  After a segment-fetch failure the contributing `<BaseURL>` service-location key is blacklisted for a configurable cooldown (default 600 s).  Subsequent fetches skip blacklisted candidates; when every candidate is blacklisted they are all retried to prevent permanent stalls.  Configure via `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`.
-- **Throughput model**: dash.js uses multiple EWMA windows (fast + slow) and harmonic mean to resist outliers.  dash-rs tracks a single α-EMA per track independently; audio and video estimates can diverge, and the model over-reacts on bursty connections.
+For a full breakdown of DASH spec compliance, behavioural differences relative
+to dash.js, and the prioritised list of unimplemented features, see
+[COMPLIANCE.md](COMPLIANCE.md).
