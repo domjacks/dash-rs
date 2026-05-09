@@ -125,10 +125,10 @@
     Build (from workspace root):
       wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player/pkg
 
-    player.js contains the bridge object (all MSE + Fetch Web API calls) and
-    the UI wiring.  WASM drives the DASH logic and calls bridge methods for
-    every browser interaction.
+    app.js    — UI wiring: on-screen logger, WASM init, form handler.
+    player.js — MSE bridge: all browser Web API calls made by dash-rs.
+                Exports createBridge(video, log); imported by app.js.
   -->
-  <script type="module" src="./player.js"></script>
+  <script type="module" src="./app.js"></script>
 </body>
 </html>

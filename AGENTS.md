@@ -445,7 +445,8 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
 | WASM player example (`JsBridge`, `BridgeClock`, `BridgeFetcher`, `BridgeMediaSource`, `BridgeSourceBuffer`, `play`) | `examples/wasm_player/src/lib.rs` |
-| WASM player browser bridge + UI wiring | `examples/wasm_player/player.js` |
+| WASM player MSE bridge (`createBridge`) — all browser Web API calls | `examples/wasm_player/player.js` |
+| WASM player UI wiring — on-screen logger, WASM init, form handler | `examples/wasm_player/app.js` |
 
 ---
 
