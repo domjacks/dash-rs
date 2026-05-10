@@ -133,6 +133,12 @@ extern "C" {
     #[wasm_bindgen(method, js_name = getCurrentTime)]
     fn get_current_time(this: &JsBridge) -> f64;
 
+    // video.paused — true while the element is paused.
+    // Passed to DashSession::tick_gap() to suppress gap jumps during user pause,
+    // mirroring dash.js GapController._shouldCheckForGaps().
+    #[wasm_bindgen(method, js_name = isPaused)]
+    fn is_paused(this: &JsBridge) -> bool;
+
     // ── MediaSource lifecycle ─────────────────────────────────────────────
     // new MediaSource() + URL.createObjectURL() + video.src= + sourceopen
     #[wasm_bindgen(method, js_name = setupMediaSource)]
@@ -635,6 +641,28 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     loop {
         if video_done && audio_done {
             break;
+        }
+
+        // ── Gap controller tick ────────────────────────────────────────────
+        // Mirrors dash.js GapController.js setInterval at ~200 ms.
+        // Collects buffered ranges from the primary gate track and checks for
+        // stalls or small gaps.  If a seek is recommended, we perform it and
+        // restart the buffer clock.
+        {
+            let position_s = bridge.get_current_time();
+            let is_paused  = bridge.is_paused();
+            let buffered   = session.buffered(gate_type.clone());
+            if let Some(target) = session.tick_gap(position_s, &buffered, is_paused) {
+                tracing::info!(
+                    position_s,
+                    seek_to = target.position_s,
+                    reason  = ?target.reason,
+                    "gap controller: seeking to recover from stall/gap"
+                );
+                bridge.seek_to(target.position_s);
+                session.seek_to(target.position_s);
+                session.notify_playing();
+            }
         }
 
         // Buffer gate: mirrors dash.js ScheduleController.

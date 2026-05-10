@@ -61,6 +61,13 @@ export function createBridge(video, log) {
       return video.currentTime;
     },
 
+    // Return true while the video element is paused.
+    // Passed to DashSession.tick_gap() so that gap jumps are suppressed while
+    // the user has paused playback — mirrors dash.js GapController._shouldCheckForGaps().
+    isPaused() {
+      return video.paused;
+    },
+
     // ── MediaSource lifecycle ──────────────────────────────────────────────────
 
     // MediaSource.isTypeSupported(mimeType) — static capability check.

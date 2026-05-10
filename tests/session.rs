@@ -2931,7 +2931,167 @@ fn seek_to_resets_gap_controller_automatically() {
     );
 }
 
-/// gap_settings returns default values and set_gap_settings round-trips.
+// ── seek_to with live PTS remap ───────────────────────────────────────────────
+
+/// `seek_to` correctly converts a remapped (≈ 0-based) presentation time back
+/// to a segment number when `apply_live_pts_remap` has been called.
+///
+/// Setup (deterministic via `FixedClock`):
+///   AST = epoch (1970-01-01T00:00:00Z), now = 1000 s, seg_dur = 4 s, start_number = 1
+///   live_edge  = floor(1000/4) + 1 = 251, safety = 3 → initial_segment_number = 248
+///   remap_offset = (248 − 1) × 4 = 988 s
+///
+/// After `apply_live_pts_remap()`:
+///   `live_pts_remap_offset_s()` == 988.0
+///   `live_presentation_start_s()` ≈ 0.0
+///
+/// `seek_to(5.0)` (remapped space) should land on segment 249:
+///   adjusted_pos = 5 + 988 − 0 = 993 s, offset_segs = floor(993/4) = 248
+///   new_seg = 1 + 248 = 249
+///   snapped_s = 248 × 4 − 988 = 4.0   (remapped)
+#[tokio::test]
+async fn seek_to_remapped_live_snaps_to_correct_segment() {
+    use std::sync::Arc;
+
+    const LIVE_REMAP_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="1970-01-01T00:00:00Z"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    struct FixedClock1000 {}
+    impl dash_rs::clock::Clock for FixedClock1000 {
+        fn now_ms(&self) -> f64 { 0.0 }
+        fn unix_s(&self) -> f64 { 1000.0 }
+    }
+
+    let mpd = dash_rs::manifest::parse(LIVE_REMAP_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock1000 {});
+
+    let mut session = DashSession::from_mpd_with_clock(mpd, base_url, fetcher, open_stub_source(), clock)
+        .expect("session construction failed");
+
+    // live_edge = floor(1000/4)+1 = 251, safety = 3 → initial_seg = 248
+    // remap_offset = (248−1) × 4 = 988 s
+    session.apply_live_pts_remap();
+
+    let remap_offset = session.live_pts_remap_offset_s();
+    assert!(
+        (remap_offset - 988.0).abs() < 1.0,
+        "remap_offset should be ~988 s, got {remap_offset}"
+    );
+
+    // live_presentation_start_s should be ≈ 0
+    let start_s = session.live_presentation_start_s();
+    assert!(
+        start_s.abs() < 4.0,
+        "live_presentation_start_s should be near 0, got {start_s}"
+    );
+
+    // seek_to(5.0) in remapped space: adjusted = 5 + 988 = 993, segs = 248 → seg 249
+    let snapped = session.seek_to(5.0);
+    // snapped_s = 248*4 − 988 = 4.0 in remapped space
+    assert!(
+        (snapped - 4.0).abs() < 1e-6,
+        "seek_to(5.0) snapped should be ~4.0 in remapped space, got {snapped}"
+    );
+    // Buffer level resets to 0 after seek
+    assert_eq!(
+        session.estimated_buffer_level_ms(&MediaType::Video),
+        0.0,
+        "buffer level should be 0 after seek"
+    );
+}
+
+/// `seek_to` with remap offset 0 (VOD / non-remapped) is unaffected — backward
+/// compatibility check.
+#[test]
+fn seek_to_with_zero_remap_offset_unchanged() {
+    let mut session = session_from_xml(SEEK_MPD);
+    // No apply_live_pts_remap() called → offset is 0.0
+    assert_eq!(session.live_pts_remap_offset_s(), 0.0);
+    // seek_to at 12 s → snapped to 12.0 exactly (4 s segments, 12/4=3 → start_number+3=4)
+    let snapped = session.seek_to(12.0);
+    assert!(
+        (snapped - 12.0).abs() < 1e-9,
+        "VOD seek_to should be unaffected by zero remap offset, got {snapped}"
+    );
+}
+
+// ── DashSession::buffered() ───────────────────────────────────────────────────
+
+/// `buffered()` returns an empty slice when no timed chunks have been appended.
+#[test]
+fn buffered_returns_empty_before_any_appends() {
+    let session = session_from_xml(SEEK_MPD);
+    let ranges = session.buffered(MediaType::Video);
+    assert!(
+        ranges.is_empty(),
+        "buffered() should be empty before any appends; got {ranges:?}"
+    );
+}
+
+/// `buffered()` returns an empty slice for an absent track.
+#[test]
+fn buffered_returns_empty_for_absent_track() {
+    const VIDEO_ONLY_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+    let session = session_from_xml(VIDEO_ONLY_MPD);
+    assert!(!session.has_audio(), "self-check: no audio track");
+    let ranges = session.buffered(MediaType::Audio);
+    assert!(
+        ranges.is_empty(),
+        "buffered() for absent audio track should be empty; got {ranges:?}"
+    );
+}
+
+/// `buffered()` reflects timed chunks appended directly to a `SourceBufferSink`.
+///
+/// This verifies the delegation chain:
+///   `session.buffered()` → `TrackState::sink.buffered()` → `StubSourceBuffer::buffered()`
+/// using `SourceBufferSink` directly (the same type the session uses internally).
+#[tokio::test]
+async fn buffered_reflects_appended_timed_chunks() {
+    use dash_rs::media_source::{sink::SourceBufferSink, stub::StubSourceBuffer, Chunk};
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    sink.append(Chunk::new(
+        bytes::Bytes::from_static(b"\x00"),
+        Some(0.0),
+        Some(4.0),
+        "seg-1",
+    ))
+    .await
+    .unwrap();
+
+    let ranges = sink.buffered();
+    assert_eq!(ranges.len(), 1, "expected one buffered range; got {ranges:?}");
+    assert!((ranges[0].start - 0.0).abs() < 1e-9, "start = {}", ranges[0].start);
+    assert!((ranges[0].end   - 4.0).abs() < 1e-9, "end   = {}", ranges[0].end);
+}
+
 #[test]
 fn gap_settings_round_trip() {
     let mut session = session_from_xml(SEEK_MPD);

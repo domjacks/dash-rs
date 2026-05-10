@@ -1533,6 +1533,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// boundaries.
     pub fn seek_to(&mut self, position_s: f64) -> f64 {
         let position_s = position_s.max(0.0);
+        // When apply_live_pts_remap() has been called, `position_s` is in
+        // remapped (≈0-based) presentation time.  The segment-number formula
+        // expects un-remapped time, so we add the stored offset back before
+        // dividing.  When no remap has been applied the offset is 0.0 and
+        // this is a no-op (backward-compatible).
+        let remap_offset = self.live_pts_remap_offset_s;
 
         let mut snapped_s: f64 = position_s;
 
@@ -1543,8 +1549,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let seg_dur_s = track.segment_duration_ms / 1_000.0;
         // Map the presentation-timeline position into a segment index.
         // DASH spec: presentation_time(N) = (N − start_number) × seg_dur_s + Period@start
-        // → N = start_number + ⌊(position_s − Period@start) / seg_dur_s⌋
-        let adjusted_pos = (position_s - track.period_start_s).max(0.0);
+        // → N = start_number + ⌊(position_s + remap_offset − Period@start) / seg_dur_s⌋
+        //
+        // The remap_offset converts from remapped time (video.currentTime space)
+        // back to un-remapped DTS time so the formula gives the correct segment.
+        let adjusted_pos = (position_s + remap_offset - track.period_start_s).max(0.0);
         let offset_segs = if seg_dur_s > 0.0 {
             (adjusted_pos / seg_dur_s).floor() as u64
         } else {
@@ -1570,8 +1579,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             // find_timeline_segment snap to the nearest valid entry instead of
             // restarting from the first entry (which is wrong for live streams
             // with large absolute tick values).
+            // Add remap_offset so the ticks land in the correct DTS-space position.
             if track.addressing_mode == AddressingMode::Timeline {
-                let target_ticks = ((position_s - track.period_start_s).max(0.0)
+                let target_ticks = ((position_s + remap_offset - track.period_start_s).max(0.0)
                     * track.timescale as f64)
                     .round() as u64;
                 track.next_segment_time = Some(target_ticks);
@@ -1587,8 +1597,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             // the new position.
             track.initial_segment_number = new_seg;
 
+            // Return the snapped position in the same coordinate space that
+            // position_s was given in (remapped if remap was applied, un-remapped
+            // otherwise) so the caller can use the value directly.
             let snapped_offset = new_seg.saturating_sub(track.start_number);
-            snapped_s = snapped_offset as f64 * seg_dur_s + track.period_start_s;
+            snapped_s = snapped_offset as f64 * seg_dur_s + track.period_start_s - remap_offset;
         }
 
         tracing::info!(
@@ -1768,6 +1781,33 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             MediaType::Video => self.video_track.as_ref().map(|t| t.segment_number).unwrap_or(0),
             MediaType::Audio => self.audio_track.as_ref().map(|t| t.segment_number).unwrap_or(0),
         }
+    }
+
+    /// The PTS remap offset applied by [`Self::apply_live_pts_remap`], in seconds.
+    ///
+    /// Returns `0.0` until `apply_live_pts_remap` has been called.  After the
+    /// call, every active sink's `timestampOffset` has been shifted by
+    /// `-live_pts_remap_offset_s`, and `live_presentation_start_s()` subtracts
+    /// this value so it returns ≈ 0 for epoch-scale live streams.
+    pub fn live_pts_remap_offset_s(&self) -> f64 {
+        self.live_pts_remap_offset_s
+    }
+
+    /// Buffered time ranges for the given media track, as reported by the
+    /// underlying [`SourceBufferSink`].
+    ///
+    /// In the WASM / MSE player these come directly from `SourceBuffer.buffered`
+    /// in the browser and reflect real decoded data.  In the stub and GStreamer
+    /// implementations they reflect chunks explicitly appended with timing
+    /// information.
+    ///
+    /// Returns an empty `Vec` when the track is absent.
+    pub fn buffered(&self, media_type: MediaType) -> Vec<crate::media_source::TimeRange> {
+        let track = match media_type {
+            MediaType::Video => self.video_track.as_ref(),
+            MediaType::Audio => self.audio_track.as_ref(),
+        };
+        track.map(|t| t.sink.buffered()).unwrap_or_default()
     }
 
     /// Returns the most recently decoded `ProducerReferenceTimeBox` (`prft`)

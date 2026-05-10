@@ -295,9 +295,21 @@ so `bridge.seekTo(0)` is a trivial seek that every browser handles.
 `GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction).
 Double-applying would shift timestamps by twice the offset and corrupt decoding.
 
-`seek_to` (Rust method) is **not updated** for remapped streams; the WASM player
-uses `bridge.seekTo()` directly and does not call `session.seek_to()` during
-live playback, so this is currently acceptable.  Fix is tracked as a follow-up.
+`seek_to` accounts for remapped streams: `position_s` is received in remapped
+(≈0-based) presentation time.  The formula adds `live_pts_remap_offset_s` back
+before computing the segment number, and subtracts it again from the returned
+snapped position, so both the segment index and the caller's seek target are in
+the correct coordinate space.  This is a no-op when `live_pts_remap_offset_s`
+is 0.0 (VOD or non-remapped live streams).
+
+`DashSession::live_pts_remap_offset_s()` exposes the stored offset for tests
+and callers that need to convert between coordinate spaces.
+
+`DashSession::buffered(media_type)` returns the current buffered time ranges
+from the track's `SourceBufferSink`, delegating to the underlying
+`SourceBuffer::buffered()`.  Used by the WASM player's `tick_gap` call to pass
+real-time buffered ranges to the gap controller.  Returns an empty `Vec` when
+the track is absent.
 
 ### `timestampOffset` formula (DASH spec §5.3.9.6)
 
