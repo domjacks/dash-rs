@@ -142,3 +142,55 @@ pub trait SegmentFetcher {
     /// by `fetch` is dropped, the request should also be cancelled.
     fn abort(&self);
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use url::Url;
+
+    fn dummy_url() -> Url {
+        Url::parse("http://example.com/seg.m4s").unwrap()
+    }
+
+    fn make_response(bytes_received: u64, transfer_duration_ms: u64) -> FetchResponse {
+        FetchResponse {
+            final_url: dummy_url(),
+            data: bytes::Bytes::new(),
+            transfer_duration_ms,
+            bytes_received,
+        }
+    }
+
+    #[test]
+    fn throughput_zero_duration_returns_none() {
+        // A zero-duration transfer has no meaningful throughput.
+        let resp = make_response(125_000, 0);
+        assert_eq!(resp.throughput_bps(), None);
+    }
+
+    #[test]
+    fn throughput_computes_correctly() {
+        // 125 000 bytes in 1 000 ms = 1 Mbps.
+        let resp = make_response(125_000, 1_000);
+        let bps = resp.throughput_bps().expect("should return Some for non-zero duration");
+        assert!(
+            (bps - 1_000_000.0).abs() < 1.0,
+            "expected 1_000_000 bps, got {bps}"
+        );
+    }
+
+    #[test]
+    fn with_byte_range_sets_field() {
+        let req = FetchRequest::new(dummy_url(), RequestType::MediaSegment)
+            .with_byte_range(100, 199);
+        assert_eq!(req.byte_range, Some((100, 199)));
+    }
+
+    #[test]
+    fn new_request_has_no_byte_range() {
+        let req = FetchRequest::new(dummy_url(), RequestType::InitializationSegment);
+        assert_eq!(req.byte_range, None);
+    }
+}

@@ -333,3 +333,179 @@ mod tests {
         assert_eq!(expand_template("seg$", "id", 100, 1, None), "seg$");
     }
 }
+
+// ── Extended tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod extended_tests {
+    use super::{collect_candidate_base_urls, resolve_effective_base_url};
+    use crate::manifest::mpd_types::{AdaptationSet, BaseURL, Period};
+    use url::Url;
+
+    fn base_url(s: &str) -> BaseURL {
+        BaseURL { base: s.to_owned(), ..Default::default() }
+    }
+
+    fn base_url_with_svc(s: &str, svc: &str) -> BaseURL {
+        BaseURL {
+            base: s.to_owned(),
+            serviceLocation: Some(svc.to_owned()),
+            ..Default::default()
+        }
+    }
+
+    fn manifest() -> Url {
+        Url::parse("https://cdn.example.com/live/manifest.mpd").unwrap()
+    }
+
+    // ── collect_candidate_base_urls ───────────────────────────────────────────
+
+    #[test]
+    fn collect_no_base_urls_returns_manifest() {
+        let candidates = collect_candidate_base_urls(
+            &manifest(),
+            &[],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].url.as_str(), manifest().as_str());
+        // service_location falls back to host.
+        assert_eq!(candidates[0].service_location, "cdn.example.com");
+    }
+
+    #[test]
+    fn collect_mpd_level_base_url_resolves() {
+        let candidates = collect_candidate_base_urls(
+            &manifest(),
+            &[base_url("https://cdn2.example.com/live/")],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates[0].url.as_str().contains("cdn2.example.com"));
+    }
+
+    #[test]
+    fn collect_multiple_mpd_base_urls_produces_multiple_candidates() {
+        let candidates = collect_candidate_base_urls(
+            &manifest(),
+            &[
+                base_url("https://cdn-a.example.com/"),
+                base_url("https://cdn-b.example.com/"),
+            ],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert_eq!(candidates.len(), 2);
+    }
+
+    #[test]
+    fn collect_service_location_inherited_from_base_url() {
+        let candidates = collect_candidate_base_urls(
+            &manifest(),
+            &[base_url_with_svc("https://cdn-a.example.com/", "cdn-a")],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert_eq!(candidates[0].service_location, "cdn-a");
+    }
+
+    #[test]
+    fn collect_repr_level_base_url_chains_with_adaptation() {
+        // Period declares one base; representation adds a relative path.
+        let mut period = Period::default();
+        period.BaseURL = vec![base_url("https://origin.example.com/content/")];
+        let repr_urls = vec![base_url("video/")];
+
+        let candidates = collect_candidate_base_urls(
+            &manifest(),
+            &[],
+            &period,
+            &AdaptationSet::default(),
+            &repr_urls,
+        );
+        assert_eq!(candidates.len(), 1);
+        assert!(
+            candidates[0].url.as_str().contains("origin.example.com"),
+            "resolved URL: {}",
+            candidates[0].url
+        );
+        assert!(
+            candidates[0].url.as_str().ends_with("video/"),
+            "resolved URL: {}",
+            candidates[0].url
+        );
+    }
+
+    // ── resolve_effective_base_url ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_no_base_urls_returns_manifest() {
+        let result = resolve_effective_base_url(
+            &manifest(),
+            &[],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert_eq!(result.as_str(), manifest().as_str());
+    }
+
+    #[test]
+    fn resolve_mpd_level_absolute_replaces_manifest() {
+        let result = resolve_effective_base_url(
+            &manifest(),
+            &[base_url("https://cdn2.example.com/live/")],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert!(result.as_str().contains("cdn2.example.com"));
+    }
+
+    #[test]
+    fn resolve_chained_relative_paths() {
+        let mut period = Period::default();
+        period.BaseURL = vec![base_url("streams/")];
+        let mut a = AdaptationSet::default();
+        a.BaseURL = vec![base_url("video/")];
+
+        // manifest → streams/ → video/
+        let result = resolve_effective_base_url(
+            &Url::parse("https://origin.example.com/").unwrap(),
+            &[],
+            &period,
+            &a,
+            &[],
+        );
+        assert!(
+            result.as_str().ends_with("video/"),
+            "resolved: {}",
+            result
+        );
+        assert!(result.as_str().contains("origin.example.com"));
+    }
+
+    #[test]
+    fn resolve_picks_first_base_url_at_each_level() {
+        // Even when multiple BaseURLs exist, resolve picks only the first.
+        let result = resolve_effective_base_url(
+            &manifest(),
+            &[
+                base_url("https://primary.example.com/"),
+                base_url("https://secondary.example.com/"),
+            ],
+            &Period::default(),
+            &AdaptationSet::default(),
+            &[],
+        );
+        assert!(result.as_str().contains("primary.example.com"),
+            "should pick first BaseURL: {}", result);
+        assert!(!result.as_str().contains("secondary.example.com"));
+    }
+}

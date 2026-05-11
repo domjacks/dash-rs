@@ -1312,4 +1312,117 @@ mod tests {
         assert_eq!(prft.reference_track_id, 1);
         assert_eq!(prft.media_time, 96_000);
     }
+
+    // ── parse_sidx_entries ────────────────────────────────────────────────────
+
+    /// `index_end_offset` is the byte immediately after the fetched index range.
+    /// With `first_offset = 0` in the sidx, the first entry starts there.
+    #[test]
+    fn sidx_entries_v0_single_entry_byte_offsets() {
+        // timescale=1000, EPT=0, one entry of duration=3840.
+        // The test sidx helper sets referenced_size = 0x1000 = 4096.
+        let data = make_sidx_v0(1000, 0, &[3840]);
+        let index_end: u64 = 5000; // arbitrary file offset
+        let entries = parse_sidx_entries(&data, index_end).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].byte_offset, index_end); // first_offset = 0
+        assert_eq!(entries[0].byte_length, 0x1000); // 4096 as built by helper
+        assert!((entries[0].start_s - 0.0).abs() < 1e-9);
+        assert!((entries[0].end_s - 3.84).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sidx_entries_v0_multiple_entries_cumulative_offsets() {
+        // Two entries; referenced_size = 4096 each (helper always uses 0x1000).
+        let data = make_sidx_v0(1000, 0, &[2000, 1840]);
+        let index_end: u64 = 1000;
+        let entries = parse_sidx_entries(&data, index_end).unwrap();
+
+        assert_eq!(entries.len(), 2);
+        // Entry 0 starts at index_end.
+        assert_eq!(entries[0].byte_offset, 1000);
+        // Entry 1 starts at index_end + referenced_size_0.
+        assert_eq!(entries[1].byte_offset, 1000 + 4096);
+
+        // Timing: timescale=1000, EPT=0.
+        assert!((entries[0].start_s - 0.0).abs() < 1e-9);
+        assert!((entries[0].end_s - 2.0).abs() < 1e-9);
+        assert!((entries[1].start_s - 2.0).abs() < 1e-9);
+        assert!((entries[1].end_s - 3.84).abs() < 1e-9);
+    }
+
+    #[test]
+    fn sidx_entries_v1_large_first_offset() {
+        // version-1 sidx with a large EPT and two entries.
+        let data = make_sidx_v1(1000, 10_000_000_000u64, &[4000]);
+        let index_end: u64 = 8192;
+        let entries = parse_sidx_entries(&data, index_end).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].byte_offset, index_end); // first_offset=0 in helper
+        let expected_start = 10_000_000_000.0_f64 / 1000.0;
+        assert!((entries[0].start_s - expected_start).abs() < 0.01);
+        assert!((entries[0].end_s - (expected_start + 4.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn sidx_entries_zero_ref_count_returns_none() {
+        // A sidx with reference_count=0 should return None.
+        let data = make_sidx_v0(1000, 0, &[]);
+        assert!(parse_sidx_entries(&data, 0).is_none());
+    }
+
+    #[test]
+    fn sidx_entries_truncated_returns_none() {
+        // A sidx buffer truncated before all entries are readable → None.
+        let data = make_sidx_v0(1000, 0, &[3840]);
+        // Drop the last 4 bytes so the single entry cannot be fully parsed.
+        let truncated = &data[..data.len() - 4];
+        assert!(parse_sidx_entries(truncated, 0).is_none());
+    }
+
+    // ── parse_prft — version handling ────────────────────────────────────────
+
+    /// version=2 is parsed like version=1 (64-bit media_time path) because the
+    /// implementation treats any non-zero version as version-1.  This test
+    /// documents that known behaviour.
+    #[test]
+    fn prft_non_zero_version_parsed_as_v1_variant() {
+        // Build a v0-shaped box but set version byte = 2.
+        let mut data = make_prft_v0(1, 3_913_056_000u64 << 32, 0);
+        // Version byte is at offset 8 (size[4] + type[4]).
+        data[8] = 2;
+        // With version=2 the code takes the 64-bit media_time path.
+        // The v0 helper only writes 4 bytes of media_time → payload too short → None.
+        assert!(
+            parse_prft(&data).is_none(),
+            "version=2 with a v0-sized box should fail because payload is too short"
+        );
+    }
+
+    // ── parse_all_emsg — v0 zero-timescale skipped ──────────────────────────
+
+    #[test]
+    fn emsg_v0_zero_timescale_skipped() {
+        // Build a v0 emsg with timescale=0; the parser should skip it.
+        let mut data = make_emsg_v0(
+            "urn:test",
+            "value",
+            0,   // timescale = 0 ← should be skipped
+            0,
+            1000,
+            0,
+            b"",
+        );
+        // The `make_emsg_v0` helper already sets timescale=0 above;
+        // just verify the result.
+        assert!(
+            parse_all_emsg(&data).is_empty(),
+            "emsg with timescale=0 should be skipped"
+        );
+        // Sanity: with a valid non-zero timescale the same scheme parses fine.
+        data = make_emsg_v0("urn:test", "val", 90_000, 0, 1000, 0, b"");
+        assert_eq!(parse_all_emsg(&data).len(), 1);
+    }
 }

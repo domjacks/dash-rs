@@ -249,4 +249,25 @@ mod tests {
             Some(1_704_067_200.0)
         );
     }
+
+    #[test]
+    fn leading_trailing_whitespace_accepted() {
+        // `s.trim()` is called at the top of `parse_xs_datetime`.
+        assert_eq!(
+            parse_xs_datetime("  1970-01-01T00:00:00Z  "),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn negative_timezone_offset_rejected() {
+        // Negative UTC offsets (e.g. "-05:00") are not the UTC "Z" suffix and
+        // do not end in "Z" or "+00:00", so they should be rejected.
+        // The last character is '0', which triggers the "no UTC marker" fallback
+        // and fails on the subsequent UTC-only format check.
+        assert!(
+            parse_xs_datetime("2000-01-01T00:00:00-05:00").is_none(),
+            "negative UTC offset should be rejected (only Z / +00:00 accepted)"
+        );
+    }
 }

@@ -604,4 +604,22 @@ mod tests {
         // position_s = 10.0 is inside [9, 12]; no gap ahead of it.
         assert!(gc.tick(10.0, &buf, false).is_none());
     }
+
+    // ── track-switch suppression ──────────────────────────────────────────────
+
+    #[test]
+    fn track_switch_suppression_multiple_ticks_then_resumes() {
+        let mut gc = GapController::new();
+        // A gap between 3.0 and 4.0 would normally trigger a jump.
+        let buf = ranges(&[(0.0, 3.0), (4.0, 8.0)]);
+
+        gc.on_track_switch_started();
+        // Both ticks while switch is in-progress must be suppressed.
+        assert!(gc.tick(3.05, &buf, false).is_none());
+        assert!(gc.tick(3.05, &buf, false).is_none());
+
+        gc.on_track_switch_ended();
+        // After the switch completes the gap is still there and can now be jumped.
+        assert!(gc.tick(3.05, &buf, false).is_some());
+    }
 }

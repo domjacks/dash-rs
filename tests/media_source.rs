@@ -4,6 +4,7 @@ use bytes::Bytes;
 use dash_rs::{
     error::DashError,
     media_source::{
+        sink::StreamInfo,
         stub::{StubMediaSource, StubSourceBuffer},
         Chunk, MediaSource, ReadyState, SourceBuffer,
     },
@@ -221,4 +222,225 @@ async fn source_buffer_sink_remove_validates_range() {
     // Invalid range (end ≤ start) should return an error.
     let result = sink.remove(5.0, 3.0).await;
     assert!(matches!(result, Err(DashError::InvalidTimeRange { .. })));
+}
+
+#[tokio::test]
+async fn source_buffer_sink_set_timestamp_offset_stored_and_retrieved() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    // Default offset is 0.0.
+    assert_eq!(sink.timestamp_offset(), 0.0);
+
+    sink.set_timestamp_offset(5.0);
+    assert_eq!(sink.timestamp_offset(), 5.0);
+}
+
+#[tokio::test]
+async fn source_buffer_sink_set_timestamp_offset_no_op_when_unchanged() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    sink.set_timestamp_offset(3.0);
+    assert_eq!(sink.timestamp_offset(), 3.0);
+
+    // Calling again with the same value should be a no-op — offset stays 3.0.
+    sink.set_timestamp_offset(3.0);
+    assert_eq!(sink.timestamp_offset(), 3.0);
+
+    // Non-finite values must be silently ignored.
+    sink.set_timestamp_offset(f64::NAN);
+    assert_eq!(sink.timestamp_offset(), 3.0);
+
+    sink.set_timestamp_offset(f64::INFINITY);
+    assert_eq!(sink.timestamp_offset(), 3.0);
+}
+
+// ── SourceBufferSink::update_append_window ────────────────────────────────────
+
+#[tokio::test]
+async fn update_append_window_basic() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    // period start=10 s, duration=30 s →
+    //   appendWindowStart = max(10 − 0.1, 0) = 9.9
+    //   appendWindowEnd   = 10 + 30 + 0.01 = 40.01
+    sink.update_append_window(
+        &StreamInfo { start: 10.0, duration: Some(30.0) },
+        None,
+    );
+
+    assert!(
+        (sink.append_window_start() - 9.9).abs() < 1e-9,
+        "appendWindowStart should be 9.9, got {}",
+        sink.append_window_start()
+    );
+    assert!(
+        (sink.append_window_end() - 40.01).abs() < 1e-9,
+        "appendWindowEnd should be 40.01, got {}",
+        sink.append_window_end()
+    );
+}
+
+#[tokio::test]
+async fn update_append_window_clamps_start_at_zero() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    // period start=0.05 s → start − 0.1 = −0.05 → clamped to 0.0
+    sink.update_append_window(
+        &StreamInfo { start: 0.05, duration: Some(10.0) },
+        None,
+    );
+
+    assert_eq!(
+        sink.append_window_start(),
+        0.0,
+        "appendWindowStart must be clamped to 0"
+    );
+}
+
+#[tokio::test]
+async fn update_append_window_no_duration_falls_back_to_source_duration() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    // No period duration → use media_source_duration.
+    // appendWindowEnd = 60.0 + 0.01 = 60.01
+    sink.update_append_window(
+        &StreamInfo { start: 0.0, duration: None },
+        Some(60.0),
+    );
+
+    assert!(
+        (sink.append_window_end() - 60.01).abs() < 1e-9,
+        "appendWindowEnd should fall back to media_source_duration + offset, got {}",
+        sink.append_window_end()
+    );
+}
+
+#[tokio::test]
+async fn update_append_window_no_duration_no_source_duration_is_infinity() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    sink.update_append_window(
+        &StreamInfo { start: 0.0, duration: None },
+        None,
+    );
+
+    assert_eq!(
+        sink.append_window_end(),
+        f64::INFINITY,
+        "appendWindowEnd should be ∞ when no duration is known"
+    );
+}
+
+#[tokio::test]
+async fn update_append_window_infinite_period_duration_falls_back() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    // Infinite period duration treated like None → use media_source_duration.
+    sink.update_append_window(
+        &StreamInfo { start: 0.0, duration: Some(f64::INFINITY) },
+        Some(30.0),
+    );
+
+    assert!(
+        (sink.append_window_end() - 30.01).abs() < 1e-9,
+        "infinite period duration should fall back to media_source_duration, got {}",
+        sink.append_window_end()
+    );
+}
+
+// ── SourceBufferSink::abort append-window restoration ─────────────────────────
+
+#[tokio::test]
+async fn sink_abort_restores_append_window() {
+    use dash_rs::media_source::sink::SourceBufferSink;
+
+    let inner = Box::new(StubSourceBuffer::new("video/mp4"));
+    let mut sink = SourceBufferSink::new(inner);
+
+    // Set a non-default append window.
+    sink.update_append_window(
+        &StreamInfo { start: 5.0, duration: Some(20.0) },
+        None,
+    );
+    let saved_start = sink.append_window_start();
+    let saved_end = sink.append_window_end();
+
+    // MSE abort() resets the window; our wrapper must restore it.
+    sink.abort().await.unwrap();
+
+    assert!(
+        (sink.append_window_start() - saved_start).abs() < 1e-9,
+        "append_window_start should be restored after abort, got {}",
+        sink.append_window_start()
+    );
+    assert!(
+        (sink.append_window_end() - saved_end).abs() < 1e-9,
+        "append_window_end should be restored after abort, got {}",
+        sink.append_window_end()
+    );
+}
+
+// ── StubSourceBuffer::remove semantics ───────────────────────────────────────
+
+#[tokio::test]
+async fn stub_remove_exact_match_removes_chunk() {
+    let mut buf = StubSourceBuffer::new("video/mp4");
+
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"data"),
+        Some(2.0),
+        Some(4.0),
+        "seg",
+    ))
+    .await
+    .unwrap();
+
+    // Remove exactly the buffered range.
+    buf.remove(2.0, 4.0).await.unwrap();
+    assert!(
+        buf.buffered().is_empty(),
+        "exact-range removal should clear all buffered data"
+    );
+}
+
+#[tokio::test]
+async fn stub_remove_non_overlapping_preserved() {
+    let mut buf = StubSourceBuffer::new("video/mp4");
+
+    // Two non-overlapping chunks.
+    buf.append_buffer(Chunk::new(Bytes::from_static(b"a"), Some(0.0), Some(2.0), "s1"))
+        .await
+        .unwrap();
+    buf.append_buffer(Chunk::new(Bytes::from_static(b"b"), Some(8.0), Some(10.0), "s2"))
+        .await
+        .unwrap();
+
+    // Remove a range that overlaps neither chunk.
+    buf.remove(3.0, 6.0).await.unwrap();
+
+    let ranges = buf.buffered();
+    assert_eq!(ranges.len(), 2, "both non-overlapping chunks should remain");
+    assert_eq!(ranges[0].start, 0.0);
+    assert_eq!(ranges[1].start, 8.0);
 }

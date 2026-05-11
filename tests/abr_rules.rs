@@ -3,6 +3,7 @@
 use dash_rs::abr::{
     abandon_requests::AbandonRequestsRule,
     buffer::BufferOccupancyRule,
+    decision::AbrDecisionReason,
     dropped_frames::DroppedFramesRule,
     insufficient_buffer::InsufficientBufferRule,
     rule::{AbrRule, RepresentationInfo},
@@ -260,4 +261,132 @@ fn controller_drops_frames_overrides_throughput() {
 
     let decision = controller.select(&reps, &metrics);
     assert_eq!(decision.index, 0);
+}
+
+// ── SwitchHistoryRule — cooldown expiry ───────────────────────────────────────
+
+#[test]
+fn switch_history_abstains_after_cooldown_elapsed() {
+    let mut rule = SwitchHistoryRule::default();
+    // Set a very short cooldown so the test doesn't take seconds.
+    rule.min_switch_interval = std::time::Duration::from_millis(5);
+    let reps = reps();
+    let metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
+
+    rule.record_switch();
+
+    // Let the cooldown expire.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+
+    // After the interval has elapsed the rule should abstain (return None).
+    assert_eq!(rule.max_index(&reps, &metrics), None);
+}
+
+// ── AbrController — record_switch clamps subsequent select ───────────────────
+
+#[test]
+fn controller_record_switch_then_select_respects_history() {
+    let mut controller = AbrController::default();
+    let reps = reps();
+
+    // Record a switch right now — switch history should clamp to current_index.
+    controller.record_switch();
+
+    // With 10 Mbps + 20 s buffer, ThroughputRule alone would return index 2.
+    // But the switch-history cooldown (8 s) should clamp the result to current_index.
+    let mut metrics = AbrMetrics::new(10_000_000.0, 20_000.0);
+    metrics.current_index = Some(1); // currently at "mid"
+
+    let decision = controller.select(&reps, &metrics);
+    // Must not exceed the current quality level during the cooldown window.
+    assert!(
+        decision.index <= 1,
+        "expected index ≤ 1 during switch cooldown, got {}",
+        decision.index
+    );
+}
+
+// ── AbandonRequestsRule — exact-boundary abstains ────────────────────────────
+
+#[test]
+fn abandon_rule_at_threshold_boundary_abstains() {
+    let rule = AbandonRequestsRule::default();
+    let reps = reps();
+
+    // ABANDON_MULTIPLIER = 0.5; the check is `ratio < 0.5` (strict less-than),
+    // so at exactly 0.5 the rule must abstain.
+    let mut metrics = AbrMetrics::new(1_000_000.0, 10_000.0);
+    metrics.effective_download_ratio = Some(0.5);
+
+    assert_eq!(rule.max_index(&reps, &metrics), None);
+}
+
+// ── AbrController — empty representations return AbrDecisionReason::Initial ───
+
+#[test]
+fn abr_controller_empty_representations_returns_initial_reason() {
+    let controller = AbrController::default();
+    let metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
+
+    let decision = controller.select(&[], &metrics);
+    assert_eq!(decision.index, 0);
+    assert!(
+        matches!(decision.reason, AbrDecisionReason::Initial),
+        "expected Initial reason for empty representations, got {:?}",
+        decision.reason
+    );
+}
+
+// ── SwitchHistoryRule — ring buffer capacity cap ───────────────────────────────
+
+#[test]
+fn switch_history_capacity_capped_at_4() {
+    let mut rule = SwitchHistoryRule::default();
+    let reps = reps();
+    let mut metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
+    metrics.current_index = Some(1);
+
+    // Record 6 switches — only the last 4 should be retained (HISTORY_CAPACITY=4).
+    for _ in 0..6 {
+        rule.record_switch();
+    }
+
+    // Should not panic, and the most-recent switch is fresh → clamp active.
+    let result = rule.max_index(&reps, &metrics);
+    assert_eq!(result, Some(1), "should clamp to current_index after recent switch");
+}
+
+// ── InsufficientBufferRule — exact threshold boundary ────────────────────────
+
+#[test]
+fn insufficient_buffer_at_exact_threshold_fires() {
+    let rule = InsufficientBufferRule::default();
+    let reps = reps();
+
+    // The threshold is ≤ 2 000 ms → exactly 2 000 must trigger the rule.
+    let metrics = AbrMetrics::new(10_000_000.0, 2_000.0);
+    assert_eq!(
+        rule.max_index(&reps, &metrics),
+        Some(0),
+        "buffer exactly at threshold should force lowest quality"
+    );
+}
+
+// ── DroppedFramesRule — exact 10% boundary abstains ──────────────────────────
+
+#[test]
+fn dropped_frames_rule_at_exact_threshold_abstains() {
+    let rule = DroppedFramesRule::default();
+    let reps = reps();
+
+    // The threshold is > 10 % (strict greater-than), so exactly 10 % abstains.
+    let mut metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
+    metrics.dropped_frames = Some(100);
+    metrics.total_decoded_frames = Some(1_000); // exactly 10 %
+
+    assert_eq!(
+        rule.max_index(&reps, &metrics),
+        None,
+        "exactly 10% drop rate should abstain (strict > threshold)"
+    );
 }

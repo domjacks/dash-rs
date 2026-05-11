@@ -248,6 +248,13 @@ An `r=-1` block is bounded by the next `S` entry's explicit `t` attribute
 entry and are not matched by the `r=-1` block.  This matches the BBC CMAF pattern
 where the live window is represented as a single `<S t="…" d="…" r="-1"/>`.
 
+**`total_segments` must be `None` for `r=-1` SegmentTimeline tracks.**
+`extract_segment_timing` (`src/session/mpd.rs`) skips `count_timeline_segments`
+whenever any `S` entry has `r < 0`.  Without this guard the count is `1`, and
+`fetch_next_segment_inner`'s segment-count EOS check fires after the very first
+fetch — causing premature `EndOfStream` on live streams.  EOS for infinite-repeat
+timelines is determined only by `availabilityEndTime` or a segment fetch failure.
+
 ### Live-edge `next_segment_time` snap for SegmentTimeline tracks
 
 `snap_to_timeline_grid` (`src/session/timeline.rs`) is used during session

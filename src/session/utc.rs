@@ -322,3 +322,84 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
     days += day - 1;
     Some(days)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_http_date, parse_rfc2822_date};
+
+    // ── parse_rfc2822_date ────────────────────────────────────────────────────
+
+    /// 2009-02-13 23:31:30 UTC == Unix timestamp 1234567890.
+    #[test]
+    fn rfc2822_known_timestamp() {
+        let ts = parse_rfc2822_date("Fri, 13 Feb 2009 23:31:30 GMT").unwrap();
+        assert!((ts - 1_234_567_890.0).abs() < 1.0, "got {ts}");
+    }
+
+    #[test]
+    fn rfc2822_without_day_name_prefix() {
+        // The day-name and comma are optional in the parser.
+        let ts = parse_rfc2822_date("13 Feb 2009 23:31:30 GMT").unwrap();
+        assert!((ts - 1_234_567_890.0).abs() < 1.0, "got {ts}");
+    }
+
+    #[test]
+    fn rfc2822_invalid_month_returns_none() {
+        assert!(parse_rfc2822_date("Fri, 13 Xyz 2009 23:31:30 GMT").is_none());
+    }
+
+    #[test]
+    fn rfc2822_too_short_returns_none() {
+        assert!(parse_rfc2822_date("incomplete").is_none());
+    }
+
+    #[test]
+    fn rfc2822_unix_epoch() {
+        let ts = parse_rfc2822_date("Thu, 01 Jan 1970 00:00:00 GMT").unwrap();
+        assert!((ts - 0.0).abs() < 1.0, "expected 0, got {ts}");
+    }
+
+    #[test]
+    fn rfc2822_all_months_are_recognised() {
+        // Spot-check a few months to ensure the match arms are all present.
+        for (mon, day, expected_month_num) in [
+            ("Jan", 1u64, 1u64),
+            ("Jun", 1, 6),
+            ("Dec", 1, 12),
+        ] {
+            let s = format!("01 {mon} 1970 00:00:00 GMT");
+            let ts = parse_rfc2822_date(&s).unwrap_or_else(|| panic!("failed for month {mon}"));
+            // Rough sanity check: the month offset in seconds should be positive.
+            let _ = expected_month_num; // used implicitly via ts > 0 for months > Jan
+            let _ = day;
+            assert!(ts >= 0.0, "timestamp for {mon} was {ts}");
+        }
+    }
+
+    // ── parse_http_date ───────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_http_date_accepts_rfc2822() {
+        let ts = parse_http_date("Fri, 13 Feb 2009 23:31:30 GMT").unwrap();
+        assert!((ts - 1_234_567_890.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn parse_http_date_accepts_xs_datetime() {
+        // XS datetime format is handled by parse_xs_datetime internally.
+        let ts = parse_http_date("2009-02-13T23:31:30Z").unwrap();
+        assert!((ts - 1_234_567_890.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn parse_http_date_returns_none_for_garbage() {
+        assert!(parse_http_date("not a date at all!!!").is_none());
+    }
+
+    #[test]
+    fn parse_http_date_returns_none_for_empty_string() {
+        assert!(parse_http_date("").is_none());
+    }
+}

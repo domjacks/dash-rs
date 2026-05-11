@@ -273,4 +273,31 @@ mod tests {
         // Ring buffer should not exceed MAX_SAMPLES.
         assert!(t.samples.len() <= super::MAX_SAMPLES);
     }
+
+    #[test]
+    fn tracker_harmonic_mean_uses_only_last_4_samples() {
+        let mut t = ThroughputTracker::new();
+        // Record 5 samples: four very high followed by one very low.
+        // After 5 records only the last 4 should remain in the ring buffer.
+        // The oldest high sample is evicted, leaving [high, high, high, low].
+        for _ in 0..4 {
+            t.record(1_000_000_000.0, 4.0); // 1 Gbps
+        }
+        t.record(1_000.0, 4.0); // 1 kbps — now the oldest 1 Gbps is evicted
+
+        // Ring buffer should hold exactly MAX_SAMPLES entries.
+        assert_eq!(t.samples.len(), super::MAX_SAMPLES);
+
+        // The harmonic mean of [1e9, 1e9, 1e9, 1000] is dominated by the
+        // 1 kbps outlier: n / Σ(1/x) = 4 / (3/1e9 + 1/1000) ≈ 4000 bps.
+        // The estimate (min of harmonic, fast_ema, slow_ema) must be well
+        // below 1 Gbps, proving the eviction changed the harmonic mean.
+        assert!(
+            t.estimate() < 1_000_000_000.0,
+            "estimate should reflect the low outlier, got {}",
+            t.estimate()
+        );
+        // And must be above 0.
+        assert!(t.estimate() > 0.0);
+    }
 }

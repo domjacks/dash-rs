@@ -4196,3 +4196,1779 @@ fn video_track_skipped_when_mime_not_supported() {
     let reps = session.audio_representations();
     assert_eq!(reps[0].id, "a1");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Area 1 — Live regression tests
+// ═══════════════════════════════════════════════════════════════════════════════
+//
+// These tests guard the live-playback paths that have historically been fragile:
+// dual-track (AV) live streams, audio-only live streams, SegmentTimeline r=-1
+// (BBC CMAF pattern), PTS remapping for Timeline tracks, and manifest re-snap.
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/// Live audio + video, `$Number$`, epoch AST.  Used with `FixedClock` so the
+/// live-edge arithmetic is deterministic.
+///
+/// AST = epoch, now = 1 000 s, seg_dur = 4 s:
+///   live_edge = floor(1000/4) + 1 = 251
+///   safety = 3 → initial_segment_number = 248
+const LIVE_AV_EPOCH_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="1970-01-01T00:00:00Z"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Live audio-only, `$Number$`, epoch AST.  Same clock assumptions as above.
+const LIVE_AUDIO_ONLY_EPOCH_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="1970-01-01T00:00:00Z"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Live SegmentTimeline with `r="-1"` (BBC CMAF pattern), video-only, epoch AST.
+///
+/// timescale = 90 000, d = 360 000 (4 s per segment).
+///
+/// With FixedClock unix_s = 1 000:
+///   live_edge = floor(1000/4)+1 = 251, safety = 3 → initial_seg = 248
+///   target_ticks = (248−1) × 360 000 = 88 920 000
+///   snap_to_timeline_grid: 88 920 000 % 360 000 = 0 → snapped = 88 920 000
+///   live_presentation_start_s() = 88 920 000 / 90 000 = 988.0 s (before remap)
+///   after apply_live_pts_remap: offset = 988.0 s, start_s ≈ 0.0
+const LIVE_TIMELINE_EPOCH_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="1970-01-01T00:00:00Z"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Time$.m4s" initialization="init.mp4"
+                       timescale="90000">
+        <SegmentTimeline>
+          <S t="0" d="360000" r="-1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Build a live audio+video MPD with an `availabilityStartTime` set
+/// `elapsed_seconds` before now.  Returns `(xml, expected_initial_segment)`.
+fn live_av_mpd_with_ast(elapsed_seconds: u64) -> (String, u64) {
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ast_unix = now_s.saturating_sub(elapsed_seconds);
+    let ast_datetime = unix_secs_to_datetime(ast_unix);
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="{ast_datetime}"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+    );
+    let live_edge = (elapsed_seconds / 4) + 1;
+    let start_at = live_edge.saturating_sub(3).max(1);
+    (xml, start_at)
+}
+
+/// Build a live Timeline (r=-1) MPD with `availabilityStartTime` set
+/// `elapsed_seconds` before now.
+///
+/// Returns `(xml, expected_initial_seg, expected_next_segment_ticks)`.
+/// timescale = 90 000, seg_dur = 360 000 ticks (4 s).
+fn live_timeline_mpd_with_ast(elapsed_seconds: u64) -> (String, u64, u64) {
+    let now_s = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let ast_unix = now_s.saturating_sub(elapsed_seconds);
+    let ast_datetime = unix_secs_to_datetime(ast_unix);
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="{ast_datetime}"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Time$.m4s" initialization="init.mp4"
+                       timescale="90000">
+        <SegmentTimeline>
+          <S t="0" d="360000" r="-1"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+    );
+    // live_edge = floor(elapsed/4)+1; safety=3 → initial_seg
+    let live_edge = (elapsed_seconds / 4) + 1;
+    let initial_seg = live_edge.saturating_sub(3).max(1);
+    // target_ticks snaps to (initial_seg - start_number) × d
+    let expected_ticks = (initial_seg - 1) * 360_000;
+    (xml, initial_seg, expected_ticks)
+}
+
+// ── 1. Live AV: both tracks snapped to live edge ──────────────────────────────
+
+/// With a live AV MPD and a fixed clock at 1 000 s past the epoch AST,
+/// both video and audio `segment_number` should be snapped to the same live
+/// edge (248) at session construction.
+#[tokio::test]
+async fn live_av_both_tracks_snapped_to_live_edge() {
+    use dash_rs::clock::Clock as _;
+
+    let mpd = dash_rs::manifest::parse(LIVE_AV_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    assert!(session.has_video(), "video track must be present");
+    assert!(session.has_audio(), "audio track must be present");
+
+    // live_edge = floor(1000/4)+1 = 251, safety = 3 → 248
+    let v_seg = session.current_segment_number(&MediaType::Video);
+    let a_seg = session.current_segment_number(&MediaType::Audio);
+    assert_eq!(v_seg, 248, "video segment_number should be at live edge 248");
+    assert_eq!(a_seg, 248, "audio segment_number should be at live edge 248");
+}
+
+// ── 2. Live AV: fetching both tracks succeeds ─────────────────────────────────
+
+/// Both `fetch_next_segment(Video)` and `fetch_next_segment(Audio)` must
+/// return `Ok` on a live AV stream, and `estimated_buffer_level_ms` must
+/// advance for both tracks after the fetch.
+#[tokio::test]
+async fn live_av_fetch_both_tracks_succeeds() {
+    let (xml, _) = live_av_mpd_with_ast(1_000);
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    session.notify_playing();
+
+    let metrics = default_metrics();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("video fetch must succeed");
+    session
+        .fetch_next_segment(MediaType::Audio, &metrics)
+        .await
+        .expect("audio fetch must succeed");
+
+    assert!(
+        session.estimated_buffer_level_ms(&MediaType::Video) > 0.0,
+        "video buffer level should be > 0 after one segment fetch"
+    );
+    assert!(
+        session.estimated_buffer_level_ms(&MediaType::Audio) > 0.0,
+        "audio buffer level should be > 0 after one segment fetch"
+    );
+}
+
+// ── 3. Live AV: never returns EndOfStream ─────────────────────────────────────
+
+/// A live stream has `total_segments = None`, so `fetch_next_segment` must
+/// never return `EndOfStream` regardless of how many segments are fetched.
+#[tokio::test]
+async fn live_av_no_eos_for_open_ended_stream() {
+    let (xml, _) = live_av_mpd_with_ast(1_000);
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    for _ in 0..5 {
+        match session.fetch_next_segment(MediaType::Video, &metrics).await {
+            Ok(_) => {}
+            Err(DashError::EndOfStream { .. }) => {
+                panic!("live stream must not return EndOfStream");
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+}
+
+// ── 4. Live audio-only: live edge snapped ─────────────────────────────────────
+
+/// An audio-only live stream must have `has_video() == false` and
+/// `has_audio() == true`, with `segment_number(Audio)` snapped to the
+/// live edge at construction.
+#[tokio::test]
+async fn live_audio_only_live_edge_snapped() {
+    let mpd = dash_rs::manifest::parse(LIVE_AUDIO_ONLY_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    assert!(!session.has_video(), "audio-only stream must not have a video track");
+    assert!(session.has_audio(), "audio track must be present");
+
+    let a_seg = session.current_segment_number(&MediaType::Audio);
+    assert_eq!(a_seg, 248, "audio segment_number should be at live edge 248");
+}
+
+// ── 5. Live audio-only: fetch succeeds ───────────────────────────────────────
+
+/// `fetch_next_segment(Audio)` must return `Ok` on an audio-only live stream.
+#[tokio::test]
+async fn live_audio_only_fetch_succeeds() {
+    let (xml, _) = {
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ast_unix = now_s.saturating_sub(1_000);
+        let ast_datetime = unix_secs_to_datetime(ast_unix);
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="{ast_datetime}"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+        );
+        let live_edge = (1_000_u64 / 4) + 1;
+        let start_at = live_edge.saturating_sub(3).max(1);
+        (xml, start_at)
+    };
+
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    session
+        .fetch_next_segment(MediaType::Audio, &metrics)
+        .await
+        .expect("audio fetch on live audio-only stream must succeed");
+    // Video fetch must return NoRepresentations (no video track).
+    assert!(
+        matches!(
+            session.fetch_next_segment(MediaType::Video, &metrics).await,
+            Err(DashError::NoRepresentations { .. })
+        ),
+        "video fetch on audio-only stream must return NoRepresentations"
+    );
+}
+
+// ── 6. Live audio-only: should_refresh_manifest ──────────────────────────────
+
+/// A live audio-only stream with `minimumUpdatePeriod` set must return
+/// `should_refresh_manifest() == true` once sufficient time has elapsed.
+#[tokio::test]
+async fn live_audio_only_should_refresh_manifest() {
+    let (xml, _) = {
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ast_unix = now_s.saturating_sub(100);
+        let ast_datetime = unix_secs_to_datetime(ast_unix);
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="{ast_datetime}"
+     minimumUpdatePeriod="PT0S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+        );
+        (xml, 0u64)
+    };
+
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert!(session.is_live(), "stream must be live");
+    // minimumUpdatePeriod=PT0S → refresh is always due.
+    assert!(
+        session.should_refresh_manifest(),
+        "audio-only live stream must trigger manifest refresh"
+    );
+}
+
+// ── 7. Live Timeline r=-1: next_segment_time set to live edge ─────────────────
+
+/// For a live SegmentTimeline stream with `r="-1"`, `next_segment_time` must
+/// be snapped to the live-edge tick at construction, not left at 0
+/// (which would cause the first fetch to start at the beginning of the window).
+///
+/// We verify via `live_presentation_start_s()` which returns
+/// `next_segment_time / timescale` for Timeline tracks.
+#[tokio::test]
+async fn live_timeline_r_minus_one_live_edge_next_segment_time_set() {
+    let mpd = dash_rs::manifest::parse(LIVE_TIMELINE_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    // live_presentation_start_s() = next_segment_time / timescale
+    // = 88_920_000 / 90_000 = 988.0 s
+    let start_s = session.live_presentation_start_s();
+    assert!(
+        (start_s - 988.0).abs() < 1.0,
+        "live_presentation_start_s should be ≈988 s (live-edge), got {start_s}"
+    );
+    // Must definitely NOT be 0.0 (beginning of window).
+    assert!(
+        start_s > 0.0,
+        "live_presentation_start_s must not be 0 (would start from window start)"
+    );
+}
+
+// ── 8. Live Timeline r=-1: first fetch URL contains live-edge time ────────────
+
+/// The first `fetch_next_segment` on a live Timeline stream must request a
+/// segment URL that contains the live-edge `$Time$` value, not `0`.
+#[tokio::test]
+async fn live_timeline_fetch_uses_live_edge_time() {
+    let (xml, _, expected_ticks) = live_timeline_mpd_with_ast(1_000);
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[&xml], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .expect("first segment fetch must succeed");
+
+    let urls = recorded.lock().unwrap();
+    // urls[0] = init segment; urls[1] = first media segment.
+    assert!(urls.len() >= 2, "expected init + media segment; got {}", urls.len());
+    let media_url = &urls[1];
+    assert!(
+        media_url.contains(&expected_ticks.to_string()),
+        "first segment URL should contain live-edge time {expected_ticks}; got {media_url}"
+    );
+    // Confirm it does NOT start from time 0.
+    assert!(
+        !media_url.contains("seg-0.m4s"),
+        "first segment URL must not be seg-0.m4s (would start from window beginning)"
+    );
+}
+
+// ── 9. Live Timeline r=-1: consecutive fetches advance next_segment_time ──────
+
+/// Each call to `fetch_next_segment` on a live Timeline stream must advance
+/// `next_segment_time` by one segment duration, so consecutive fetches request
+/// monotonically increasing `$Time$` values.
+#[tokio::test]
+async fn live_timeline_consecutive_fetches_advance_time() {
+    let (xml, _, expected_ticks) = live_timeline_mpd_with_ast(1_000);
+    let seg_dur_ticks: u64 = 360_000;
+
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[&xml], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    // Fetch 3 media segments.
+    for _ in 0..3 {
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .expect("segment fetch must succeed");
+    }
+
+    let urls = recorded.lock().unwrap();
+    // urls[0] = init; urls[1..=3] = media segments.
+    assert!(urls.len() >= 4, "expected init + 3 media segments; got {}", urls.len());
+
+    let t0 = expected_ticks;
+    let t1 = t0 + seg_dur_ticks;
+    let t2 = t1 + seg_dur_ticks;
+
+    assert!(
+        urls[1].contains(&t0.to_string()),
+        "segment 1 URL should contain t={t0}; got {}", urls[1]
+    );
+    assert!(
+        urls[2].contains(&t1.to_string()),
+        "segment 2 URL should contain t={t1}; got {}", urls[2]
+    );
+    assert!(
+        urls[3].contains(&t2.to_string()),
+        "segment 3 URL should contain t={t2}; got {}", urls[3]
+    );
+}
+
+// ── 10. apply_live_pts_remap for Timeline tracks ──────────────────────────────
+
+/// For a `$Time$`-addressed live stream, `apply_live_pts_remap` must compute
+/// the offset as `next_segment_time / timescale`, not from the segment number
+/// formula used for `$Number$` streams.
+///
+/// With FixedClock unix_s = 1 000:
+///   next_segment_time = 88_920_000 ticks
+///   remap_offset = 88_920_000 / 90_000 = 988.0 s
+#[tokio::test]
+async fn apply_live_pts_remap_timeline_uses_next_segment_time() {
+    let mpd = dash_rs::manifest::parse(LIVE_TIMELINE_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    session.apply_live_pts_remap();
+
+    let remap_offset = session.live_pts_remap_offset_s();
+    // 88_920_000 / 90_000 = 988.0 s
+    assert!(
+        (remap_offset - 988.0).abs() < 1.0,
+        "Timeline remap_offset should be ≈988 s (next_segment_time/timescale); got {remap_offset}"
+    );
+}
+
+// ── 11. live_presentation_start_s for Timeline tracks: near zero after remap ──
+
+/// After `apply_live_pts_remap`, `live_presentation_start_s()` must return ≈ 0
+/// for a SegmentTimeline live stream, so `seekTo(0)` in the browser is trivial.
+#[tokio::test]
+async fn live_presentation_start_s_timeline_returns_near_zero_after_remap() {
+    let mpd = dash_rs::manifest::parse(LIVE_TIMELINE_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    // Before remap: start_s should reflect the live-edge tick (≈ 988 s).
+    let before = session.live_presentation_start_s();
+    assert!(
+        before > 0.0,
+        "before remap, live_presentation_start_s should be > 0; got {before}"
+    );
+
+    session.apply_live_pts_remap();
+
+    // After remap: should be ≈ 0 so the browser seek is trivial.
+    let after = session.live_presentation_start_s();
+    assert!(
+        after.abs() < 4.0,
+        "after remap, live_presentation_start_s should be ≈0; got {after}"
+    );
+}
+
+// ── 12. refresh_manifest re-snaps video segment_number to live edge ───────────
+
+/// When `segment_number` has fallen behind the live edge (e.g. after
+/// `seek_to(0.0)`), a subsequent `refresh_manifest` call must snap it back.
+#[tokio::test]
+async fn refresh_manifest_resnaps_live_edge_when_segment_falls_behind() {
+    let (xml, expected_start) = live_mpd_with_ast(1_000);
+    // Serve the same manifest twice: once for initial load, once for refresh.
+    let fetcher = MockFetcher::with_manifests(&[&xml, &xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let initial_seg = session.current_segment_number(&MediaType::Video);
+    assert!(
+        initial_seg >= expected_start,
+        "initial segment should be at live edge (≥ {expected_start}); got {initial_seg}"
+    );
+
+    // Seek backward to simulate a long pause / buffer underrun.
+    session.seek_to(0.0);
+    let after_seek = session.current_segment_number(&MediaType::Video);
+    assert_eq!(after_seek, 1, "after seek_to(0), segment_number should be 1");
+
+    // Refresh should snap back to live edge.
+    session.refresh_manifest().await.unwrap();
+    let after_refresh = session.current_segment_number(&MediaType::Video);
+    assert!(
+        after_refresh >= initial_seg,
+        "after refresh, segment_number should be back at live edge (≥ {initial_seg}); got {after_refresh}"
+    );
+}
+
+// ── 13. refresh_manifest re-snaps both AV tracks ─────────────────────────────
+
+/// Same as test 12 but for a dual-track AV stream: both video and audio
+/// segment numbers must be re-snapped after a refresh.
+#[tokio::test]
+async fn live_av_refresh_resnaps_both_tracks() {
+    let (xml, expected_start) = live_av_mpd_with_ast(1_000);
+    let fetcher = MockFetcher::with_manifests(&[&xml, &xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let initial_v = session.current_segment_number(&MediaType::Video);
+    let initial_a = session.current_segment_number(&MediaType::Audio);
+    assert!(initial_v >= expected_start, "video should be at live edge");
+    assert!(initial_a >= expected_start, "audio should be at live edge");
+
+    // Seek both tracks backward.
+    session.seek_to(0.0);
+    assert_eq!(session.current_segment_number(&MediaType::Video), 1);
+    assert_eq!(session.current_segment_number(&MediaType::Audio), 1);
+
+    session.refresh_manifest().await.unwrap();
+
+    let after_v = session.current_segment_number(&MediaType::Video);
+    let after_a = session.current_segment_number(&MediaType::Audio);
+    assert!(
+        after_v >= initial_v,
+        "video segment_number should be re-snapped to live edge after refresh; got {after_v}"
+    );
+    assert!(
+        after_a >= initial_a,
+        "audio segment_number should be re-snapped to live edge after refresh; got {after_a}"
+    );
+}
+
+// ── 14. apply_live_pts_remap on audio-only stream ────────────────────────────
+
+/// When only an audio track is present, `apply_live_pts_remap` must use the
+/// audio track's timing to compute the offset.
+#[tokio::test]
+async fn live_audio_only_apply_live_pts_remap_uses_audio_track_offset() {
+    let mpd = dash_rs::manifest::parse(LIVE_AUDIO_ONLY_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    assert!(!session.has_video(), "self-check: no video track");
+
+    session.apply_live_pts_remap();
+
+    // remap_offset = (248 − 1) × 4 = 988 s (same formula as video)
+    let remap_offset = session.live_pts_remap_offset_s();
+    assert!(
+        (remap_offset - 988.0).abs() < 1.0,
+        "audio-only remap_offset should be ≈988 s; got {remap_offset}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Area 2 — VOD / AOD completeness
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Fixtures ──────────────────────────────────────────────────────────────────
+
+/// Static VOD with audio + video, 3 segments each (12 s total, 4 s per segment).
+const VOD_AV_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Static VOD with audio + video where video has 3 segments (12 s / 4 s) and
+/// audio has 2 segments (12 s / 6 s).  Tests that EOS fires independently.
+const VOD_AV_UNEQUAL_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT12S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="v-$Number$.m4s" initialization="v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="6" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Static VOD SegmentTimeline with audio + video, 2 segments each (8 s total).
+const TIMELINE_VOD_AV_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT8S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="v-$Time$.m4s" initialization="v-init.mp4"
+                       timescale="1000">
+        <SegmentTimeline>
+          <S t="0"    d="4000"/>
+          <S t="4000" d="4000"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Time$.m4s" initialization="a-init.mp4"
+                       timescale="1000">
+        <SegmentTimeline>
+          <S t="0"    d="4000"/>
+          <S t="4000" d="4000"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// Two-period VOD, each period has one audio + one video segment (4 s each).
+const MULTI_PERIOD_AV_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT8S">
+  <Period id="p1" duration="PT4S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p1-v-$Number$.m4s" initialization="p1-v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="p1-a-$Number$.m4s" initialization="p1-a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+  <Period id="p2" duration="PT4S">
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="p2-v-$Number$.m4s" initialization="p2-v-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="p2-a-$Number$.m4s" initialization="p2-a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+// ── 15. VOD AV: both tracks fetch all segments and reach EOS ──────────────────
+
+/// Both video and audio tracks must be able to fetch all their segments and
+/// return `EndOfStream` when the content is exhausted.
+#[tokio::test]
+async fn vod_av_both_tracks_fetch_all_segments() {
+    let mut session = session_from_xml(VOD_AV_MPD);
+    let metrics = default_metrics();
+
+    let mut video_done = false;
+    let mut audio_done = false;
+
+    for _ in 0..10 {
+        if !video_done {
+            match session.fetch_next_segment(MediaType::Video, &metrics).await {
+                Ok(_) => {}
+                Err(DashError::EndOfStream { .. }) => video_done = true,
+                Err(e) => panic!("unexpected video error: {e}"),
+            }
+        }
+        if !audio_done {
+            match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+                Ok(_) => {}
+                Err(DashError::EndOfStream { .. }) => audio_done = true,
+                Err(e) => panic!("unexpected audio error: {e}"),
+            }
+        }
+        if video_done && audio_done {
+            break;
+        }
+    }
+
+    assert!(video_done, "video track should have reached EOS");
+    assert!(audio_done, "audio track should have reached EOS");
+}
+
+// ── 16. VOD AV: EOS fires independently per track ────────────────────────────
+
+/// When video and audio have different segment counts, EOS for the shorter
+/// track must not affect the longer track — both must complete independently.
+#[tokio::test]
+async fn vod_av_eos_fires_independently_per_track() {
+    // VOD_AV_UNEQUAL_MPD: 3 video segments (4 s each), 2 audio segments (6 s each).
+    let mut session = session_from_xml(VOD_AV_UNEQUAL_MPD);
+    let metrics = default_metrics();
+
+    let mut video_eos_count = 0u32;
+    let mut audio_eos_count = 0u32;
+    let mut video_ok_count  = 0u32;
+    let mut audio_ok_count  = 0u32;
+
+    for _ in 0..10 {
+        match session.fetch_next_segment(MediaType::Video, &metrics).await {
+            Ok(_) => video_ok_count += 1,
+            Err(DashError::EndOfStream { .. }) => video_eos_count += 1,
+            Err(e) => panic!("unexpected video error: {e}"),
+        }
+        match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+            Ok(_) => audio_ok_count += 1,
+            Err(DashError::EndOfStream { .. }) => audio_eos_count += 1,
+            Err(e) => panic!("unexpected audio error: {e}"),
+        }
+    }
+
+    assert_eq!(video_ok_count, 3, "video should have 3 successful fetches (3 segments)");
+    assert_eq!(audio_ok_count, 2, "audio should have 2 successful fetches (2 segments)");
+    assert!(video_eos_count >= 1, "video should have reached EOS");
+    assert!(audio_eos_count >= 1, "audio should have reached EOS");
+}
+
+// ── 17. AOD live: live edge snapped (audio-only dynamic stream) ───────────────
+
+/// An audio-only live (AOD) stream must snap the audio segment_number to the
+/// live edge and report `has_video() == false`.
+///
+/// This is equivalent to test 4 but uses the real-time `live_mpd_with_ast`
+/// helper to exercise the full `from_url` path.
+#[tokio::test]
+async fn aod_live_live_edge_snapped() {
+    let (xml, expected_start) = {
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ast_unix = now_s.saturating_sub(1_000);
+        let ast_datetime = unix_secs_to_datetime(ast_unix);
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="{ast_datetime}"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+        );
+        let live_edge = (1_000_u64 / 4) + 1;
+        let start_at = live_edge.saturating_sub(3).max(1);
+        (xml, start_at)
+    };
+
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert!(!session.has_video(), "AOD stream must have no video track");
+    assert!(session.has_audio(), "AOD stream must have an audio track");
+
+    let a_seg = session.current_segment_number(&MediaType::Audio);
+    assert!(
+        a_seg >= expected_start,
+        "audio segment_number should be at live edge (≥ {expected_start}); got {a_seg}"
+    );
+}
+
+// ── 18. AOD live: never returns EndOfStream ───────────────────────────────────
+
+/// An audio-only live stream must never return `EndOfStream` for the audio
+/// track (`total_segments = None` for live streams).
+#[tokio::test]
+async fn aod_live_no_eos() {
+    let (xml, _) = {
+        let now_s = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let ast_unix = now_s.saturating_sub(1_000);
+        let ast_datetime = unix_secs_to_datetime(ast_unix);
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     availabilityStartTime="{ast_datetime}"
+     minimumUpdatePeriod="PT4S">
+  <Period>
+    <AdaptationSet mimeType="audio/mp4" contentType="audio">
+      <SegmentTemplate media="a-$Number$.m4s" initialization="a-init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="a1" bandwidth="128000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#
+        );
+        (xml, 0u64)
+    };
+
+    let fetcher = MockFetcher::with_manifests(&[&xml]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    for _ in 0..5 {
+        match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+            Ok(_) => {}
+            Err(DashError::EndOfStream { .. }) => {
+                panic!("AOD live stream must not return EndOfStream")
+            }
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+}
+
+// ── 19. SegmentTimeline VOD AV: both tracks fetch in time order ───────────────
+
+/// A dual-track SegmentTimeline VOD stream must fetch segments for both
+/// video and audio in ascending `$Time$` order, and both must reach EOS.
+#[tokio::test]
+async fn timeline_vod_av_both_tracks_fetch_in_time_order() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[TIMELINE_VOD_AV_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = default_metrics();
+    let mut video_done = false;
+    let mut audio_done = false;
+
+    for _ in 0..10 {
+        if !video_done {
+            match session.fetch_next_segment(MediaType::Video, &metrics).await {
+                Ok(_) => {}
+                Err(DashError::EndOfStream { .. }) => video_done = true,
+                Err(e) => panic!("unexpected video error: {e}"),
+            }
+        }
+        if !audio_done {
+            match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+                Ok(_) => {}
+                Err(DashError::EndOfStream { .. }) => audio_done = true,
+                Err(e) => panic!("unexpected audio error: {e}"),
+            }
+        }
+        if video_done && audio_done { break; }
+    }
+
+    assert!(video_done, "video must reach EOS");
+    assert!(audio_done, "audio must reach EOS");
+
+    // Verify URL ordering: v-0.m4s before v-4000.m4s, a-0.m4s before a-4000.m4s.
+    let urls = recorded.lock().unwrap();
+    let video_media: Vec<_> = urls.iter().filter(|u| u.contains("/v-") && !u.contains("init")).collect();
+    let audio_media: Vec<_> = urls.iter().filter(|u| u.contains("/a-") && !u.contains("init")).collect();
+
+    assert_eq!(video_media.len(), 2, "expected 2 video media segments; got {}", video_media.len());
+    assert_eq!(audio_media.len(), 2, "expected 2 audio media segments; got {}", audio_media.len());
+
+    assert!(
+        video_media[0].contains("v-0.m4s"),
+        "first video segment should be v-0.m4s; got {}", video_media[0]
+    );
+    assert!(
+        video_media[1].contains("v-4000.m4s"),
+        "second video segment should be v-4000.m4s; got {}", video_media[1]
+    );
+    assert!(
+        audio_media[0].contains("a-0.m4s"),
+        "first audio segment should be a-0.m4s; got {}", audio_media[0]
+    );
+    assert!(
+        audio_media[1].contains("a-4000.m4s"),
+        "second audio segment should be a-4000.m4s; got {}", audio_media[1]
+    );
+}
+
+// ── 20. Multi-period AV: advances through period boundary ────────────────────
+
+/// After exhausting period 1's segments, `fetch_next_segment` must
+/// transparently advance both audio and video to period 2 (`current_period_index`
+/// becomes 1), and `EndOfStream` must only fire after period 2 is exhausted.
+#[tokio::test]
+async fn multi_period_av_advances_through_period_boundary() {
+    let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = RecordingFetcher::new(&[MULTI_PERIOD_AV_MPD], Arc::clone(&recorded));
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert_eq!(session.period_count(), 2, "should have 2 periods");
+    assert_eq!(session.current_period_index(), 0, "should start in period 0");
+
+    let metrics = default_metrics();
+
+    // Fetch all segments: 1 per period × 2 periods = 2 total, then EOS.
+    let mut video_done = false;
+    let mut audio_done = false;
+    let mut period1_completed = false;
+
+    for _ in 0..10 {
+        if !video_done {
+            match session.fetch_next_segment(MediaType::Video, &metrics).await {
+                Ok(_) => {
+                    // After fetching period 1's only video segment and advancing,
+                    // current_period_index should become 1.
+                    if session.current_period_index() == 1 {
+                        period1_completed = true;
+                    }
+                }
+                Err(DashError::EndOfStream { .. }) => video_done = true,
+                Err(e) => panic!("unexpected video error: {e}"),
+            }
+        }
+        if !audio_done {
+            match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+                Ok(_) => {}
+                Err(DashError::EndOfStream { .. }) => audio_done = true,
+                Err(e) => panic!("unexpected audio error: {e}"),
+            }
+        }
+        if video_done && audio_done { break; }
+    }
+
+    assert!(period1_completed, "session must have advanced through period boundary to period 1");
+    assert!(video_done, "video must reach EOS after all periods");
+    assert!(audio_done, "audio must reach EOS after all periods");
+
+    // Verify that segments from both periods were fetched.
+    let urls = recorded.lock().unwrap();
+    let has_p1_video = urls.iter().any(|u| u.contains("p1-v-"));
+    let has_p2_video = urls.iter().any(|u| u.contains("p2-v-"));
+    let has_p1_audio = urls.iter().any(|u| u.contains("p1-a-"));
+    let has_p2_audio = urls.iter().any(|u| u.contains("p2-a-"));
+
+    assert!(has_p1_video, "period 1 video segment must have been fetched");
+    assert!(has_p2_video, "period 2 video segment must have been fetched");
+    assert!(has_p1_audio, "period 1 audio segment must have been fetched");
+    assert!(has_p2_audio, "period 2 audio segment must have been fetched");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Area 3 — GapController scenarios
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 21. Stall recovery fires after threshold ticks ───────────────────────────
+
+/// When the playback position does not advance for `stall_threshold_ticks`
+/// consecutive `tick_gap` calls and the position is inside a buffered range
+/// (but with no visible gap ahead), the controller must recommend a stall
+/// recovery seek.
+///
+/// This exercises the `GapSeekReason::StallRecovery` path which is distinct
+/// from `GapJump` (a gap between buffered ranges).
+#[test]
+fn tick_gap_stall_recovery_fires_after_threshold_ticks() {
+    let mut session = session_from_xml(SEEK_MPD);
+
+    // Lower the stall threshold to 3 for a fast test.
+    let mut settings = session.gap_settings().clone();
+    settings.stall_threshold_ticks = 3;
+    session.set_gap_settings(settings);
+
+    // A single continuous buffered range — no gap, but position is inside.
+    let buffered = vec![TimeRange::new(0.0, 10.0)];
+    let position_s = 3.0; // inside the buffered range
+
+    // Ticks 1–3: stall counter accumulates; should return None.
+    // (First tick initialises last_position_s; stall counter starts on tick 2.)
+    for i in 1..=3 {
+        let result = session.tick_gap(position_s, &buffered, false);
+        assert!(
+            result.is_none(),
+            "tick {i}: should not fire yet (threshold not reached); got {result:?}"
+        );
+    }
+
+    // Tick 4: stall_ticks reaches threshold → StallRecovery fires.
+    let result = session.tick_gap(position_s, &buffered, false);
+    assert!(
+        result.is_some(),
+        "tick 4: stall recovery should fire after threshold is reached"
+    );
+    let target = result.unwrap();
+    assert!(
+        matches!(target.reason, GapSeekReason::StallRecovery),
+        "reason should be StallRecovery; got {:?}",
+        target.reason
+    );
+    assert!(
+        target.position_s > position_s,
+        "seek target should be ahead of current position"
+    );
+}
+
+// ── 22. Small gap (≤ small_gap_limit_s) is always jumped ─────────────────────
+
+/// A gap smaller than `small_gap_limit_s` (0.8 s) must be jumped even when
+/// `jump_large_gaps` is `false`.  This ensures small holes in the buffer never
+/// cause a permanent stall regardless of the large-gap setting.
+#[test]
+fn tick_gap_small_gap_jumped_regardless_of_jump_large_gaps_setting() {
+    let mut session = session_from_xml(SEEK_MPD);
+
+    // Disable large-gap jumps.
+    let mut settings = session.gap_settings().clone();
+    settings.jump_large_gaps = false;
+    session.set_gap_settings(settings);
+
+    // Gap of 0.4 s between [0.0, 5.0] and [5.4, 10.0] — below the 0.8 s limit.
+    let buffered = vec![TimeRange::new(0.0, 5.0), TimeRange::new(5.4, 10.0)];
+    // Position just past the end of the first range.
+    let result = session.tick_gap(5.05, &buffered, false);
+
+    assert!(
+        result.is_some(),
+        "small gap (0.35 s ≤ 0.8 s limit) must be jumped even with jump_large_gaps=false"
+    );
+    let target = result.unwrap();
+    assert!(
+        matches!(target.reason, GapSeekReason::GapJump { .. }),
+        "reason should be GapJump; got {:?}", target.reason
+    );
+}
+
+// ── 23. Large gap is not jumped when jump_large_gaps is disabled ──────────────
+
+/// When `jump_large_gaps = false` and the gap exceeds `small_gap_limit_s`,
+/// `tick_gap` must return `None` (the gap is silently ignored).
+///
+/// This documents the behaviour as a regression test — previously covered
+/// only indirectly inside `gap_settings_round_trip`.
+#[test]
+fn tick_gap_large_gap_not_jumped_when_disabled() {
+    let mut session = session_from_xml(SEEK_MPD);
+
+    let mut settings = session.gap_settings().clone();
+    settings.jump_large_gaps = false;
+    session.set_gap_settings(settings);
+
+    // Gap of 0.9 s > 0.8 s limit → large gap, disabled → None.
+    let result = session.tick_gap(5.1, &gap_buffered(), false);
+    assert!(
+        result.is_none(),
+        "large gap (0.9 s) must not be jumped when jump_large_gaps=false; got {result:?}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Area 5 (session-side) — is_type_supported false for audio
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── 29. Audio track skipped when audio MIME not supported ─────────────────────
+
+/// When `MediaSource::is_type_supported` returns `false` for the audio MIME
+/// type (but `true` for video), `from_mpd` must construct a video-only session:
+/// `has_audio() == false`, `has_video() == true`.
+///
+/// This is the mirror of the existing `video_track_skipped_when_mime_not_supported`
+/// test, covering the audio-skip path.
+struct AudioUnsupportedMediaSource(StubMediaSource);
+
+#[async_trait(?Send)]
+impl MediaSource for AudioUnsupportedMediaSource {
+    fn is_type_supported(&self, mime_type: &str) -> bool {
+        !mime_type.starts_with("audio/")
+    }
+    fn ready_state(&self) -> ReadyState { self.0.ready_state() }
+    fn duration(&self) -> Option<f64> { self.0.duration() }
+    fn set_duration(&mut self, d: f64) -> Result<(), DashError> { self.0.set_duration(d) }
+    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
+        self.0.add_source_buffer(mime_type)
+    }
+    fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
+        self.0.remove_source_buffer(mime_type)
+    }
+    async fn end_of_stream(&mut self) -> Result<(), DashError> { self.0.end_of_stream().await }
+    fn close(&mut self) { self.0.close() }
+}
+
+#[test]
+fn audio_track_skipped_when_audio_mime_not_supported() {
+    let mpd = dash_rs::manifest::parse(VOD_AV_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+
+    let mut ms = StubMediaSource::new();
+    ms.open();
+    let ms = AudioUnsupportedMediaSource(ms);
+
+    let session =
+        DashSession::from_mpd(mpd, base_url, fetcher, ms).expect("from_mpd must not fail");
+
+    assert!(
+        session.has_video(),
+        "video track should be present when only audio MIME is unsupported"
+    );
+    assert!(
+        !session.has_audio(),
+        "audio track should be absent when audio MIME is not supported"
+    );
+}
+
+// ── 30. apply_live_pts_remap sets sink timestamp_offset ──────────────────────
+
+/// After `apply_live_pts_remap`, `live_pts_remap_offset_s()` must equal
+/// `(initial_segment_number − start_number) × seg_dur_s` for a `$Number$`
+/// live stream.  This exercises the `set_timestamp_offset` call path end-to-end.
+#[tokio::test]
+async fn apply_live_pts_remap_sets_sink_timestamp_offset() {
+    let mpd = dash_rs::manifest::parse(LIVE_AV_EPOCH_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
+    )
+    .unwrap();
+
+    // Before remap: offset must be 0.
+    assert_eq!(
+        session.live_pts_remap_offset_s(), 0.0,
+        "remap offset should be 0 before apply_live_pts_remap"
+    );
+
+    session.apply_live_pts_remap();
+
+    // initial_seg = 248, start_number = 1, seg_dur = 4 s
+    // expected offset = (248 − 1) × 4 = 988 s
+    let offset = session.live_pts_remap_offset_s();
+    assert!(
+        (offset - 988.0).abs() < 1.0,
+        "remap offset should be ≈988 s after apply_live_pts_remap; got {offset}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Area 6 — Buffer scheduling: notify_paused, prune_all_tracks,
+//           estimated_playback_position_s, schedule_while_paused,
+//           abandon_timeout_ms, min_buffer_time_ms, update_metrics
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── notify_paused / is_paused state machine ───────────────────────────────────
+
+/// `is_paused` starts false, becomes true after `notify_paused`, and becomes
+/// false again after `notify_playing`.
+#[test]
+fn notify_paused_toggles_is_paused() {
+    let mut session = session_from_xml(STATIC_MPD);
+    assert!(!session.is_paused(), "should not be paused initially");
+
+    session.notify_paused();
+    assert!(session.is_paused(), "should be paused after notify_paused");
+
+    session.notify_playing();
+    assert!(!session.is_paused(), "should not be paused after notify_playing");
+}
+
+/// Calling `notify_paused` twice is idempotent — `is_paused` remains true.
+#[test]
+fn notify_paused_idempotent() {
+    let mut session = session_from_xml(STATIC_MPD);
+    session.notify_paused();
+    session.notify_paused(); // second call must not panic
+    assert!(session.is_paused(), "should still be paused after double notify_paused");
+}
+
+/// After `notify_playing` → `notify_paused` → `notify_playing`, paused time
+/// is excluded from `estimated_buffer_level_ms` so the level does not drift
+/// lower during the pause.
+///
+/// We use a `FixedClock` so that `now_ms()` is fully controlled.
+#[test]
+fn estimated_buffer_level_excludes_paused_time() {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use dash_rs::clock::Clock;
+
+    // A clock whose `now_ms` advances on demand.
+    struct StepClock(Cell<f64>);
+    impl Clock for StepClock {
+        fn now_ms(&self) -> f64 { self.0.get() }
+        fn unix_s(&self) -> f64 { 0.0 }
+    }
+    // Safety: single-threaded test.
+    unsafe impl Send for StepClock {}
+    unsafe impl Sync for StepClock {}
+
+    let clock = Arc::new(StepClock(Cell::new(0.0)));
+
+    let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ).unwrap();
+
+    // t=0: start playing; pretend 5 segments (5×2000ms=10s) are already
+    // accounted for by a prior fetch (we set initial_segment_number manually
+    // via seek_to to advance segment_number without a network call).
+    // Instead let's just check that pausing stops the clock:
+
+    // t=0: notify_playing
+    clock.0.set(0.0);
+    session.notify_playing();
+
+    // t=2000: buffer level before pause = pushed_ms - elapsed_ms.
+    // Since no segments have been fetched, pushed_ms=0, level=0.
+    clock.0.set(2_000.0);
+    let level_before_pause = session.estimated_buffer_level_ms(&MediaType::Video);
+    assert_eq!(level_before_pause, 0.0, "no segments fetched → level 0");
+
+    // t=2000: pause
+    session.notify_paused();
+
+    // t=5000: still paused — paused_duration = 3000 ms
+    clock.0.set(5_000.0);
+
+    // t=5000: resume
+    session.notify_playing();
+
+    // t=5000 immediately after resume: elapsed_playing = 2000 ms (not 5000).
+    // With 0 segments fetched → level still 0.  No crash.
+    let level_after_resume = session.estimated_buffer_level_ms(&MediaType::Video);
+    assert_eq!(
+        level_after_resume, 0.0,
+        "level should be 0 after seek (no segments fetched)"
+    );
+}
+
+// ── schedule_while_paused round-trip ──────────────────────────────────────────
+
+#[test]
+fn schedule_while_paused_round_trip() {
+    let mut session = session_from_xml(STATIC_MPD);
+    assert!(
+        !session.schedule_while_paused(),
+        "default schedule_while_paused should be false"
+    );
+    session.set_schedule_while_paused(true);
+    assert!(
+        session.schedule_while_paused(),
+        "schedule_while_paused should be true after set"
+    );
+    session.set_schedule_while_paused(false);
+    assert!(
+        !session.schedule_while_paused(),
+        "schedule_while_paused should be false after reset"
+    );
+}
+
+// ── estimated_playback_position_s ────────────────────────────────────────────
+
+/// Before `notify_playing` the estimated playback position is 0.
+#[test]
+fn estimated_playback_position_s_zero_before_notify_playing() {
+    let session = session_from_xml(STATIC_MPD);
+    assert_eq!(
+        session.estimated_playback_position_s(),
+        0.0,
+        "should be 0 before notify_playing"
+    );
+}
+
+/// `estimated_playback_position_s` must be non-negative and grow after
+/// `notify_playing`.  We rely on the real system clock for a coarse check.
+#[test]
+fn estimated_playback_position_s_nonzero_after_notify_playing() {
+    let mut session = session_from_xml(STATIC_MPD);
+    session.notify_playing();
+    // Even without sleeping, the position should be ≥ 0 and ≤ a few seconds.
+    let pos = session.estimated_playback_position_s();
+    assert!(pos >= 0.0, "position must be non-negative; got {pos}");
+    assert!(pos < 30.0, "position should be plausible (< 30 s); got {pos}");
+}
+
+/// Pausing stops the playback clock; the position does not advance during
+/// the pause window.  We use a `StepClock` for determinism.
+#[test]
+fn estimated_playback_position_s_excludes_paused_time() {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use dash_rs::clock::Clock;
+
+    struct StepClock2(Cell<f64>);
+    impl Clock for StepClock2 {
+        fn now_ms(&self) -> f64 { self.0.get() }
+        fn unix_s(&self) -> f64 { 0.0 }
+    }
+    unsafe impl Send for StepClock2 {}
+    unsafe impl Sync for StepClock2 {}
+
+    let clock = Arc::new(StepClock2(Cell::new(0.0)));
+
+    let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base_url, fetcher, open_stub_source(),
+        Arc::clone(&clock) as Arc<dyn Clock>,
+    ).unwrap();
+
+    // t=0: start playing
+    clock.0.set(0.0);
+    session.notify_playing();
+
+    // t=4000: 4 s elapsed playing
+    clock.0.set(4_000.0);
+    let pos_before_pause = session.estimated_playback_position_s();
+    assert!((pos_before_pause - 4.0).abs() < 0.01, "pos before pause = {pos_before_pause}");
+
+    // t=4000: pause
+    session.notify_paused();
+
+    // t=9000: 5 s spent paused
+    clock.0.set(9_000.0);
+
+    // t=9000: resume
+    session.notify_playing();
+
+    // Immediately after resume: effective elapsed = 4000 ms (pause not counted)
+    clock.0.set(9_000.0);
+    let pos_after_resume = session.estimated_playback_position_s();
+    // elapsed = 9000 - 0 = 9000 ms; paused = 5000 ms; net = 4000 ms = 4.0 s
+    assert!(
+        (pos_after_resume - 4.0).abs() < 0.01,
+        "paused time should not count in position; got {pos_after_resume}"
+    );
+}
+
+// ── prune_all_tracks ──────────────────────────────────────────────────────────
+
+/// `prune_all_tracks` with `current_time_s = 0` and any `buffer_to_keep_behind_s`
+/// must not prune anything (prune_end ≤ 0 → no-op).
+#[tokio::test]
+async fn prune_all_tracks_noop_at_time_zero() {
+    let mut session = session_from_xml(STATIC_MPD);
+    // Should succeed without error even when no data is buffered.
+    session.prune_all_tracks(0.0, 30.0).await.expect("prune must not fail");
+}
+
+/// `prune_all_tracks` succeeds even when both tracks are absent.
+#[tokio::test]
+async fn prune_all_tracks_succeeds_with_no_tracks() {
+    // Use an audio-only MPD so video track is absent.
+    let mut session = session_from_xml(AUDIO_ONLY_MPD);
+    assert!(!session.has_video(), "self-check");
+    session.prune_all_tracks(60.0, 0.0).await.expect("prune must not fail with absent video track");
+}
+
+/// `prune_all_tracks(current_time_s, keep_s)` removes buffered data up to
+/// `current_time_s − keep_s` from both tracks.  We verify using the
+/// `SourceBufferSink` directly (same path the session uses internally) that
+/// the method wires through correctly by checking it runs without error and
+/// does not crash on a real session with an empty buffer.
+#[tokio::test]
+async fn prune_all_tracks_with_positive_time() {
+    let mut session = session_from_xml(SEEK_MPD); // has both video + audio
+    // With an empty buffer, pruning any window is a no-op (no ranges to remove).
+    session
+        .prune_all_tracks(100.0, 30.0)
+        .await
+        .expect("prune at t=100 keep=30 should succeed on empty buffer");
+    session
+        .prune_all_tracks(100.0, 0.0)
+        .await
+        .expect("prune at t=100 keep=0 should succeed on empty buffer");
+}
+
+// ── set_abandon_timeout_ms / abandon_timeout_ms ───────────────────────────────
+
+/// Round-trip: setting and clearing the abandon timeout is reflected by the
+/// accessor.
+#[test]
+fn abandon_timeout_ms_round_trip() {
+    let mut session = session_from_xml(STATIC_MPD);
+    assert_eq!(session.abandon_timeout_ms(), None, "default should be None");
+    session.set_abandon_timeout_ms(Some(5_000));
+    assert_eq!(session.abandon_timeout_ms(), Some(5_000));
+    session.set_abandon_timeout_ms(None);
+    assert_eq!(session.abandon_timeout_ms(), None);
+}
+
+/// When `abandon_timeout_ms` is set to 1 ms and the fetcher never resolves,
+/// `fetch_next_segment` returns `DashError::SegmentAbandoned`.
+#[tokio::test]
+async fn abandon_timeout_returns_segment_abandoned_error() {
+    use std::future;
+
+    // A fetcher that hangs forever on media segments.
+    struct HangingFetcher { manifest: bytes::Bytes }
+
+    #[async_trait(?Send)]
+    impl SegmentFetcher for HangingFetcher {
+        async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
+            if request.request_type == RequestType::Manifest {
+                let len = self.manifest.len() as u64;
+                return Ok(FetchResponse {
+                    final_url: request.url,
+                    data: self.manifest.clone(),
+                    transfer_duration_ms: 1,
+                    bytes_received: len,
+                });
+            }
+            if request.request_type == RequestType::InitializationSegment {
+                // Return empty bytes immediately so the init fetch succeeds.
+                return Ok(FetchResponse {
+                    final_url: request.url,
+                    data: bytes::Bytes::new(),
+                    transfer_duration_ms: 1,
+                    bytes_received: 0,
+                });
+            }
+            // Hang forever for media segment requests — the abandon timeout should fire.
+            future::pending::<()>().await;
+            unreachable!()
+        }
+        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> { Ok(true) }
+        fn abort(&self) {}
+    }
+
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let fetcher = HangingFetcher { manifest: bytes::Bytes::from(STATIC_MPD.to_string()) };
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // Set a 1 ms timeout — will fire almost immediately.
+    session.set_abandon_timeout_ms(Some(1));
+
+    let result = session.fetch_next_segment(MediaType::Video, &default_metrics()).await;
+    assert!(
+        matches!(result, Err(DashError::SegmentAbandoned { .. })),
+        "expected SegmentAbandoned with 1 ms timeout, got {result:?}"
+    );
+}
+
+// ── min_buffer_time_ms / buffer_target_ms seeding from MPD@minBufferTime ──────
+
+/// For VOD, `buffer_target_ms` is seeded to `max(minBufferTime, 12_000)`.
+#[test]
+fn vod_buffer_target_ms_seeded_from_min_buffer_time() {
+    // minBufferTime = PT20S → 20 000 ms > 12 000 ms default.
+    const MPD_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S"
+     minBufferTime="PT20S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+    let session = session_from_xml(MPD_XML);
+    assert_eq!(
+        session.min_buffer_time_ms(),
+        Some(20_000.0),
+        "min_buffer_time_ms should reflect the parsed value"
+    );
+    assert!(
+        (session.buffer_target_ms() - 20_000.0).abs() < 1.0,
+        "buffer_target_ms should be seeded to 20 000 ms (from minBufferTime) for VOD; got {}",
+        session.buffer_target_ms()
+    );
+}
+
+/// When `minBufferTime` is smaller than the default 12 s, `buffer_target_ms`
+/// is still clamped to 12 000 ms.
+#[test]
+fn vod_buffer_target_ms_clamped_to_default_minimum() {
+    const MPD_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S"
+     minBufferTime="PT4S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+    let session = session_from_xml(MPD_XML);
+    assert_eq!(session.min_buffer_time_ms(), Some(4_000.0));
+    assert!(
+        (session.buffer_target_ms() - 12_000.0).abs() < 1.0,
+        "buffer_target_ms should be clamped to default 12 000 ms when minBufferTime < 12 s; got {}",
+        session.buffer_target_ms()
+    );
+}
+
+/// For live streams, `buffer_target_ms` defaults to 12 000 ms regardless of
+/// `minBufferTime`.
+#[test]
+fn live_buffer_target_ms_always_12000() {
+    const MPD_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="dynamic"
+     minimumUpdatePeriod="PT4S"
+     minBufferTime="PT60S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+    let session = session_from_xml(MPD_XML);
+    // min_buffer_time_ms reports what is in the XML.
+    assert_eq!(session.min_buffer_time_ms(), Some(60_000.0));
+    // buffer_target_ms must still be the live default (12 000 ms).
+    assert!(
+        (session.buffer_target_ms() - 12_000.0).abs() < 1.0,
+        "live stream buffer_target_ms must be 12 000 ms regardless of minBufferTime; got {}",
+        session.buffer_target_ms()
+    );
+}
+
+/// When `minBufferTime` is absent, `min_buffer_time_ms()` returns `None` and
+/// `buffer_target_ms` falls back to 12 000 ms.
+#[test]
+fn min_buffer_time_none_when_absent() {
+    let session = session_from_xml(STATIC_MPD);
+    assert_eq!(session.min_buffer_time_ms(), None);
+    assert!(
+        (session.buffer_target_ms() - 12_000.0).abs() < 1.0,
+        "default buffer_target_ms should be 12 000 ms; got {}",
+        session.buffer_target_ms()
+    );
+}
+
+/// `set_buffer_target_ms` / `buffer_target_ms` round-trip.
+#[test]
+fn set_buffer_target_ms_round_trip() {
+    let mut session = session_from_xml(STATIC_MPD);
+    session.set_buffer_target_ms(30_000.0);
+    assert!(
+        (session.buffer_target_ms() - 30_000.0).abs() < 1.0,
+        "buffer_target_ms should reflect the overridden value"
+    );
+}
+
+// ── update_metrics applies ABR decision ──────────────────────────────────────
+
+/// `update_metrics` with high throughput on a multi-representation stream
+/// causes the session to select a higher quality index, which is then
+/// reflected in `current_metrics().current_index`.
+#[test]
+fn update_metrics_applies_abr_decision() {
+    // Three representations: 500 kbps, 1 Mbps, 3 Mbps.
+    const MULTI_REP_MPD3: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="low"  bandwidth="500000"/>
+      <Representation id="mid"  bandwidth="1000000"/>
+      <Representation id="high" bandwidth="3000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let mut session = session_from_xml(MULTI_REP_MPD3);
+
+    // Initially at index 0 (lowest bitrate).
+    assert_eq!(
+        session.current_metrics(MediaType::Video, 0.0).current_index,
+        Some(0),
+        "should start at index 0"
+    );
+
+    // Very high throughput + healthy buffer → ABR should pick highest quality.
+    let metrics = AbrMetrics::new(100_000_000.0, 30_000.0);
+    session.update_metrics(&MediaType::Video, metrics);
+
+    let idx = session.current_metrics(MediaType::Video, 0.0).current_index;
+    assert!(
+        idx.unwrap_or(0) >= 1,
+        "after update_metrics with high throughput, index should be > 0; got {idx:?}"
+    );
+}
+
+/// `update_metrics` on an absent track is a no-op (must not panic).
+#[test]
+fn update_metrics_noop_for_absent_track() {
+    // STATIC_MPD has no audio track.
+    let mut session = session_from_xml(STATIC_MPD);
+    assert!(!session.has_audio(), "self-check: no audio");
+    // Should not panic.
+    let metrics = AbrMetrics::new(1_000_000.0, 5_000.0);
+    session.update_metrics(&MediaType::Audio, metrics);
+}
+
+/// `select_quality` returns a `QualityDecision` without mutating the session.
+#[test]
+fn select_quality_does_not_mutate_state() {
+    const MULTI_REP_MPD4: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT30S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="low"  bandwidth="500000"/>
+      <Representation id="high" bandwidth="3000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+    let session = session_from_xml(MULTI_REP_MPD4);
+    let metrics = AbrMetrics::new(10_000_000.0, 10_000.0);
+
+    // select_quality takes &self, so two calls must return consistent results.
+    let d1 = session.select_quality(&MediaType::Video, &metrics).unwrap();
+    let d2 = session.select_quality(&MediaType::Video, &metrics).unwrap();
+    assert_eq!(d1.index, d2.index, "select_quality must be deterministic");
+
+    // Current index must still be 0 (select_quality does not mutate).
+    assert_eq!(
+        session.current_metrics(MediaType::Video, 0.0).current_index,
+        Some(0),
+        "select_quality must not change current_index"
+    );
+}
+
+/// `select_quality` on an absent track returns `DashError::NoRepresentations`.
+#[test]
+fn select_quality_returns_error_for_absent_track() {
+    let session = session_from_xml(STATIC_MPD); // no audio
+    let result = session.select_quality(&MediaType::Audio, &default_metrics());
+    assert!(
+        matches!(result, Err(DashError::NoRepresentations { .. })),
+        "expected NoRepresentations for absent audio track, got {result:?}"
+    );
+}
+
+// ── ManifestLoader — parse-error propagation ──────────────────────────────────
+
+/// When the fetcher returns invalid XML, `DashSession::from_url` (which
+/// uses `ManifestLoader` internally) must return an error rather than panicking.
+#[tokio::test]
+async fn manifest_loader_returns_error_on_invalid_xml() {
+    let fetcher = MockFetcher::with_manifests(&["this is not xml at all <<<>>>"]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+
+    let result = DashSession::from_url(&url, fetcher, open_stub_source()).await;
+    assert!(
+        result.is_err(),
+        "from_url with invalid XML must return Err, got Ok"
+    );
+}

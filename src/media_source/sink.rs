@@ -100,6 +100,16 @@ impl SourceBufferSink {
         self.inner.timestamp_offset()
     }
 
+    /// Current append-window start in seconds.
+    pub fn append_window_start(&self) -> f64 {
+        self.inner.append_window_start()
+    }
+
+    /// Current append-window end in seconds.
+    pub fn append_window_end(&self) -> f64 {
+        self.inner.append_window_end()
+    }
+
     /// Set the MSE timestamp offset.
     ///
     /// Mirrors `SourceBufferSink.updateTimestampOffset()`.
