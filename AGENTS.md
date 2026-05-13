@@ -526,6 +526,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
 | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
 | Epoch-scale PTS remapping (`apply_live_pts_remap`, `live_pts_remap_offset_s`) | `src/session/mod.rs` |
+| Formal metrics (`DashMetrics`, `HttpRequestRecord`, `RepresentationSwitchRecord`, `BufferLevelSample`) | `src/session/metrics.rs` |
 | MPD helpers (`merge_segment_templates`, `extract_segment_timing`, `find_adaptation`, etc.) | `src/session/mpd.rs` |
 | SegmentTimeline / `$Time$` walking (`find_timeline_segment`, `snap_to_timeline_grid`) | `src/session/timeline.rs` |
 | URL template expansion + BaseURL resolution | `src/session/segment_url.rs` |

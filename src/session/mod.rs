@@ -23,6 +23,7 @@
 mod blacklist;
 mod gap;
 mod live;
+pub mod metrics;
 mod mpd;
 mod segment_url;
 mod timeline;
@@ -30,6 +31,7 @@ mod utc;
 mod xlink;
 
 pub use gap::{GapController, GapControllerSettings, GapSeekReason, GapSeekTarget};
+pub use metrics::{BufferLevelSample, DashMetrics, HttpRequestRecord, RepresentationSwitchRecord};
 
 use std::{
     collections::HashMap,
@@ -628,6 +630,10 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// probe-based PTS subtraction via `GstMediaSource::set_live_mode(true)`.
     /// Double-applying would corrupt timing.
     live_pts_remap_offset_s: f64,
+    /// Accumulated playback metrics: HTTP request log, representation-switch log,
+    /// and buffer-level samples.  Populated automatically by
+    /// [`Self::fetch_next_segment`].  Accessible via [`Self::metrics`].
+    dash_metrics: DashMetrics,
 }
 
 // Re-export for convenience in examples.
@@ -1043,10 +1049,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             video_max_bitrate_bps: None,
             audio_max_bitrate_bps: None,
             cdn_blacklist: CdnBlacklist::new(),
-            gap_controller: GapController::new(),
-            time_shift_buffer_depth_ms: mpd_ref_tsbd,
-            live_pts_remap_offset_s: 0.0,
-        })
+             gap_controller: GapController::new(),
+             time_shift_buffer_depth_ms: mpd_ref_tsbd,
+             live_pts_remap_offset_s: 0.0,
+             dash_metrics: DashMetrics::new(),
+         })
     }
 
     // ── Introspection ─────────────────────────────────────────────────────────
@@ -1793,6 +1800,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.live_pts_remap_offset_s
     }
 
+    /// Returns a reference to the accumulated playback metrics for this session.
+    ///
+    /// The returned [`DashMetrics`] contains:
+    /// - [`DashMetrics::http_requests`] — one entry per completed segment fetch
+    /// - [`DashMetrics::representation_switches`] — one entry per quality switch
+    /// - [`DashMetrics::buffer_level_samples`] — one buffer snapshot per fetch
+    ///
+    /// Each list is capped at 100 entries (oldest evicted first).
+    pub fn metrics(&self) -> &DashMetrics {
+        &self.dash_metrics
+    }
+
     /// Buffered time ranges for the given media track, as reported by the
     /// underlying [`SourceBufferSink`].
     ///
@@ -2369,23 +2388,38 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         };
 
         // Apply quality switch if needed.
-        let quality_switched = {
+        // Returns Some(from_index) on a switch, None when quality is unchanged.
+        let switched_from: Option<usize> = {
             let track = self.track_mut(&media_type)?;
             if decision.index != track.current_index {
+                let from_index = track.current_index;
                 tracing::info!(
                     media_type = %media_type,
-                    old = track.current_index,
+                    old = from_index,
                     new = decision.index,
                     reason = ?decision.reason,
                     "quality switch"
                 );
                 track.current_index = decision.index;
                 self.abr.record_switch();
-                true
+                Some(from_index)
             } else {
-                false
+                None
             }
         };
+        let quality_switched = switched_from.is_some();
+
+        // Record a representation-switch metric when a quality change occurred.
+        if let Some(from_index) = switched_from {
+            let wall_ms = (self.clock.unix_s() + self.utc_clock_offset_s) * 1_000.0;
+            self.dash_metrics.push_switch(RepresentationSwitchRecord {
+                wall_ms,
+                media_type: media_type.clone(),
+                from_index,
+                to_index: decision.index,
+                reason: decision.reason.clone(),
+            });
+        }
 
         // On a quality switch, re-append the init segment so the decoder
         // sees the correct codec configuration.  Use the cache (populated by
@@ -2731,6 +2765,37 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 transfer_ms = track.last_transfer_ms,
                 "throughput updated"
             );
+        }
+
+        // Record HTTP request metrics and a buffer-level sample.
+        {
+            let wall_ms = (self.clock.unix_s() + self.utc_clock_offset_s) * 1_000.0;
+            let (quality_index, buffer_level_ms) = {
+                let track = self.track(&media_type)?;
+                let position_s = self.estimated_playback_position_s();
+                let level = track
+                    .sink
+                    .buffered()
+                    .last()
+                    .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
+                    .unwrap_or(0.0);
+                (track.current_index, level)
+            };
+            self.dash_metrics.push_http(HttpRequestRecord {
+                wall_ms,
+                media_type: media_type.clone(),
+                segment_number: seg_number,
+                url: response.final_url.to_string(),
+                bytes_received: response.bytes_received,
+                transfer_duration_ms: response.transfer_duration_ms as f64,
+                throughput_bps: response.throughput_bps(),
+                quality_index,
+            });
+            self.dash_metrics.push_buffer_level(BufferLevelSample {
+                wall_ms,
+                media_type: media_type.clone(),
+                level_ms: buffer_level_ms,
+            });
         }
 
         let sidx = parse_sidx(&response.data);

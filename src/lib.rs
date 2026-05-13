@@ -59,4 +59,7 @@ pub use clock::{Clock, SystemClock};
 pub use error::DashError;
 pub use manifest::MPD;
 pub use mp4::{parse_all_emsg, parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
-pub use session::{DashEvent, DashSession, GapControllerSettings, GapSeekReason, GapSeekTarget, MediaType};
+pub use session::{
+    BufferLevelSample, DashEvent, DashMetrics, DashSession, GapControllerSettings, GapSeekReason,
+    GapSeekTarget, HttpRequestRecord, MediaType, RepresentationSwitchRecord,
+};

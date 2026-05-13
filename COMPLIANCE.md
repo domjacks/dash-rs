@@ -69,6 +69,7 @@ All items below are implemented and covered by tests.
  | 47 | `DashSession::buffered(media_type)` public accessor delegates to the track's `SourceBufferSink::buffered()`, providing real-time buffered ranges to callers (e.g. the gap controller loop) without exposing internals; returns empty `Vec` when the track is absent | — |
  | 48 | WASM player `tick_gap` loop integrated: at every fetch iteration `session.tick_gap(position_s, &buffered, is_paused)` is called with the live `video.currentTime` and `video.paused` state (via new `isPaused()` bridge call); when a seek is recommended the player calls `bridge.seek_to`, `session.seek_to`, and `session.notify_playing()` — mirrors dash.js `GapController.js` | — |
  | 49 | `extract_segment_timing` no longer sets `total_segments` from a SegmentTimeline that contains an `r=-1` (infinite-repeat) entry; such timelines are unbounded and EOS must be determined by `availabilityEndTime` or segment fetch failure, not by segment count — fixes premature `EndOfStream` on first fetch of any live `r=-1` stream | §5.3.9.6.4 |
+ | 50 | Formal metrics collection (`DashMetrics`) — three bounded ring-buffer lists (cap 100, matching dash.js `MAX_SAVED_METRICS_REQUESTS`): `HttpRequestRecord` (per `fetch_next_segment` call: wall_ms, segment_number, url, bytes_received, transfer_duration_ms, throughput_bps, quality_index), `RepresentationSwitchRecord` (per quality switch: wall_ms, from_index, to_index, reason), `BufferLevelSample` (per fetch at ABR decision time: wall_ms, level_ms); exposed via `DashSession::metrics()` (`&DashMetrics`); timestamps are absolute Unix milliseconds; module at `src/session/metrics.rs` | dash.js `DashMetrics.js` |
 
 ---
 
@@ -194,17 +195,9 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-9: Formal metrics collection missing
-
-**Gap**: There is no structured event log for QoE reporting.  `DashSession` exposes throughput EMA and current quality index only.
-
-**Fix**: Add a `DashMetrics` struct populated on each fetch/append: buffer-level samples, HTTP request records, representation-switch events.  Expose via `session.metrics()`.
-
----
-
 ### P2-10: DVB/ISO metrics reporting missing
 
-**Gap**: `MetricsReporting.js` / `DVBReporting` — periodic HTTP posting to a `@dvb:metrics` reporting server.  Depends on P2-9.
+**Gap**: `MetricsReporting.js` / `DVBReporting` — periodic HTTP posting to a `@dvb:metrics` reporting server.  Depends on P2-9 (now implemented).
 
 ---
 

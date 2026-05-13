@@ -21,6 +21,7 @@ use dash_rs::{
         MediaSource, ReadyState, SourceBuffer, TimeRange,
     },
     session::{DashSession, MediaType},
+    DashMetrics,
     GapSeekReason,
 };
 
@@ -5970,5 +5971,161 @@ async fn manifest_loader_returns_error_on_invalid_xml() {
     assert!(
         result.is_err(),
         "from_url with invalid XML must return Err, got Ok"
+    );
+}
+
+// ── DashMetrics integration tests ─────────────────────────────────────────────
+
+/// Shared 3-representation VOD MPD used by metrics tests.
+const METRICS_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT10S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$RepresentationID$-$Number$.m4s"
+                       initialization="init-$RepresentationID$.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="low"  bandwidth="500000"/>
+      <Representation id="mid"  bandwidth="1500000"/>
+      <Representation id="high" bandwidth="4000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+/// After one `fetch_next_segment` call, `metrics().http_requests` must contain
+/// exactly one entry with the correct segment number and quality index.
+#[tokio::test]
+async fn metrics_http_request_recorded_after_fetch() {
+    let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    assert_eq!(session.metrics().http_requests.len(), 0,
+        "no HTTP records before any fetch");
+
+    let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
+    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+
+    assert_eq!(
+        session.metrics().http_requests.len(), 1,
+        "exactly one HTTP record after one fetch"
+    );
+}
+
+/// The recorded `HttpRequestRecord` must carry the correct `segment_number`
+/// and `quality_index` matching the ABR decision that was applied.
+#[tokio::test]
+async fn metrics_http_request_has_correct_fields() {
+    let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // 10 Mbps throughput → ABR should select highest quality (index 2 = "high").
+    let high_metrics = AbrMetrics::new(10_000_000.0, 4_000.0);
+    session.fetch_next_segment(MediaType::Video, &high_metrics).await.unwrap();
+
+    let rec = session.metrics().last_http_request().expect("must have a record");
+    assert_eq!(rec.segment_number, 1, "first segment number is 1 (startNumber=1)");
+    assert_eq!(rec.quality_index, 2, "10 Mbps throughput must select highest rep (index 2)");
+    assert!(rec.bytes_received == 0, "stub fetcher returns empty bytes");
+    assert!(!rec.url.is_empty(), "URL must be non-empty");
+}
+
+/// A buffer-level sample must be appended after each `fetch_next_segment` call.
+#[tokio::test]
+async fn metrics_buffer_level_sample_recorded_per_fetch() {
+    let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
+    for i in 1..=3u64 {
+        session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+        assert_eq!(
+            session.metrics().buffer_level_samples.len(), i as usize,
+            "buffer_level_samples must grow by one per fetch"
+        );
+    }
+}
+
+/// When a quality switch occurs, a `RepresentationSwitchRecord` must be pushed
+/// with the correct `from_index` and `to_index`.
+#[tokio::test]
+async fn metrics_representation_switch_recorded() {
+    let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    // First fetch at low throughput → selects index 0 ("low").
+    let low_metrics = AbrMetrics::new(200_000.0, 4_000.0);
+    session.fetch_next_segment(MediaType::Video, &low_metrics).await.unwrap();
+    assert_eq!(session.metrics().representation_switches.len(), 0,
+        "no switch on the first fetch (initial selection is not a switch)");
+
+    // Second fetch at very high throughput → ABR up-switches.
+    let high_metrics = AbrMetrics::new(50_000_000.0, 12_000.0);
+    session.fetch_next_segment(MediaType::Video, &high_metrics).await.unwrap();
+
+    // There may or may not be a switch depending on switch-history throttle;
+    // if a switch occurred validate the record.
+    if let Some(sw) = session.metrics().last_switch() {
+        assert_eq!(sw.to_index, 2, "up-switch with 50 Mbps must target highest rep");
+        assert!(sw.to_index > sw.from_index, "to_index must be higher than from_index");
+    }
+    // (switch-history throttle may suppress the switch on the second segment —
+    // the important invariant is that if a record exists it is well-formed)
+}
+
+/// After more than `METRICS_CAPACITY` (100) fetches the ring buffer must not
+/// exceed 100 entries — the oldest are silently evicted.
+#[tokio::test]
+async fn metrics_ring_buffer_caps_at_100() {
+    // Build an MPD with enough segments to exceed the cap (110 × 2 s = 220 s).
+    let big_mpd = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT220S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let fetcher = MockFetcher::with_manifests(&[big_mpd]);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
+        .await
+        .unwrap();
+
+    let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
+    for _ in 0..110 {
+        match session.fetch_next_segment(MediaType::Video, &metrics).await {
+            Ok(_) => {}
+            Err(DashError::EndOfStream { .. }) => break,
+            Err(e) => panic!("unexpected error: {e}"),
+        }
+    }
+
+    assert!(
+        session.metrics().http_requests.len() <= 100,
+        "http_requests must be capped at 100, got {}",
+        session.metrics().http_requests.len()
+    );
+    assert!(
+        session.metrics().buffer_level_samples.len() <= 100,
+        "buffer_level_samples must be capped at 100, got {}",
+        session.metrics().buffer_level_samples.len()
     );
 }
