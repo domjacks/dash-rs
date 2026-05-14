@@ -6,6 +6,7 @@
  *   - WASM module initialisation (init())
  *   - URL input pre-fill from the ?url= query parameter
  *   - Form submit handler — creates a fresh bridge per session and calls play()
+ *   - Debug panel — updated every 500 ms via bridge.getLatestStatus()
  *
  * MSE bridge logic (all browser Web API calls made by dash-rs) lives in
  * player.js and is kept entirely separate from this file.
@@ -48,11 +49,11 @@ const _console = {
   debug: console.debug.bind(console),
 };
 
-// 2. Low-level append — creates a coloured span in the log panel.
+// 2. Low-level append — creates a coloured div (block) in the log panel.
 function appendToLog(cssClass, text) {
-  const line     = document.createElement('span');
+  const line     = document.createElement('div');
   line.className = cssClass;
-  line.textContent = text + '\n';
+  line.textContent = text;
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
@@ -99,10 +100,89 @@ export function log(category, msg) {
   appendToLog(`cat-${category.toLowerCase()}`, `[${category}] ${msg}`);
 }
 
+// ── Debug panel ────────────────────────────────────────────────────────────────
+//
+// updateDebugPanel() is called by a setInterval every 500 ms.  It reads:
+//   • bridge.getLatestStatus() — the last JSON snapshot pushed from Rust.
+//   • video.* — live browser properties for playback state and position.
+//
+// All DOM element references are looked up once here and reused each tick.
+
+const dp = {
+  dot:       document.getElementById('dp-dot'),
+  stateText: document.getElementById('dp-state-text'),
+  live:      document.getElementById('dp-live'),
+  pos:       document.getElementById('dp-pos'),
+  vq:        document.getElementById('dp-vq'),
+  vbps:      document.getElementById('dp-vbps'),
+  vbuf:      document.getElementById('dp-vbuf'),
+  aq:        document.getElementById('dp-aq'),
+  abps:      document.getElementById('dp-abps'),
+  abuf:      document.getElementById('dp-abuf'),
+  hc:        document.getElementById('dp-hc'),
+  sc:        document.getElementById('dp-sc'),
+  url:       document.getElementById('dp-url'),
+  tms:       document.getElementById('dp-tms'),
+  tbps:      document.getElementById('dp-tbps'),
+};
+
+// Current bridge — set when a session starts, cleared when it ends.
+let activeBridge = null;
+
+function fmtBps(bps) {
+  if (bps === 0) return '—';
+  if (bps >= 1_000_000) return `${(bps / 1_000_000).toFixed(2)} Mbps`;
+  if (bps >= 1_000)     return `${(bps / 1_000).toFixed(1)} kbps`;
+  return `${bps} bps`;
+}
+
+function fmtMs(ms) {
+  if (ms === 0) return '—';
+  return `${ms.toFixed(0)} ms`;
+}
+
+function updateDebugPanel() {
+  // ── Playback state from the video element ────────────────────────────────
+  let stateLabel, dotClass;
+  if (video.ended) {
+    stateLabel = 'Ended';     dotClass = 'dot-ended';
+  } else if (video.paused) {
+    stateLabel = 'Paused';    dotClass = 'dot-paused';
+  } else if (video.readyState < 3) {
+    stateLabel = 'Buffering'; dotClass = 'dot-buffering';
+  } else {
+    stateLabel = 'Playing';   dotClass = 'dot-playing';
+  }
+  dp.dot.className       = `dot ${dotClass}`;
+  dp.stateText.textContent = stateLabel;
+  dp.pos.textContent     = `${video.currentTime.toFixed(2)} s`;
+
+  // ── Rust session status ──────────────────────────────────────────────────
+  const s = activeBridge ? activeBridge.getLatestStatus() : null;
+  if (!s) return;  // no tick yet — leave remaining rows as '—'
+
+  dp.live.textContent  = s.live  ? 'Live'  : 'VOD';
+  dp.vq.textContent    = s.vc > 0 ? `${s.vi + 1} / ${s.vc}` : '—';
+  dp.vbps.textContent  = s.vc > 0 ? fmtBps(s.vbps) : '—';
+  dp.vbuf.textContent  = s.vc > 0 ? fmtMs(s.vbuf)  : '—';
+  dp.aq.textContent    = s.ac > 0 ? `${s.ai + 1} / ${s.ac}` : '—';
+  dp.abps.textContent  = s.ac > 0 ? fmtBps(s.abps) : '—';
+  dp.abuf.textContent  = s.ac > 0 ? fmtMs(s.abuf)  : '—';
+  dp.hc.textContent    = String(s.hc);
+  dp.sc.textContent    = String(s.sc);
+  // Show only the last path component of the URL to keep the panel compact.
+  dp.url.textContent   = s.url ? s.url.split('/').pop() || s.url : '—';
+  dp.tms.textContent   = s.tms > 0 ? fmtMs(s.tms)  : '—';
+  dp.tbps.textContent  = s.tbps > 0 ? fmtBps(s.tbps) : '—';
+}
+
+// Start the panel refresh loop immediately (it is safe to call before playback).
+setInterval(updateDebugPanel, 500);
+
 // ── WASM initialisation ────────────────────────────────────────────────────────
 
 await init();
-status.textContent = 'Ready. Enter a manifest URL and press Play.';
+status.textContent = 'Ready. Enter a manifest URL and press Load.';
 
 // ── Form handler ───────────────────────────────────────────────────────────────
 
@@ -117,9 +197,17 @@ form.addEventListener('submit', async (e) => {
   status.className   = '';
   status.textContent = `Starting playback: ${url}`;
 
+  // Reset debug panel rows to '—' between sessions.
+  for (const el of Object.values(dp)) {
+    if (el !== dp.dot && el !== dp.stateText) el.textContent = '—';
+  }
+  dp.stateText.textContent = '—';
+  dp.dot.className = 'dot';
+
   try {
     // Create a fresh bridge for each playback session so MSE state is clean.
     const bridge = createBridge(video, log);
+    activeBridge = bridge;
 
     // play() runs the full DASH fetch loop and resolves when EOS is reached.
     await play(url, bridge);
@@ -128,5 +216,7 @@ form.addEventListener('submit', async (e) => {
     status.className   = 'error';
     status.textContent = `Error: ${err}`;
     console.error('dash-rs error:', err);
+  } finally {
+    activeBridge = null;
   }
 });

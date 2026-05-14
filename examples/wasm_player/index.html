@@ -4,118 +4,107 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>dash-rs WASM player</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      font-family: system-ui, sans-serif;
-      background: #111;
-      color: #eee;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      padding: 2rem;
-      gap: 1rem;
-    }
-    h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: 0.03em; }
-    video {
-      width: 100%;
-      max-width: 900px;
-      aspect-ratio: 16/9;
-      background: #000;
-      border-radius: 6px;
-    }
-    form {
-      display: flex;
-      gap: 0.5rem;
-      width: 100%;
-      max-width: 900px;
-    }
-    input[type=text] {
-      flex: 1;
-      padding: 0.45rem 0.75rem;
-      border: 1px solid #444;
-      border-radius: 4px;
-      background: #222;
-      color: #eee;
-      font-size: 0.85rem;
-    }
-    button {
-      padding: 0.45rem 1rem;
-      border: none;
-      border-radius: 4px;
-      background: #1a7fd4;
-      color: #fff;
-      font-size: 0.85rem;
-      cursor: pointer;
-    }
-    button:hover { background: #1569b0; }
-    #status {
-      font-size: 0.8rem;
-      color: #aaa;
-      min-height: 1.2em;
-      text-align: center;
-    }
-    #status.error { color: #f55; }
-
-    /* On-screen API call log */
-    #log-section {
-      width: 100%;
-      max-width: 900px;
-    }
-    #log-section h2 {
-      font-size: 0.8rem;
-      font-weight: 600;
-      color: #888;
-      text-transform: uppercase;
-      letter-spacing: 0.08em;
-      margin-bottom: 0.4rem;
-    }
-    #api-log {
-      background: #1a1a1a;
-      border: 1px solid #333;
-      border-radius: 4px;
-      padding: 0.6rem 0.8rem;
-      font-family: ui-monospace, monospace;
-      font-size: 0.75rem;
-      line-height: 1.6;
-      height: 220px;
-      overflow-y: auto;
-      color: #ccc;
-    }
-    /* Web API bridge calls — coloured by category */
-    #api-log .cat-mse   { color: #5bf; }
-    #api-log .cat-fetch { color: #8d8; }
-    #api-log .cat-clock { color: #fa8; }
-    #api-log .cat-util  { color: #aaa; }
-    /* Rust tracing / console output — coloured by severity level */
-    #api-log .level-log   { color: #ccc; }
-    #api-log .level-info  { color: #ccc; }
-    #api-log .level-warn  { color: #fb3; }
-    #api-log .level-error { color: #f55; }
-    #api-log .level-debug { color: #555; }
-  </style>
+  <link href="./styles.css" rel="stylesheet" />
 </head>
 <body>
   <h1>dash-rs &mdash; WASM player</h1>
 
-  <video id="video" controls autoplay muted></video>
+  <div id="player-wrap">
 
-  <form id="form">
-    <input
-      id="url-input"
-      type="text"
-      placeholder="MPEG-DASH manifest URL (.mpd)"
-      value="https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd"
-    />
-    <button type="submit">Load</button>
-  </form>
+    <!-- Left column: video + URL form + status line -->
+    <div id="left-col">
+      <video id="video" controls autoplay muted></video>
 
-  <div id="status">Loading WASM module…</div>
+      <form id="form">
+        <input
+          id="url-input"
+          type="text"
+          placeholder="MPEG-DASH manifest URL (.mpd)"
+          value="https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd"
+        />
+        <button type="submit">Load</button>
+      </form>
 
-  <section id="log-section">
-    <h2>Player log</h2>
-    <div id="api-log"></div>
-  </section>
+      <div id="status">Loading WASM module&hellip;</div>
+    </div>
+
+    <!-- Right column: debug panel + player log -->
+    <div id="right-col">
+
+      <!-- Debug panel — updated every 500 ms by app.js -->
+      <section id="debug-panel">
+        <h2>Playback stats</h2>
+
+        <div class="debug-row">
+          <span class="debug-label">State</span>
+          <span class="debug-value" id="dp-state">
+            <span class="state-badge"><span class="dot" id="dp-dot"></span><span id="dp-state-text">—</span></span>
+          </span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Stream type</span>
+          <span class="debug-value" id="dp-live">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Position</span>
+          <span class="debug-value" id="dp-pos">—</span>
+        </div>
+
+        <div class="debug-row">
+          <span class="debug-label">Video quality</span>
+          <span class="debug-value" id="dp-vq">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Video bandwidth</span>
+          <span class="debug-value" id="dp-vbps">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Video buffer</span>
+          <span class="debug-value" id="dp-vbuf">—</span>
+        </div>
+
+        <div class="debug-row">
+          <span class="debug-label">Audio quality</span>
+          <span class="debug-value" id="dp-aq">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Audio bandwidth</span>
+          <span class="debug-value" id="dp-abps">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Audio buffer</span>
+          <span class="debug-value" id="dp-abuf">—</span>
+        </div>
+
+        <div class="debug-row">
+          <span class="debug-label">HTTP requests</span>
+          <span class="debug-value" id="dp-hc">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Quality switches</span>
+          <span class="debug-value" id="dp-sc">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Last segment</span>
+          <span class="debug-value" id="dp-url">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Last fetch time</span>
+          <span class="debug-value" id="dp-tms">—</span>
+        </div>
+        <div class="debug-row">
+          <span class="debug-label">Throughput</span>
+          <span class="debug-value" id="dp-tbps">—</span>
+        </div>
+      </section>
+
+      <section id="log-section">
+        <h2>Player log</h2>
+        <div id="api-log"></div>
+      </section>
+
+    </div><!-- #right-col -->
+  </div><!-- #player-wrap -->
 
   <!--
     wasm-pack build --target web outputs:

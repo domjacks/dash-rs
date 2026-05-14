@@ -1,0 +1,166 @@
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      background: #111;
+      color: #eee;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      padding: 2rem;
+      gap: 1rem;
+    }
+    h1 { font-size: 1.4rem; font-weight: 600; letter-spacing: 0.03em; }
+
+    /* ── Two-column layout ──────────────────────────────────────────────────── */
+    #player-wrap {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1.25rem;
+      width: 100%;
+      max-width: 1280px;
+      align-items: flex-start;
+    }
+
+    /* Left column: video + controls */
+    #left-col {
+      flex: 1 1 60%;
+      min-width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    /* Right column: debug panel + log */
+    #right-col {
+      flex: 0 0 360px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+
+    /* Collapse to single column on narrow screens */
+    @media (max-width: 900px) {
+      #right-col { flex: 1 1 100%; }
+    }
+
+    /* ── Video element ──────────────────────────────────────────────────────── */
+    video {
+      width: 100%;
+      aspect-ratio: 16/9;
+      background: #000;
+      border-radius: 6px;
+    }
+
+    /* ── URL form ───────────────────────────────────────────────────────────── */
+    form {
+      display: flex;
+      gap: 0.5rem;
+    }
+    input[type=text] {
+      flex: 1;
+      padding: 0.45rem 0.75rem;
+      border: 1px solid #444;
+      border-radius: 4px;
+      background: #222;
+      color: #eee;
+      font-size: 0.85rem;
+    }
+    button {
+      padding: 0.45rem 1rem;
+      border: none;
+      border-radius: 4px;
+      background: #1a7fd4;
+      color: #fff;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    button:hover { background: #1569b0; }
+
+    /* ── Status line ────────────────────────────────────────────────────────── */
+    #status {
+      font-size: 0.8rem;
+      color: #aaa;
+      min-height: 1.2em;
+    }
+    #status.error { color: #f55; }
+
+    /* ── Debug panel ────────────────────────────────────────────────────────── */
+    #debug-panel {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 0.7rem 0.9rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      line-height: 1.8;
+    }
+    #debug-panel h2 {
+      font-family: system-ui, sans-serif;
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.5rem;
+    }
+    .debug-row {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+      border-bottom: 1px solid #222;
+      padding: 0.1rem 0;
+    }
+    .debug-row:last-child { border-bottom: none; }
+    .debug-label { color: #666; }
+    .debug-value { color: #ccc; text-align: right; word-break: break-all; }
+
+    /* Playback state indicator dot */
+    .state-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .dot {
+      display: inline-block;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #888;
+    }
+    .dot-playing    { background: #4c4; }
+    .dot-paused     { background: #fa3; }
+    .dot-buffering  { background: #f80; }
+    .dot-ended      { background: #888; }
+
+    /* ── Player log ─────────────────────────────────────────────────────────── */
+    #log-section h2 {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: #888;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 0.4rem;
+    }
+    #api-log {
+      background: #1a1a1a;
+      border: 1px solid #333;
+      border-radius: 4px;
+      padding: 0.6rem 0.8rem;
+      font-family: ui-monospace, monospace;
+      font-size: 0.75rem;
+      line-height: 1.6;
+      height: 380px;
+      overflow-y: auto;
+      color: #ccc;
+    }
+    /* Web API bridge calls — coloured by category */
+    #api-log .cat-mse   { color: #5bf; }
+    #api-log .cat-fetch { color: #8d8; }
+    #api-log .cat-clock { color: #fa8; }
+    #api-log .cat-util  { color: #aaa; }
+    /* Rust tracing / console output — coloured by severity level */
+    #api-log .level-log   { color: #ccc; }
+    #api-log .level-info  { color: #ccc; }
+    #api-log .level-warn  { color: #fb3; }
+    #api-log .level-error { color: #f55; }
+    #api-log .level-debug { color: #555; }

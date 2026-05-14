@@ -1790,6 +1790,29 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         }
     }
 
+    /// Returns the [`RepresentationInfo`] for the currently active quality
+    /// level on the given track, or `None` if the track is absent.
+    ///
+    /// The `bandwidth` field carries the declared bitrate in bits per second
+    /// as specified by `@bandwidth` in the MPD.
+    pub fn current_representation(&self, media_type: &MediaType) -> Option<&RepresentationInfo> {
+        let track = match media_type {
+            MediaType::Video => self.video_track.as_ref(),
+            MediaType::Audio => self.audio_track.as_ref(),
+        }?;
+        track.representations.get(track.current_index)
+    }
+
+    /// Returns the total number of representations available for the given
+    /// track, or `0` if the track is absent.
+    pub fn representation_count(&self, media_type: &MediaType) -> usize {
+        let track = match media_type {
+            MediaType::Video => self.video_track.as_ref(),
+            MediaType::Audio => self.audio_track.as_ref(),
+        };
+        track.map(|t| t.representations.len()).unwrap_or(0)
+    }
+
     /// The PTS remap offset applied by [`Self::apply_live_pts_remap`], in seconds.
     ///
     /// Returns `0.0` until `apply_live_pts_remap` has been called.  After the

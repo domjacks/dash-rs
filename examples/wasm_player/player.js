@@ -21,6 +21,9 @@ export function createBridge(video, log) {
   const sourceBuffers = {};   // opaque id (string) → SourceBuffer
   let nextSbId = 0;
 
+  // Debug-panel state — latest status snapshot pushed from Rust each loop tick.
+  let _latestStatus = null;
+
   return {
 
     // ── Clock ──────────────────────────────────────────────────────────────────
@@ -260,6 +263,21 @@ export function createBridge(video, log) {
       log('Fetch', `fetch("${url}", { method: 'HEAD', mode: 'cors' })`);
       const response = await fetch(url, { method: 'HEAD', mode: 'cors' });
       return response.ok;
+    },
+
+    // ── Debug panel ────────────────────────────────────────────────────────────
+
+    // Called by Rust once per fetch-loop iteration with a compact JSON string
+    // describing the current session state (built by build_status_json in lib.rs).
+    // We parse it immediately so getLatestStatus() returns a plain object.
+    reportStatus(json) {
+      try { _latestStatus = JSON.parse(json); } catch (_) { /* ignore */ }
+    },
+
+    // Return the last parsed status object (or null before the first tick).
+    // Called by the setInterval updater in app.js.
+    getLatestStatus() {
+      return _latestStatus;
     },
 
   };

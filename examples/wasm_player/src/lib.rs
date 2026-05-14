@@ -231,6 +231,12 @@ extern "C" {
     // fetch(url, {method:'HEAD'})  →  Promise<bool>
     #[wasm_bindgen(method, js_name = checkExists)]
     fn check_exists(this: &JsBridge, url: &str) -> Promise;
+
+    // Debug panel status push — called once per fetch-loop iteration.
+    // The argument is a compact JSON string; JS calls JSON.parse on it and
+    // stores the result for the setInterval debug-panel updater.
+    #[wasm_bindgen(method, js_name = reportStatus)]
+    fn report_status(this: &JsBridge, json: &str);
 }
 
 // ── FetchResult extern type ───────────────────────────────────────────────────
@@ -542,6 +548,73 @@ impl SegmentFetcher for BridgeFetcher {
 
 // ── WASM entry point ──────────────────────────────────────────────────────────
 
+// ── Debug status helper ───────────────────────────────────────────────────────
+
+/// Build a compact JSON string describing the current session state.
+///
+/// The string is passed to `bridge.reportStatus()` once per fetch-loop
+/// iteration so the JavaScript debug panel can update without any structured
+/// data passing across the WASM boundary.  All values are primitive JSON
+/// scalars; no arrays or nested objects are used so there is no need for a
+/// serialisation library.
+///
+/// Key | Type   | Meaning
+/// ----|--------|---------------------------------------------------
+/// vi  | u32    | Video quality index (0-based)
+/// vc  | u32    | Video representation count (0 = track absent)
+/// vbps| u64    | Video declared bandwidth (bits/s)
+/// vbuf| f64    | Video buffer level (ms)
+/// ai  | u32    | Audio quality index (0-based)
+/// ac  | u32    | Audio representation count
+/// abps| u64    | Audio declared bandwidth (bits/s)
+/// abuf| f64    | Audio buffer level (ms)
+/// hc  | usize  | Total HTTP request records in DashMetrics
+/// sc  | usize  | Total representation-switch records
+/// url | string | Last segment URL (path only, `"` and `\` stripped)
+/// tms | f64    | Last transfer duration (ms)
+/// tbps| f64    | Last measured throughput (bits/s), 0 if unavailable
+/// live| bool   | Whether the session is a live stream
+fn build_status_json<F, M>(session: &DashSession<F, M>, position_s: f64) -> String
+where
+    F: dash_rs::fetch::SegmentFetcher,
+    M: dash_rs::media_source::MediaSource,
+{
+    // ── Video track ───────────────────────────────────────────────────────────
+    let vi   = session.current_metrics(MediaType::Video, position_s)
+                      .current_index.unwrap_or(0) as u32;
+    let vc   = session.representation_count(&MediaType::Video) as u32;
+    let vbps = session.current_representation(&MediaType::Video)
+                      .map(|r| r.bandwidth).unwrap_or(0);
+    let vbuf = session.estimated_buffer_level_ms(&MediaType::Video);
+
+    // ── Audio track ───────────────────────────────────────────────────────────
+    let ai   = session.current_metrics(MediaType::Audio, position_s)
+                      .current_index.unwrap_or(0) as u32;
+    let ac   = session.representation_count(&MediaType::Audio) as u32;
+    let abps = session.current_representation(&MediaType::Audio)
+                      .map(|r| r.bandwidth).unwrap_or(0);
+    let abuf = session.estimated_buffer_level_ms(&MediaType::Audio);
+
+    // ── DashMetrics ───────────────────────────────────────────────────────────
+    let m    = session.metrics();
+    let hc   = m.http_requests.len();
+    let sc   = m.representation_switches.len();
+
+    // Last HTTP record — strip characters that would break the JSON string.
+    let (url_safe, tms, tbps) = if let Some(r) = m.last_http_request() {
+        let safe = r.url.replace('"', "").replace('\\', "");
+        (safe, r.transfer_duration_ms, r.throughput_bps.unwrap_or(0.0))
+    } else {
+        (String::new(), 0.0, 0.0)
+    };
+
+    let live = session.is_live();
+
+    format!(
+        r#"{{"vi":{vi},"vc":{vc},"vbps":{vbps},"vbuf":{vbuf:.1},"ai":{ai},"ac":{ac},"abps":{abps},"abuf":{abuf:.1},"hc":{hc},"sc":{sc},"url":"{url_safe}","tms":{tms:.1},"tbps":{tbps:.0},"live":{live}}}"#
+    )
+}
+
 /// Initialise WASM infrastructure (panic hook + tracing).
 ///
 /// Called automatically by the WASM module initialiser before any exported
@@ -703,6 +776,15 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
                 }
                 Err(e) => return Err(JsValue::from_str(&e.to_string())),
             }
+        }
+
+        // ── Debug panel status push ────────────────────────────────────────
+        // Build a compact JSON snapshot of current session state and push it
+        // to the JavaScript debug panel via the bridge.  The JS side stores
+        // the latest value and a setInterval updater reads it every 500 ms.
+        {
+            let pos = bridge.get_current_time();
+            bridge.report_status(&build_status_json(&session, pos));
         }
     }
 
