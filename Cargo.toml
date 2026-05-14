@@ -19,7 +19,7 @@ categories = ["multimedia", "network-programming"]
 sink-gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
 
 [dependencies]
-quick-xml        = { version = "0.36", features = ["serialize"] }
+quick-xml        = { version = "0.40", features = ["serialize"] }
 serde            = { version = "1", features = ["derive"] }
 bytes            = "1"
 url              = "2"
