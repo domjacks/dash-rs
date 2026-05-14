@@ -27,7 +27,7 @@ thiserror        = "2"
 async-trait      = "0.1"
 tracing          = "0.1"
 rand             = "0.8"
-async-broadcast  = "0.5"
+async-broadcast  = "0.7"
 futures-timer    = "3"
 futures          = { version = "0.3", default-features = false, features = ["std"] }
 gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
