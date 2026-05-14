@@ -711,10 +711,27 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         MediaType::Audio
     };
 
+    // Track the previous pause state so we can call notify_paused() /
+    // notify_playing() on transitions.  Without this the session's wall-clock
+    // keeps advancing while the user is paused, draining estimated_buffer_level_ms
+    // to zero and causing the loop to over-fetch into a full SourceBuffer.
+    let mut was_paused = false;
+
     loop {
         if video_done && audio_done {
             break;
         }
+
+        // ── Pause-state tracking ───────────────────────────────────────────
+        // Forward pause/resume transitions to the session so that
+        // estimated_buffer_level_ms stays correct while paused.
+        let is_paused = bridge.is_paused();
+        if is_paused && !was_paused {
+            session.notify_paused();
+        } else if !is_paused && was_paused {
+            session.notify_playing();
+        }
+        was_paused = is_paused;
 
         // ── Gap controller tick ────────────────────────────────────────────
         // Mirrors dash.js GapController.js setInterval at ~200 ms.
@@ -723,7 +740,6 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         // restart the buffer clock.
         {
             let position_s = bridge.get_current_time();
-            let is_paused  = bridge.is_paused();
             let buffered   = session.buffered(gate_type.clone());
             if let Some(target) = session.tick_gap(position_s, &buffered, is_paused) {
                 tracing::info!(

@@ -155,11 +155,21 @@ export function createBridge(video, log) {
     // Append raw fMP4 bytes to a SourceBuffer.
     // Returns a Promise that resolves when the browser fires 'updateend',
     // meaning the data has been parsed and is now in the decode pipeline.
+    // appendBuffer() can throw synchronously (e.g. QuotaExceededError /
+    // "buffer not sufficient") if the SourceBuffer is full, so the call is
+    // placed *inside* the Promise constructor so the rejection stays in the
+    // Promise chain and surfaces as a Rust DashError rather than an uncaught
+    // JS exception.
     appendBuffer(id, data) {
       const sb = sourceBuffers[id];
       log('MSE', `sourceBuffers[${id}].appendBuffer(${data.byteLength} bytes)`);
-      sb.appendBuffer(data);
       return new Promise((resolve, reject) => {
+        try {
+          sb.appendBuffer(data);
+        } catch (e) {
+          reject(e);
+          return;
+        }
         sb.addEventListener('updateend', resolve, { once: true });
         sb.addEventListener('error',     reject,  { once: true });
       });
