@@ -4,8 +4,7 @@ A Rust implementation of MPEG-DASH playback logic, inspired by
 [dash.js](https://github.com/Dash-Industry-Forum/dash.js).
 
 dash-rs provides the core building blocks needed to drive a DASH adaptive
-streaming session from native Rust code — without requiring a browser or any
-JavaScript runtime.
+streaming session from native Rust code.
 
 ---
 
