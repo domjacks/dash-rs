@@ -14,6 +14,9 @@
 
 use async_trait::async_trait;
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String};
+
 use crate::{abr::QualityDecision, session::GapSeekTarget};
 
 // ── IterationSummary ──────────────────────────────────────────────────────────

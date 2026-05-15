@@ -16,6 +16,11 @@
 use crate::manifest::mpd_types::{AdaptationSet, BaseURL, Period};
 use url::Url;
 
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
+#[cfg(not(feature = "std"))]
+use alloc::{string::{String, ToString}, vec::Vec};
+
 /// A resolved CDN candidate URL paired with its blacklist key.
 ///
 /// Returned by [`collect_candidate_base_urls`].  The `service_location` field
@@ -222,8 +227,8 @@ pub(super) fn resolve_effective_base_url(
 ///   come first.  This produces a correctly weighted random permutation.
 fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
     // Group by priority (preserving document order within each group).
-    let mut by_priority: std::collections::BTreeMap<u64, Vec<&BaseURL>> =
-        std::collections::BTreeMap::new();
+    let mut by_priority: alloc::collections::BTreeMap<u64, Vec<&BaseURL>> =
+        alloc::collections::BTreeMap::new();
     for b in bases {
         by_priority.entry(b.priority.unwrap_or(1)).or_default().push(b);
     }

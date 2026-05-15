@@ -12,6 +12,9 @@ pub use decision::{AbrDecisionReason, QualityDecision};
 pub use metrics::AbrMetrics;
 pub use rule::{AbrRule, RepresentationInfo};
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 use crate::abr::{
     abandon_requests::AbandonRequestsRule, buffer::BufferOccupancyRule,
     dropped_frames::DroppedFramesRule, insufficient_buffer::InsufficientBufferRule,

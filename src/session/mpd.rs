@@ -12,6 +12,11 @@ use crate::abr::RepresentationInfo;
 use super::MediaType;
 use super::timeline::count_timeline_segments;
 
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
+#[cfg(not(feature = "std"))]
+use alloc::{string::{String, ToString}, vec::Vec};
+
 // ── Public helpers ────────────────────────────────────────────────────────────
 
 /// Merge `SegmentTemplate` attributes across the DASH element hierarchy.
@@ -154,7 +159,7 @@ pub(super) fn find_adaptation<'a>(
 pub(super) fn extract_segment_timing(
     adaptation: &AdaptationSet,
     period: &Period,
-    presentation_duration: Option<std::time::Duration>,
+    presentation_duration: Option<core::time::Duration>,
 ) -> (u64, f64, Option<u64>) {
     // Use the first representation as a sample; all representations within
     // a track should have the same effective segment duration.
@@ -603,7 +608,7 @@ mod extended_tests {
         // 2-second segments: duration=180000, timescale=90000
         let a = adaptation_with_template(180_000.0, 90_000, 1);
         let (start, dur_ms, total) =
-            extract_segment_timing(&a, &Period::default(), Some(std::time::Duration::from_secs(60)));
+            extract_segment_timing(&a, &Period::default(), Some(core::time::Duration::from_secs(60)));
         assert_eq!(start, 1);
         assert!((dur_ms - 2_000.0).abs() < 1.0, "expected 2000 ms, got {dur_ms}");
         // 60 s / 2 s = 30 segments
@@ -642,7 +647,7 @@ mod extended_tests {
         let (_, _, total) = extract_segment_timing(
             &a,
             &Period::default(),
-            Some(std::time::Duration::from_secs(3600)),
+            Some(core::time::Duration::from_secs(3600)),
         );
         assert!(
             total.is_none(),

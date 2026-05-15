@@ -20,7 +20,10 @@
 //! success.  If every element either fails or is unsupported, the offset
 //! is left at `0.0` (system clock used as-is).
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+
+#[cfg(not(feature = "std"))]
+use alloc::{borrow::ToOwned, string::{String, ToString}, vec::Vec};
 
 use crate::manifest::mpd_types::MPD;
 use url::Url;
@@ -214,7 +217,7 @@ async fn query_http_utc<F: SegmentFetcher>(
     let request = FetchRequest::new(url.clone(), RequestType::ClockSync);
     let response = fetcher.fetch(request).await.ok()?;
 
-    let body = std::str::from_utf8(&response.data).ok()?.trim().to_owned();
+    let body = core::str::from_utf8(&response.data).ok()?.trim().to_owned();
     let server_s = parse_xs_datetime(&body)?;
     Some(server_s - client_now_s)
 }

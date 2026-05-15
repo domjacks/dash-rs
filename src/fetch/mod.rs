@@ -5,6 +5,9 @@ use bytes::Bytes;
 use thiserror::Error;
 use url::Url;
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
+
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during a fetch operation.

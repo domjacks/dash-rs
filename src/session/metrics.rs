@@ -22,7 +22,10 @@
 //! input; it is not a history.  `DashMetrics` is the accumulated history that
 //! the session populates automatically.
 
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+
+#[cfg(not(feature = "std"))]
+use alloc::{string::String, vec::Vec};
 
 use crate::{
     abr::AbrDecisionReason,

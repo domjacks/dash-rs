@@ -24,7 +24,8 @@
 //! Inject a custom clock via [`crate::session::DashSession::from_mpd_with_clock`]
 //! or [`crate::session::DashSession::from_url_with_clock`].
 
-use std::sync::Arc;
+use alloc::sync::Arc;
+#[cfg(feature = "std")]
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -100,10 +101,12 @@ pub trait Clock: Send + Sync {
 /// - [`Clock::unix_s`] calls [`std::time::SystemTime::now()`].
 /// - [`Clock::set_timeout`] uses [`futures_timer::Delay`], which works with
 ///   any async executor without requiring tokio.
+#[cfg(feature = "std")]
 pub struct SystemClock {
     start: std::time::Instant,
 }
 
+#[cfg(feature = "std")]
 impl SystemClock {
     /// Create a new clock anchored at the current instant.
     pub fn new() -> Self {
@@ -118,12 +121,14 @@ impl SystemClock {
     }
 }
 
+#[cfg(feature = "std")]
 impl Default for SystemClock {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(feature = "std")]
 #[async_trait(?Send)]
 impl Clock for SystemClock {
     fn now_ms(&self) -> f64 {

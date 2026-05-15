@@ -2,6 +2,9 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use url::Url;
 
+#[cfg(not(feature = "std"))]
+use alloc::boxed::Box;
+
 use crate::fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
 
 /// A stub [`SegmentFetcher`] that logs every call and immediately returns

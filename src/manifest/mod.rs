@@ -1,7 +1,7 @@
 pub mod mpd_types;
 pub mod parser;
 
-use std::sync::Arc;
+use alloc::sync::Arc;
 
 use url::Url;
 

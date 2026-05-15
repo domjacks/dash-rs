@@ -3,6 +3,9 @@ use crate::{
     media_source::{Chunk, SourceBuffer, TimeRange},
 };
 
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, vec::Vec};
+
 /// The time (seconds) by which `appendWindowStart` is expanded inward to
 /// account for imprecise segment boundaries. Mirrors
 /// `APPEND_WINDOW_START_OFFSET` in `SourceBufferSink.js`.

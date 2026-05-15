@@ -1,4 +1,7 @@
-use std::collections::VecDeque;
+use alloc::collections::VecDeque;
+
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
 
 use crate::abr::{
     metrics::AbrMetrics,

@@ -3,6 +3,9 @@ use crate::abr::{
     rule::{AbrRule, RepresentationInfo},
 };
 
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
+
 /// Target buffer level in ms: the level we aim to maintain.
 const TARGET_BUFFER_MS: f64 = 12_000.0;
 /// Maximum buffer level in ms: above this there is no reason to download more.

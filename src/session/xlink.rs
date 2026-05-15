@@ -17,6 +17,9 @@
 
 use url::Url;
 
+#[cfg(not(feature = "std"))]
+use alloc::{string::{String, ToString}, vec::Vec};
+
 use crate::manifest::mpd_types::{AdaptationSet, MPD, Period};
 
 use crate::{
@@ -51,7 +54,7 @@ pub async fn resolve_xlinks<F: SegmentFetcher>(
 
     for period in &mut mpd.periods {
         period.adaptations = resolve_adaptation_xlinks(
-            std::mem::take(&mut period.adaptations),
+            core::mem::take(&mut period.adaptations),
             base_url,
             fetcher,
         )
@@ -243,7 +246,7 @@ async fn fetch_text<F: SegmentFetcher>(
 ) -> Result<String, crate::fetch::FetchError> {
     let req = FetchRequest::new(url.clone(), RequestType::Manifest);
     let resp = fetcher.fetch(req).await?;
-    let text = std::str::from_utf8(&resp.data)
+    let text = core::str::from_utf8(&resp.data)
         .unwrap_or("")
         .to_owned();
     Ok(text)

@@ -12,7 +12,12 @@
 //! The default cooldown is **600 seconds**, matching
 //! `BlacklistController.BLACKLIST_DURATION` in dash.js.
 
-use std::{collections::HashMap, time::Duration};
+use core::time::Duration;
+
+use hashbrown::HashMap;
+
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
 
 /// Default cooldown duration matching dash.js `BlacklistController.BLACKLIST_DURATION`.
 pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);

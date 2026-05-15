@@ -51,6 +51,9 @@
 
 use bytes::Bytes;
 
+#[cfg(not(feature = "std"))]
+use alloc::{string::{String, ToString}, vec::Vec};
+
 // ── EmsgInfo / parse_all_emsg ─────────────────────────────────────────────────
 
 /// A single DASH event parsed from a `DASHEventMessageBox` (`emsg`,

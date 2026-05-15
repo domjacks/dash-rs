@@ -11,6 +11,9 @@
 /// too much latency.
 const DEFAULT_LIVE_SAFETY_SEGMENTS: u64 = 3;
 
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
+
 /// Compute the segment number to start fetching for a live/dynamic stream.
 ///
 /// Uses the DASH spec §5.3.9.4 formula extended with `@availabilityTimeOffset`:

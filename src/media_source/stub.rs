@@ -1,7 +1,10 @@
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::String, vec::Vec};
 
 use crate::{
     error::DashError,

@@ -1,5 +1,5 @@
-use std::collections::VecDeque;
-use std::time::Duration;
+use alloc::collections::VecDeque;
+use core::time::Duration;
 
 use crate::abr::{
     metrics::AbrMetrics,

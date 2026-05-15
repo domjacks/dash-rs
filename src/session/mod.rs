@@ -34,10 +34,13 @@ mod xlink;
 pub use gap::{GapController, GapControllerSettings, GapSeekReason, GapSeekTarget};
 pub use metrics::{BufferLevelSample, DashMetrics, HttpRequestRecord, RepresentationSwitchRecord};
 
-use std::{
-    collections::HashMap,
-    sync::Arc,
-};
+use alloc::sync::Arc;
+use hashbrown::HashMap;
+
+#[cfg(not(feature = "std"))]
+use alloc::{boxed::Box, string::{String, ToString}, vec::Vec};
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
 
 use async_broadcast;
 use bytes::Bytes;
@@ -81,8 +84,8 @@ pub enum MediaType {
     Audio,
 }
 
-impl std::fmt::Display for MediaType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for MediaType {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             MediaType::Video => write!(f, "video"),
             MediaType::Audio => write!(f, "audio"),
@@ -229,7 +232,7 @@ struct TrackReinit {
 fn compute_track_reinit(
     adaptation: &AdaptationSet,
     period: &Period,
-    presentation_duration: Option<std::time::Duration>,
+    presentation_duration: Option<core::time::Duration>,
 ) -> TrackReinit {
     let representations = extract_representations(adaptation);
     let mime = adaptation_mime_type(adaptation);
@@ -1113,7 +1116,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// candidates, which was the previous behaviour).
     pub fn set_cdn_blacklist_cooldown_ms(&mut self, ms: u64) {
         self.cdn_blacklist
-            .set_cooldown(std::time::Duration::from_millis(ms));
+            .set_cooldown(core::time::Duration::from_millis(ms));
     }
 
     // ── Gap / stall control ───────────────────────────────────────────────────
@@ -2514,7 +2517,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                         wait_ms = seg_dur_ms as u64,
                         "live segment not yet available — waiting one segment duration before retry"
                     );
-                    Delay::new(std::time::Duration::from_millis(seg_dur_ms as u64)).await;
+                    Delay::new(core::time::Duration::from_millis(seg_dur_ms as u64)).await;
                     // Single retry: if still 404, propagate the underlying error.
                     return self.fetch_next_segment_inner(media_type.clone(), metrics).await;
                 }
@@ -2973,7 +2976,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             };
 
             let fetch_result: Result<FetchResponse, DashError> = if let Some(ms) = abandon_ms {
-                let delay = Delay::new(std::time::Duration::from_millis(ms));
+                let delay = Delay::new(core::time::Duration::from_millis(ms));
                 match fut::select(
                     Box::pin(fetcher.fetch(request)),
                     Box::pin(delay),
