@@ -239,8 +239,12 @@ fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
             result.extend(tier);
         } else {
             // Weighted random permutation (Efraimidis–Spirakis).
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
+            use rand::{rngs::SmallRng, Rng, SeedableRng};
+            // Seed from the stack address of a local variable for per-call
+            // variation without requiring OS entropy (no_std compatible).
+            let seed_val = 0u64;
+            let seed_ptr = &seed_val as *const u64 as u64;
+            let mut rng = SmallRng::seed_from_u64(seed_ptr);
             let mut scored: Vec<(f64, &BaseURL)> = tier
                 .iter()
                 .map(|&b| {
@@ -250,7 +254,7 @@ fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
                 })
                 .collect();
             // Higher score = higher priority within the tier.
-            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+            scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(core::cmp::Ordering::Equal));
             result.extend(scored.into_iter().map(|(_, b)| b));
         }
     }

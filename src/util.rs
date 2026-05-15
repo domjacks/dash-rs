@@ -1,5 +1,75 @@
 //! Shared utility functions used across multiple modules.
 
+use core::time::Duration;
+
+#[cfg(not(feature = "std"))]
+use crate::math::FloatExt as _;
+#[cfg(not(feature = "std"))]
+use alloc::string::String;
+
+// ── ISO 8601 duration parser ──────────────────────────────────────────────────
+
+/// Parse an ISO 8601 duration string into a [`Duration`].
+///
+/// Supported format: `P[nY][nM][nW][nD][T[nH][nM][n[.f]S]]`
+///
+/// Years and months are approximated (365.25 days and 30.4375 days
+/// respectively) — acceptable for DASH presentation-duration purposes.
+///
+/// # Examples
+///
+/// ```
+/// use dash_rs::util::parse_iso_duration;
+/// use core::time::Duration;
+///
+/// assert_eq!(parse_iso_duration("PT30S"), Some(Duration::from_secs(30)));
+/// assert_eq!(parse_iso_duration("PT1H"), Some(Duration::from_secs(3_600)));
+/// ```
+pub fn parse_iso_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if !s.starts_with('P') {
+        return None;
+    }
+
+    let mut total_secs: f64 = 0.0;
+    let mut chars = s[1..].chars().peekable(); // skip leading 'P'
+    let mut in_time_part = false;
+
+    while chars.peek().is_some() {
+        // 'T' switches from date designators to time designators.
+        if chars.peek() == Some(&'T') {
+            in_time_part = true;
+            chars.next();
+            continue;
+        }
+
+        // Collect digits and optional decimal point.
+        let mut num_str = String::new();
+        while matches!(chars.peek(), Some('0'..='9') | Some('.')) {
+            num_str.push(chars.next().unwrap());
+        }
+        if num_str.is_empty() {
+            break; // malformed — stop gracefully
+        }
+
+        let num: f64 = num_str.parse().ok()?;
+        let designator = chars.next()?;
+
+        match (in_time_part, designator) {
+            (false, 'Y') => total_secs += num * 365.25 * 86_400.0,
+            (false, 'M') => total_secs += num * 30.4375 * 86_400.0,
+            (false, 'W') => total_secs += num * 7.0 * 86_400.0,
+            (false, 'D') => total_secs += num * 86_400.0,
+            (true, 'H') => total_secs += num * 3_600.0,
+            (true, 'M') => total_secs += num * 60.0,
+            (true, 'S') => total_secs += num,
+            _ => {} // ignore unknown designators
+        }
+    }
+
+    Some(Duration::from_secs_f64(total_secs))
+}
+
 // ── XS datetime parser ────────────────────────────────────────────────────────
 
 /// Parse an XML Schema dateTime string (`YYYY-MM-DDTHH:MM:SS[.sss]Z`) into a
@@ -144,7 +214,72 @@ pub fn parse_xs_datetime(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_xs_datetime;
+    use super::{parse_iso_duration, parse_xs_datetime};
+    use core::time::Duration;
+
+    // ── parse_iso_duration ────────────────────────────────────────────────────
+
+    #[test]
+    fn iso_pt0s() {
+        assert_eq!(parse_iso_duration("PT0S"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn iso_pt30s() {
+        assert_eq!(parse_iso_duration("PT30S"), Some(Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn iso_pt5m30s() {
+        assert_eq!(
+            parse_iso_duration("PT5M30S"),
+            Some(Duration::from_secs(330))
+        );
+    }
+
+    #[test]
+    fn iso_pt1h() {
+        assert_eq!(
+            parse_iso_duration("PT1H"),
+            Some(Duration::from_secs(3_600))
+        );
+    }
+
+    #[test]
+    fn iso_p1d() {
+        assert_eq!(
+            parse_iso_duration("P1D"),
+            Some(Duration::from_secs(86_400))
+        );
+    }
+
+    #[test]
+    fn iso_p1dt2h30m() {
+        assert_eq!(
+            parse_iso_duration("P1DT2H30M"),
+            Some(Duration::from_secs(86_400 + 7_200 + 1_800))
+        );
+    }
+
+    #[test]
+    fn iso_fractional_seconds() {
+        assert_eq!(
+            parse_iso_duration("PT1.5S"),
+            Some(Duration::from_millis(1_500))
+        );
+    }
+
+    #[test]
+    fn iso_empty_returns_none() {
+        assert_eq!(parse_iso_duration(""), None);
+    }
+
+    #[test]
+    fn iso_no_p_prefix_returns_none() {
+        assert_eq!(parse_iso_duration("30S"), None);
+    }
+
+    // ── parse_xs_datetime ─────────────────────────────────────────────────────
 
     #[test]
     fn unix_epoch() {
