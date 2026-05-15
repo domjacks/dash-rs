@@ -42,28 +42,46 @@
 //! # }
 //! ```
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+#[macro_use]
+extern crate alloc;
+
 pub mod abr;
 pub mod clock;
 pub mod error;
 pub mod fetch;
 pub mod manifest;
+pub(crate) mod math;
 pub mod media_source;
 pub mod mp4;
 pub mod session;
 pub mod util;
-mod math;
 mod time;
 
-extern crate alloc;
+#[cfg(not(feature = "std"))]
+mod url_type;
+
+// Conditionally re-export the right `Url` type.
+#[cfg(feature = "std")]
+pub use url::Url;
+#[cfg(not(feature = "std"))]
+pub use url_type::Url;
 
 // Top-level re-exports for the most commonly used types.
 pub use abr::{AbrController, AbrMetrics, QualityDecision};
-pub use clock::{Clock, SystemClock};
+pub use clock::Clock;
+#[cfg(feature = "std")]
+pub use clock::SystemClock;
 pub use error::DashError;
 pub use manifest::MPD;
-pub use mp4::{parse_all_emsg, parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
+pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
+#[cfg(feature = "events")]
+pub use mp4::parse_all_emsg;
+#[cfg(feature = "events")]
+pub use session::DashEvent;
 pub use session::{
-    BufferLevelSample, DashEvent, DashMetrics, DashSession, GapControllerSettings, GapSeekReason,
+    BufferLevelSample, DashMetrics, DashSession, GapControllerSettings, GapSeekReason,
     GapSeekTarget, HttpRequestRecord, MediaType, RepresentationSwitchRecord,
 };
 pub use session::driver::{IterationSummary, PlaybackDriver};
