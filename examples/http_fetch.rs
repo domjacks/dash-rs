@@ -25,7 +25,10 @@ use bytes::Bytes;
 use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     media_source::stub::StubMediaSource,
-    session::{driver::{IterationSummary, PlaybackDriver}, DashSession, MediaType},
+    session::{
+        driver::{IterationSummary, PlaybackDriver},
+        DashSession, MediaType,
+    },
     DashError,
 };
 use url::Url;
@@ -226,13 +229,15 @@ async fn main() -> Result<(), DashError> {
     /// measured throughput back into the ABR controller.
     struct HttpPlaybackDriver {
         throughput_tracker: Arc<AtomicU64>,
-        segments_fetched:   u32,
-        last_transfer_ms:   f64,
+        segments_fetched: u32,
+        last_transfer_ms: f64,
     }
 
     #[async_trait(?Send)]
     impl PlaybackDriver for HttpPlaybackDriver {
-        fn position_s(&self) -> f64 { 0.0 }
+        fn position_s(&self) -> f64 {
+            0.0
+        }
 
         fn should_continue(&self) -> bool {
             self.segments_fetched < SEGMENTS_TO_FETCH
@@ -244,24 +249,32 @@ async fn main() -> Result<(), DashError> {
 
         fn throughput_override_bps(&self) -> Option<f64> {
             let raw = self.throughput_tracker.load(Ordering::Relaxed);
-            if raw == 0 { None } else { Some(f64::from_bits(raw)) }
+            if raw == 0 {
+                None
+            } else {
+                Some(f64::from_bits(raw))
+            }
         }
 
         fn on_iteration(&mut self, s: &IterationSummary<'_>) {
             self.last_transfer_ms = s.last_transfer_ms;
 
-            let (vid_idx, vid_reason) = s.video_decision
+            let (vid_idx, vid_reason) = s
+                .video_decision
                 .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
                 .unwrap_or_else(|| ("done".into(), "-".into()));
-            let (aud_idx, aud_reason) = s.audio_decision
+            let (aud_idx, aud_reason) = s
+                .audio_decision
                 .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
                 .unwrap_or_else(|| ("done".into(), "-".into()));
 
             println!(
                 "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps measured)",
                 self.segments_fetched,
-                vid_idx, vid_reason,
-                aud_idx, aud_reason,
+                vid_idx,
+                vid_reason,
+                aud_idx,
+                aud_reason,
                 s.last_transfer_ms as u64,
                 s.last_throughput_bps / 1_000.0,
             );
@@ -272,8 +285,8 @@ async fn main() -> Result<(), DashError> {
     //    end_of_stream() and returns.
     let mut driver = HttpPlaybackDriver {
         throughput_tracker: Arc::clone(&throughput_tracker),
-        segments_fetched:   0,
-        last_transfer_ms:   0.0,
+        segments_fetched: 0,
+        last_transfer_ms: 0.0,
     };
     session.run(&mut driver).await?;
 

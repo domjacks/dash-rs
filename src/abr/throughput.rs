@@ -140,7 +140,11 @@ impl ThroughputTracker {
         let harmonic = {
             let n = self.samples.len() as f64;
             let sum_inv: f64 = self.samples.iter().map(|&b| 1.0 / b).sum();
-            if sum_inv > 0.0 { n / sum_inv } else { self.fast_ema }
+            if sum_inv > 0.0 {
+                n / sum_inv
+            } else {
+                self.fast_ema
+            }
         };
 
         harmonic.min(self.fast_ema).min(self.slow_ema)
@@ -229,7 +233,11 @@ mod tests {
         // First sample should seed both EWMAs to exactly 10 Mbps.
         // The harmonic mean of one sample is the sample itself.
         // estimate = min(harmonic, fast, slow) = 10 Mbps.
-        assert!((t.estimate() - 10_000_000.0).abs() < 1.0, "estimate = {}", t.estimate());
+        assert!(
+            (t.estimate() - 10_000_000.0).abs() < 1.0,
+            "estimate = {}",
+            t.estimate()
+        );
         assert!(!t.is_empty());
     }
 

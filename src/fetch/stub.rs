@@ -1,6 +1,6 @@
+use crate::Url;
 use async_trait::async_trait;
 use bytes::Bytes;
-use url::Url;
 
 #[cfg(not(feature = "std"))]
 use alloc::boxed::Box;

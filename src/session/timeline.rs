@@ -79,7 +79,10 @@ pub(super) fn snap_to_timeline_grid(segments: &[S], target_ticks: u64) -> Option
 ///
 /// Returns `Some((start_time, duration))` on success, `None` when the timeline
 /// is exhausted (signals EOS for VOD) or is empty.
-pub(super) fn find_timeline_segment(segments: &[S], target_time: Option<u64>) -> Option<(u64, u64)> {
+pub(super) fn find_timeline_segment(
+    segments: &[S],
+    target_time: Option<u64>,
+) -> Option<(u64, u64)> {
     let mut cursor: u64 = 0; // inferred running start time
 
     for (idx, s) in segments.iter().enumerate() {
@@ -98,9 +101,7 @@ pub(super) fn find_timeline_segment(segments: &[S], target_time: Option<u64>) ->
             // The block's upper bound is the explicit `t` of the next S entry,
             // when present — targets at or beyond that point belong to the
             // subsequent entry.
-            let next_explicit_t: Option<u64> = segments
-                .get(idx + 1)
-                .and_then(|next| next.t);
+            let next_explicit_t: Option<u64> = segments.get(idx + 1).and_then(|next| next.t);
 
             match target_time {
                 None => {
@@ -192,7 +193,12 @@ mod tests {
     use crate::manifest::mpd_types::S;
 
     fn s(t: Option<u64>, d: u64, r: Option<i64>) -> S {
-        S { t, d, r, ..Default::default() }
+        S {
+            t,
+            d,
+            r,
+            ..Default::default()
+        }
     }
 
     // ── find_timeline_segment ─────────────────────────────────────────────────
@@ -220,8 +226,14 @@ mod tests {
             s(None, 90_000, None),
         ];
         assert_eq!(find_timeline_segment(&segs, Some(0)), Some((0, 90_000)));
-        assert_eq!(find_timeline_segment(&segs, Some(90_000)), Some((90_000, 90_000)));
-        assert_eq!(find_timeline_segment(&segs, Some(180_000)), Some((180_000, 90_000)));
+        assert_eq!(
+            find_timeline_segment(&segs, Some(90_000)),
+            Some((90_000, 90_000))
+        );
+        assert_eq!(
+            find_timeline_segment(&segs, Some(180_000)),
+            Some((180_000, 90_000))
+        );
     }
 
     /// `t` on a later entry overrides the running cursor.
@@ -238,8 +250,14 @@ mod tests {
     #[test]
     fn repeat_r2() {
         let segs = vec![s(Some(0), 90_000, Some(2))]; // covers 0, 90k, 180k
-        assert_eq!(find_timeline_segment(&segs, Some(90_000)), Some((90_000, 90_000)));
-        assert_eq!(find_timeline_segment(&segs, Some(180_000)), Some((180_000, 90_000)));
+        assert_eq!(
+            find_timeline_segment(&segs, Some(90_000)),
+            Some((90_000, 90_000))
+        );
+        assert_eq!(
+            find_timeline_segment(&segs, Some(180_000)),
+            Some((180_000, 90_000))
+        );
         // Beyond the last repeat → None.
         assert_eq!(find_timeline_segment(&segs, Some(270_000)), None);
     }
@@ -255,7 +273,10 @@ mod tests {
         // First occurrence.
         assert_eq!(find_timeline_segment(&segs, Some(0)), Some((0, 90_000)));
         // Second occurrence (simulates next_segment_time = 0 + 90_000).
-        assert_eq!(find_timeline_segment(&segs, Some(90_000)), Some((90_000, 90_000)));
+        assert_eq!(
+            find_timeline_segment(&segs, Some(90_000)),
+            Some((90_000, 90_000))
+        );
         // Far-future occurrence (simulates many segments later).
         assert_eq!(
             find_timeline_segment(&segs, Some(90_000 * 5)),
@@ -349,7 +370,7 @@ mod tests {
     #[test]
     fn snap_epoch_scale_r_minus_one() {
         let t_start: u64 = 83_855_000_000_000; // epoch-scale start of live window
-        let d: u64 = 184_320;                  // BBC segment duration in ticks
+        let d: u64 = 184_320; // BBC segment duration in ticks
         let segs = vec![s(Some(t_start), d, Some(-1))];
 
         // Exact aligned target.
@@ -383,7 +404,11 @@ mod tests {
     /// Three plain entries (no r) → count 3.
     #[test]
     fn count_plain_entries() {
-        let segs = vec![s(Some(0), 90_000, None), s(None, 90_000, None), s(None, 90_000, None)];
+        let segs = vec![
+            s(Some(0), 90_000, None),
+            s(None, 90_000, None),
+            s(None, 90_000, None),
+        ];
         assert_eq!(count_timeline_segments(&segs), 3);
     }
 

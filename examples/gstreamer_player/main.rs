@@ -62,7 +62,10 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
-    session::{driver::{IterationSummary, PlaybackDriver}, DashSession, MediaType},
+    session::{
+        driver::{IterationSummary, PlaybackDriver},
+        DashSession, MediaType,
+    },
     DashError,
 };
 use gst::prelude::*;
@@ -241,27 +244,38 @@ async fn run_session(
     /// - Enables buffer pruning so old data is evicted from GStreamer's appsrc.
     /// - Pushes a console progress row after every segment pair.
     struct GstPlaybackDriver {
-        is_paused:         Arc<AtomicBool>,
+        is_paused: Arc<AtomicBool>,
         throughput_tracker: Arc<AtomicU64>,
         /// Session's estimated playback position — updated at iteration start.
-        cached_pos_s:      f64,
-        seg:               u32,
+        cached_pos_s: f64,
+        seg: u32,
     }
 
     impl GstPlaybackDriver {
         fn new(is_paused: Arc<AtomicBool>, throughput_tracker: Arc<AtomicU64>) -> Self {
-            Self { is_paused, throughput_tracker, cached_pos_s: 0.0, seg: 0 }
+            Self {
+                is_paused,
+                throughput_tracker,
+                cached_pos_s: 0.0,
+                seg: 0,
+            }
         }
     }
 
     #[async_trait(?Send)]
     impl PlaybackDriver for GstPlaybackDriver {
-        fn position_s(&self) -> f64 { self.cached_pos_s }
+        fn position_s(&self) -> f64 {
+            self.cached_pos_s
+        }
 
-        fn is_paused(&self) -> bool { self.is_paused.load(Ordering::Relaxed) }
+        fn is_paused(&self) -> bool {
+            self.is_paused.load(Ordering::Relaxed)
+        }
 
         fn throughput_override_bps(&self) -> Option<f64> {
-            Some(f64::from_bits(self.throughput_tracker.load(Ordering::Relaxed)))
+            Some(f64::from_bits(
+                self.throughput_tracker.load(Ordering::Relaxed),
+            ))
         }
 
         fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {
@@ -275,7 +289,9 @@ async fn run_session(
             }
         }
 
-        fn enable_pruning(&self) -> bool { true }
+        fn enable_pruning(&self) -> bool {
+            true
+        }
 
         fn on_iteration_start(&mut self, session_position_s: f64) {
             self.cached_pos_s = session_position_s;
@@ -284,20 +300,34 @@ async fn run_session(
 
         fn on_iteration(&mut self, s: &IterationSummary<'_>) {
             let measured_bps = f64::from_bits(self.throughput_tracker.load(Ordering::Relaxed));
-            let buf_ms = if s.video_buffer_ms > 0.0 { s.video_buffer_ms } else { s.audio_buffer_ms };
+            let buf_ms = if s.video_buffer_ms > 0.0 {
+                s.video_buffer_ms
+            } else {
+                s.audio_buffer_ms
+            };
 
-            let (vid_idx, vid_reason, video_ms) = s.video_decision
-                .map(|d| (d.index.to_string(), format!("{:?}", d.reason), s.last_transfer_ms as u128))
+            let (vid_idx, vid_reason, video_ms) = s
+                .video_decision
+                .map(|d| {
+                    (
+                        d.index.to_string(),
+                        format!("{:?}", d.reason),
+                        s.last_transfer_ms as u128,
+                    )
+                })
                 .unwrap_or_else(|| ("done".into(), "-".into(), 0));
-            let (aud_idx, aud_reason) = s.audio_decision
+            let (aud_idx, aud_reason) = s
+                .audio_decision
                 .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
                 .unwrap_or_else(|| ("done".into(), "-".into()));
 
             println!(
                 "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
                 self.seg,
-                vid_idx, vid_reason,
-                aud_idx, aud_reason,
+                vid_idx,
+                vid_reason,
+                aud_idx,
+                aud_reason,
                 buf_ms / 1_000.0,
                 video_ms,
                 measured_bps / 1_000.0,

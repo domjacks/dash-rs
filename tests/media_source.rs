@@ -273,7 +273,10 @@ async fn update_append_window_basic() {
     //   appendWindowStart = max(10 − 0.1, 0) = 9.9
     //   appendWindowEnd   = 10 + 30 + 0.01 = 40.01
     sink.update_append_window(
-        &StreamInfo { start: 10.0, duration: Some(30.0) },
+        &StreamInfo {
+            start: 10.0,
+            duration: Some(30.0),
+        },
         None,
     );
 
@@ -298,7 +301,10 @@ async fn update_append_window_clamps_start_at_zero() {
 
     // period start=0.05 s → start − 0.1 = −0.05 → clamped to 0.0
     sink.update_append_window(
-        &StreamInfo { start: 0.05, duration: Some(10.0) },
+        &StreamInfo {
+            start: 0.05,
+            duration: Some(10.0),
+        },
         None,
     );
 
@@ -319,7 +325,10 @@ async fn update_append_window_no_duration_falls_back_to_source_duration() {
     // No period duration → use media_source_duration.
     // appendWindowEnd = 60.0 + 0.01 = 60.01
     sink.update_append_window(
-        &StreamInfo { start: 0.0, duration: None },
+        &StreamInfo {
+            start: 0.0,
+            duration: None,
+        },
         Some(60.0),
     );
 
@@ -338,7 +347,10 @@ async fn update_append_window_no_duration_no_source_duration_is_infinity() {
     let mut sink = SourceBufferSink::new(inner);
 
     sink.update_append_window(
-        &StreamInfo { start: 0.0, duration: None },
+        &StreamInfo {
+            start: 0.0,
+            duration: None,
+        },
         None,
     );
 
@@ -358,7 +370,10 @@ async fn update_append_window_infinite_period_duration_falls_back() {
 
     // Infinite period duration treated like None → use media_source_duration.
     sink.update_append_window(
-        &StreamInfo { start: 0.0, duration: Some(f64::INFINITY) },
+        &StreamInfo {
+            start: 0.0,
+            duration: Some(f64::INFINITY),
+        },
         Some(30.0),
     );
 
@@ -380,7 +395,10 @@ async fn sink_abort_restores_append_window() {
 
     // Set a non-default append window.
     sink.update_append_window(
-        &StreamInfo { start: 5.0, duration: Some(20.0) },
+        &StreamInfo {
+            start: 5.0,
+            duration: Some(20.0),
+        },
         None,
     );
     let saved_start = sink.append_window_start();
@@ -429,12 +447,22 @@ async fn stub_remove_non_overlapping_preserved() {
     let mut buf = StubSourceBuffer::new("video/mp4");
 
     // Two non-overlapping chunks.
-    buf.append_buffer(Chunk::new(Bytes::from_static(b"a"), Some(0.0), Some(2.0), "s1"))
-        .await
-        .unwrap();
-    buf.append_buffer(Chunk::new(Bytes::from_static(b"b"), Some(8.0), Some(10.0), "s2"))
-        .await
-        .unwrap();
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"a"),
+        Some(0.0),
+        Some(2.0),
+        "s1",
+    ))
+    .await
+    .unwrap();
+    buf.append_buffer(Chunk::new(
+        Bytes::from_static(b"b"),
+        Some(8.0),
+        Some(10.0),
+        "s2",
+    ))
+    .await
+    .unwrap();
 
     // Remove a range that overlaps neither chunk.
     buf.remove(3.0, 6.0).await.unwrap();

@@ -353,7 +353,11 @@ fn switch_history_capacity_capped_at_4() {
 
     // Should not panic, and the most-recent switch is fresh → clamp active.
     let result = rule.max_index(&reps, &metrics);
-    assert_eq!(result, Some(1), "should clamp to current_index after recent switch");
+    assert_eq!(
+        result,
+        Some(1),
+        "should clamp to current_index after recent switch"
+    );
 }
 
 // ── InsufficientBufferRule — exact threshold boundary ────────────────────────

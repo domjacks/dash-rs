@@ -11,29 +11,29 @@ use dash_rs::{
     session::driver::{IterationSummary, PlaybackDriver},
     GapSeekTarget,
 };
-use wasm_bindgen::JsValue;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 
 use crate::bridge::JsBridge;
 
 // ── WasmPlaybackDriver ────────────────────────────────────────────────────────
 
 pub(crate) struct WasmPlaybackDriver {
-    bridge:          JsBridge,
+    bridge: JsBridge,
     /// Cached video representation count (for the status JSON).
     video_rep_count: u32,
     /// Cached audio representation count (for the status JSON).
     audio_rep_count: u32,
     /// Whether the session is a live stream (for the status JSON).
-    is_live:         bool,
+    is_live: bool,
 }
 
 impl WasmPlaybackDriver {
     pub(crate) fn new(
-        bridge:          &JsBridge,
+        bridge: &JsBridge,
         video_rep_count: u32,
         audio_rep_count: u32,
-        is_live:         bool,
+        is_live: bool,
     ) -> Self {
         Self {
             bridge: JsValue::clone(bridge.as_ref()).unchecked_into(),
@@ -61,9 +61,9 @@ impl PlaybackDriver for WasmPlaybackDriver {
     fn on_iteration(&mut self, s: &IterationSummary<'_>) {
         // Build a compact JSON status string and push it to the JS debug panel.
         // All values are primitive scalars — no serde dependency needed.
-        let vi   = s.video_decision.map_or(0, |d| d.index) as u32;
+        let vi = s.video_decision.map_or(0, |d| d.index) as u32;
         let vbps = s.video_bandwidth;
-        let ai   = s.audio_decision.map_or(0, |d| d.index) as u32;
+        let ai = s.audio_decision.map_or(0, |d| d.index) as u32;
         let abps = s.audio_bandwidth;
 
         // Strip characters that would break the JSON string value.
@@ -71,13 +71,13 @@ impl PlaybackDriver for WasmPlaybackDriver {
 
         let json = format!(
             r#"{{"vi":{vi},"vc":{vc},"vbps":{vbps},"vbuf":{vbuf:.1},"ai":{ai},"ac":{ac},"abps":{abps},"abuf":{abuf:.1},"hc":{hc},"sc":{sc},"url":"{url_safe}","tms":{tms:.1},"tbps":{tbps:.0},"live":{live}}}"#,
-            vc   = self.video_rep_count,
+            vc = self.video_rep_count,
             vbuf = s.video_buffer_ms,
-            ac   = self.audio_rep_count,
+            ac = self.audio_rep_count,
             abuf = s.audio_buffer_ms,
-            hc   = s.http_request_count,
-            sc   = s.switch_count,
-            tms  = s.last_transfer_ms,
+            hc = s.http_request_count,
+            sc = s.switch_count,
+            tms = s.last_transfer_ms,
             tbps = s.last_throughput_bps,
             live = self.is_live,
         );

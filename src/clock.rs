@@ -24,6 +24,7 @@
 //! Inject a custom clock via [`crate::session::DashSession::from_mpd_with_clock`]
 //! or [`crate::session::DashSession::from_url_with_clock`].
 
+use alloc::boxed::Box;
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::time::Duration;

@@ -4,7 +4,12 @@ use crate::{
 };
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 /// The time (seconds) by which `appendWindowStart` is expanded inward to
 /// account for imprecise segment boundaries. Mirrors

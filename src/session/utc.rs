@@ -23,10 +23,14 @@
 use alloc::sync::Arc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, string::{String, ToString}, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 use crate::manifest::mpd_types::MPD;
-use url::Url;
+use crate::Url;
 
 use crate::{
     fetch::{FetchRequest, RequestType, SegmentFetcher},
@@ -84,8 +88,7 @@ pub(crate) async fn resolve_utc_timing<F: SegmentFetcher>(
                 if let Some(url_str) = &entry.value {
                     match Url::parse(url_str) {
                         Ok(url) => {
-                            if let Some(offset) =
-                                query_http_utc(&url, fetcher, client_now_s).await
+                            if let Some(offset) = query_http_utc(&url, fetcher, client_now_s).await
                             {
                                 tracing::info!(
                                     scheme,
@@ -367,11 +370,7 @@ mod tests {
     #[test]
     fn rfc2822_all_months_are_recognised() {
         // Spot-check a few months to ensure the match arms are all present.
-        for (mon, day, expected_month_num) in [
-            ("Jan", 1u64, 1u64),
-            ("Jun", 1, 6),
-            ("Dec", 1, 12),
-        ] {
+        for (mon, day, expected_month_num) in [("Jan", 1u64, 1u64), ("Jun", 1, 6), ("Dec", 1, 12)] {
             let s = format!("01 {mon} 1970 00:00:00 GMT");
             let ts = parse_rfc2822_date(&s).unwrap_or_else(|| panic!("failed for month {mon}"));
             // Rough sanity check: the month offset in seconds should be positive.

@@ -105,25 +105,39 @@ async fn main() -> Result<(), DashError> {
 
     #[async_trait(?Send)]
     impl PlaybackDriver for BasicPlaybackDriver {
-        fn position_s(&self) -> f64 { (self.seg as f64) * 4.0 }
+        fn position_s(&self) -> f64 {
+            (self.seg as f64) * 4.0
+        }
 
-        fn should_continue(&self) -> bool { self.seg < 5 }
+        fn should_continue(&self) -> bool {
+            self.seg < 5
+        }
 
-        fn on_iteration_start(&mut self, _pos: f64) { self.seg += 1; }
+        fn on_iteration_start(&mut self, _pos: f64) {
+            self.seg += 1;
+        }
 
         fn throughput_override_bps(&self) -> Option<f64> {
             Some(1_200_000.0 + (self.seg as f64) * 400_000.0)
         }
 
         fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-            let vid = s.video_decision.map(|d| (d.index, format!("{:?}", d.reason)));
-            let aud = s.audio_decision.map(|d| (d.index, format!("{:?}", d.reason)));
+            let vid = s
+                .video_decision
+                .map(|d| (d.index, format!("{:?}", d.reason)));
+            let aud = s
+                .audio_decision
+                .map(|d| (d.index, format!("{:?}", d.reason)));
             println!(
                 "  seg {}: video quality={} ({:?}), audio quality={} ({:?})",
                 self.seg,
-                vid.as_ref().map(|(i, _)| i.to_string()).unwrap_or_else(|| "done".into()),
+                vid.as_ref()
+                    .map(|(i, _)| i.to_string())
+                    .unwrap_or_else(|| "done".into()),
                 vid.as_ref().map(|(_, r)| r.as_str()).unwrap_or("-"),
-                aud.as_ref().map(|(i, _)| i.to_string()).unwrap_or_else(|| "done".into()),
+                aud.as_ref()
+                    .map(|(i, _)| i.to_string())
+                    .unwrap_or_else(|| "done".into()),
                 aud.as_ref().map(|(_, r)| r.as_str()).unwrap_or("-"),
             );
         }

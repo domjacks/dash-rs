@@ -21,14 +21,18 @@ use crate::bridge::{js_err, JsBridge};
 // ── BridgeSourceBuffer ────────────────────────────────────────────────────────
 
 pub(crate) struct BridgeSourceBuffer {
-    bridge:    JsBridge,
-    sb_id:     String,
+    bridge: JsBridge,
+    sb_id: String,
     mime_type: String,
 }
 
 impl BridgeSourceBuffer {
     pub(crate) fn new(bridge: JsBridge, sb_id: String, mime_type: String) -> Self {
-        Self { bridge, sb_id, mime_type }
+        Self {
+            bridge,
+            sb_id,
+            mime_type,
+        }
     }
 }
 

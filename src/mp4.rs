@@ -52,7 +52,10 @@
 use bytes::Bytes;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::{String, ToString}, vec::Vec};
+use alloc::{
+    string::{String, ToString},
+    vec::Vec,
+};
 
 // ── EmsgInfo / parse_all_emsg ─────────────────────────────────────────────────
 
@@ -325,7 +328,6 @@ fn read_cstring(data: &[u8]) -> Option<(String, &[u8])> {
     let s = String::from_utf8_lossy(&data[..nul]).into_owned();
     Some((s, &data[nul + 1..]))
 }
-
 
 ///
 /// All times are in **seconds** relative to the stream's presentation
@@ -610,25 +612,23 @@ fn parse_sidx_entries_fullbox(data: &[u8], index_end_offset: u64) -> Option<Vec<
         return None;
     }
 
-    let (earliest_presentation_time, first_offset, refs_start): (u64, u64, usize) =
-        if version == 0 {
-            let ept = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as u64;
-            let fo = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as u64;
-            (ept, fo, 24)
-        } else {
-            if data.len() < 32 {
-                return None;
-            }
-            let ept = u64::from_be_bytes([
-                data[12], data[13], data[14], data[15],
-                data[16], data[17], data[18], data[19],
-            ]);
-            let fo = u64::from_be_bytes([
-                data[20], data[21], data[22], data[23],
-                data[24], data[25], data[26], data[27],
-            ]);
-            (ept, fo, 32)
-        };
+    let (earliest_presentation_time, first_offset, refs_start): (u64, u64, usize) = if version == 0
+    {
+        let ept = u32::from_be_bytes([data[12], data[13], data[14], data[15]]) as u64;
+        let fo = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as u64;
+        (ept, fo, 24)
+    } else {
+        if data.len() < 32 {
+            return None;
+        }
+        let ept = u64::from_be_bytes([
+            data[12], data[13], data[14], data[15], data[16], data[17], data[18], data[19],
+        ]);
+        let fo = u64::from_be_bytes([
+            data[20], data[21], data[22], data[23], data[24], data[25], data[26], data[27],
+        ]);
+        (ept, fo, 32)
+    };
 
     let rc_off = refs_start - 2;
     let reference_count = u16::from_be_bytes([data[rc_off], data[rc_off + 1]]) as usize;
@@ -652,8 +652,7 @@ fn parse_sidx_entries_fullbox(data: &[u8], index_end_offset: u64) -> Option<Vec<
         let word0 = u32::from_be_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
         let referenced_size = word0 & 0x7FFF_FFFF;
         let subseg_dur =
-            u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]])
-                as u64;
+            u32::from_be_bytes([data[off + 4], data[off + 5], data[off + 6], data[off + 7]]) as u64;
 
         entries.push(SidxEntry {
             byte_offset: current_byte,
@@ -740,21 +739,37 @@ pub fn parse_prft(data: &[u8]) -> Option<ProducerReferenceTime> {
     }
     let version = payload[0];
     // Minimum payload after version+flags: ref_id(4) + ntp(8) + media_time(4 or 8).
-    let min_len = if version == 0 { 4 + 4 + 8 + 4 } else { 4 + 4 + 8 + 8 };
+    let min_len = if version == 0 {
+        4 + 4 + 8 + 4
+    } else {
+        4 + 4 + 8 + 8
+    };
     if payload.len() < min_len {
         return None;
     }
     let reference_track_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
     let ntp_timestamp = u64::from_be_bytes([
-        payload[8], payload[9], payload[10], payload[11],
-        payload[12], payload[13], payload[14], payload[15],
+        payload[8],
+        payload[9],
+        payload[10],
+        payload[11],
+        payload[12],
+        payload[13],
+        payload[14],
+        payload[15],
     ]);
     let media_time = if version == 0 {
         u32::from_be_bytes([payload[16], payload[17], payload[18], payload[19]]) as u64
     } else {
         u64::from_be_bytes([
-            payload[16], payload[17], payload[18], payload[19],
-            payload[20], payload[21], payload[22], payload[23],
+            payload[16],
+            payload[17],
+            payload[18],
+            payload[19],
+            payload[20],
+            payload[21],
+            payload[22],
+            payload[23],
         ])
     };
 
@@ -785,7 +800,8 @@ mod tests {
     ///   ept(4) first_offset(4) reserved(2) ref_count(2)
     ///   [ ref_type_and_size(4) duration(4) sap(4) ] × ref_count
     fn make_sidx_v0(timescale: u32, ept: u32, durations: &[u32]) -> Vec<u8> {
-        let ref_count = durations.len() as u16;        let size: u32 = 32 + 12 * ref_count as u32;
+        let ref_count = durations.len() as u16;
+        let size: u32 = 32 + 12 * ref_count as u32;
         let mut buf = Vec::with_capacity(size as usize);
 
         buf.extend_from_slice(&size.to_be_bytes());
@@ -1075,7 +1091,15 @@ mod tests {
 
     #[test]
     fn emsg_v0_basic_fields() {
-        let data = make_emsg_v0("urn:scte:scte35:2014:xml+bin", "1", 90_000, 180_000, 270_000, 7, b"payload");
+        let data = make_emsg_v0(
+            "urn:scte:scte35:2014:xml+bin",
+            "1",
+            90_000,
+            180_000,
+            270_000,
+            7,
+            b"payload",
+        );
         let events = parse_all_emsg(&data);
         assert_eq!(events.len(), 1);
         let e = &events[0];
@@ -1083,7 +1107,11 @@ mod tests {
         assert_eq!(e.scheme_id_uri, "urn:scte:scte35:2014:xml+bin");
         assert_eq!(e.value, "1");
         // presentation_time_delta=180000, timescale=90000 → 2.0 s
-        assert!((e.presentation_time_s - 2.0).abs() < 1e-9, "pt={}", e.presentation_time_s);
+        assert!(
+            (e.presentation_time_s - 2.0).abs() < 1e-9,
+            "pt={}",
+            e.presentation_time_s
+        );
         // event_duration=270000, timescale=90000 → 3.0 s
         assert!((e.duration_s - 3.0).abs() < 1e-9, "dur={}", e.duration_s);
         assert_eq!(e.id, 7);
@@ -1100,7 +1128,11 @@ mod tests {
         assert_eq!(e.version, 1);
         assert_eq!(e.scheme_id_uri, "urn:example:test");
         assert_eq!(e.value, "val");
-        assert!((e.presentation_time_s - 5.0).abs() < 1e-9, "pt={}", e.presentation_time_s);
+        assert!(
+            (e.presentation_time_s - 5.0).abs() < 1e-9,
+            "pt={}",
+            e.presentation_time_s
+        );
         assert!((e.duration_s - 2.0).abs() < 1e-9, "dur={}", e.duration_s);
         assert_eq!(e.id, 42);
         assert_eq!(&e.message_data[..], b"hello");
@@ -1111,7 +1143,10 @@ mod tests {
         let data = make_emsg_v0("urn:x", "", 1000, 0, 0xFFFF_FFFF, 1, b"");
         let events = parse_all_emsg(&data);
         assert_eq!(events.len(), 1);
-        assert!(events[0].duration_s.is_infinite(), "expected INFINITY for 0xFFFFFFFF event_duration");
+        assert!(
+            events[0].duration_s.is_infinite(),
+            "expected INFINITY for 0xFFFFFFFF event_duration"
+        );
     }
 
     #[test]
@@ -1149,9 +1184,8 @@ mod tests {
     fn emsg_mixed_with_other_boxes() {
         // Real segments: styp + sidx + emsg.  Both sidx and emsg should parse.
         let styp: &[u8] = &[
-            0, 0, 0, 20, b's', b't', b'y', b'p',
-            b'd', b'a', b's', b'h', 0, 0, 0, 0,
-            b'd', b'a', b's', b'h',
+            0, 0, 0, 20, b's', b't', b'y', b'p', b'd', b'a', b's', b'h', 0, 0, 0, 0, b'd', b'a',
+            b's', b'h',
         ];
         let sidx = make_sidx_v0(1000, 0, &[2000]);
         let emsg = make_emsg_v1("urn:test", "", 1000, 500, 1000, 9, b"data");
@@ -1253,8 +1287,11 @@ mod tests {
         assert_eq!(prft.ntp_timestamp, ntp_ts);
         assert_eq!(prft.media_time, 48_000);
         // wall_clock_s = 3913056000 - 2208988800 = 1704067200
-        assert!((prft.wall_clock_s - 1_704_067_200.0).abs() < 1.0,
-            "wall_clock_s = {}", prft.wall_clock_s);
+        assert!(
+            (prft.wall_clock_s - 1_704_067_200.0).abs() < 1.0,
+            "wall_clock_s = {}",
+            prft.wall_clock_s
+        );
     }
 
     #[test]
@@ -1279,8 +1316,11 @@ mod tests {
         let data = make_prft_v0(1, ntp_ts, 0);
         let prft = parse_prft(&data).unwrap();
         // wall_clock_s should be 1704067200.5 approximately
-        assert!((prft.wall_clock_s - 1_704_067_200.5).abs() < 1e-6,
-            "wall_clock_s = {}", prft.wall_clock_s);
+        assert!(
+            (prft.wall_clock_s - 1_704_067_200.5).abs() < 1e-6,
+            "wall_clock_s = {}",
+            prft.wall_clock_s
+        );
     }
 
     #[test]
@@ -1410,13 +1450,8 @@ mod tests {
     fn emsg_v0_zero_timescale_skipped() {
         // Build a v0 emsg with timescale=0; the parser should skip it.
         let mut data = make_emsg_v0(
-            "urn:test",
-            "value",
-            0,   // timescale = 0 ← should be skipped
-            0,
-            1000,
-            0,
-            b"",
+            "urn:test", "value", 0, // timescale = 0 ← should be skipped
+            0, 1000, 0, b"",
         );
         // The `make_emsg_v0` helper already sets timescale=0 above;
         // just verify the result.

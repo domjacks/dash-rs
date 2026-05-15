@@ -56,8 +56,8 @@ pub(crate) mod math;
 pub mod media_source;
 pub mod mp4;
 pub mod session;
-pub mod util;
 mod time;
+pub mod util;
 
 #[cfg(not(feature = "std"))]
 mod url_type;
@@ -75,13 +75,13 @@ pub use clock::Clock;
 pub use clock::SystemClock;
 pub use error::DashError;
 pub use manifest::MPD;
-pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 #[cfg(feature = "events")]
 pub use mp4::parse_all_emsg;
+pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
+pub use session::driver::{IterationSummary, PlaybackDriver};
 #[cfg(feature = "events")]
 pub use session::DashEvent;
 pub use session::{
     BufferLevelSample, DashMetrics, DashSession, GapControllerSettings, GapSeekReason,
     GapSeekTarget, HttpRequestRecord, MediaType, RepresentationSwitchRecord,
 };
-pub use session::driver::{IterationSummary, PlaybackDriver};

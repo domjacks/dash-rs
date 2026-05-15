@@ -17,7 +17,7 @@ use core::time::Duration;
 use hashbrown::HashMap;
 
 #[cfg(not(feature = "std"))]
-use alloc::string::String;
+use alloc::{borrow::ToOwned, string::String};
 
 /// Default cooldown duration matching dash.js `BlacklistController.BLACKLIST_DURATION`.
 pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
@@ -76,7 +76,11 @@ impl CdnBlacklist {
     pub(super) fn record_failure(&mut self, key: &str) {
         let expiry = crate::time::mono_ms() + self.cooldown.as_secs_f64() * 1_000.0;
         self.entries.insert(key.to_owned(), expiry);
-        tracing::debug!(key, cooldown_s = self.cooldown.as_secs_f64(), "CDN blacklisted");
+        tracing::debug!(
+            key,
+            cooldown_s = self.cooldown.as_secs_f64(),
+            "CDN blacklisted"
+        );
     }
 
     /// Remove entries whose cooldown has already elapsed.
@@ -108,7 +112,10 @@ mod tests {
         let mut bl = CdnBlacklist::new();
         bl.record_failure("cdn1");
         assert!(bl.is_blacklisted("cdn1"));
-        assert!(!bl.is_blacklisted("cdn2"), "unrelated key must not be affected");
+        assert!(
+            !bl.is_blacklisted("cdn2"),
+            "unrelated key must not be affected"
+        );
     }
 
     #[test]
@@ -116,9 +123,15 @@ mod tests {
         let mut bl = CdnBlacklist::new();
         bl.set_cooldown(Duration::from_millis(5));
         bl.record_failure("cdn1");
-        assert!(bl.is_blacklisted("cdn1"), "should be blacklisted immediately after failure");
+        assert!(
+            bl.is_blacklisted("cdn1"),
+            "should be blacklisted immediately after failure"
+        );
         thread::sleep(Duration::from_millis(10));
-        assert!(!bl.is_blacklisted("cdn1"), "should have expired after cooldown");
+        assert!(
+            !bl.is_blacklisted("cdn1"),
+            "should have expired after cooldown"
+        );
     }
 
     #[test]
@@ -155,7 +168,10 @@ mod tests {
         bl.set_cooldown(Duration::from_secs(600));
         bl.record_failure("cdn1");
         bl.evict_expired();
-        assert!(bl.is_blacklisted("cdn1"), "live entry must survive evict_expired");
+        assert!(
+            bl.is_blacklisted("cdn1"),
+            "live entry must survive evict_expired"
+        );
     }
 
     #[test]
@@ -165,6 +181,9 @@ mod tests {
         assert_eq!(bl.cooldown(), Duration::from_millis(1));
         bl.record_failure("cdn1");
         thread::sleep(Duration::from_millis(5));
-        assert!(!bl.is_blacklisted("cdn1"), "short cooldown should expire quickly");
+        assert!(
+            !bl.is_blacklisted("cdn1"),
+            "short cooldown should expire quickly"
+        );
     }
 }

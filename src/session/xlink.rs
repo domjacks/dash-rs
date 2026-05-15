@@ -15,12 +15,17 @@
 //! * `href="urn:mpeg:dash:resolve-to-zero:2013"` — the element is removed from
 //!   the manifest.
 
-use url::Url;
+use crate::Url;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::{String, ToString}, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 
-use crate::manifest::mpd_types::{AdaptationSet, MPD, Period};
+use crate::manifest::mpd_types::{AdaptationSet, Period, MPD};
 
 use crate::{
     error::DashError,
@@ -53,12 +58,9 @@ pub async fn resolve_xlinks<F: SegmentFetcher>(
     mpd.periods = resolve_period_xlinks(mpd.periods, base_url, fetcher).await?;
 
     for period in &mut mpd.periods {
-        period.adaptations = resolve_adaptation_xlinks(
-            core::mem::take(&mut period.adaptations),
-            base_url,
-            fetcher,
-        )
-        .await?;
+        period.adaptations =
+            resolve_adaptation_xlinks(core::mem::take(&mut period.adaptations), base_url, fetcher)
+                .await?;
     }
 
     Ok(mpd)
@@ -233,7 +235,10 @@ fn check_xlink(href: &Option<String>, actuate: &Option<String>, base_url: &Url) 
     match url {
         Some(u) => XLinkAction::Fetch(u),
         None => {
-            tracing::warn!(href = href_str, "xlink: could not resolve href to a URL — skipping");
+            tracing::warn!(
+                href = href_str,
+                "xlink: could not resolve href to a URL — skipping"
+            );
             XLinkAction::Skip
         }
     }
@@ -246,9 +251,7 @@ async fn fetch_text<F: SegmentFetcher>(
 ) -> Result<String, crate::fetch::FetchError> {
     let req = FetchRequest::new(url.clone(), RequestType::Manifest);
     let resp = fetcher.fetch(req).await?;
-    let text = core::str::from_utf8(&resp.data)
-        .unwrap_or("")
-        .to_owned();
+    let text = core::str::from_utf8(&resp.data).unwrap_or("").to_owned();
     Ok(text)
 }
 

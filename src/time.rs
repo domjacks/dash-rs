@@ -17,15 +17,21 @@
 ///
 /// Only deltas between two calls matter — the absolute base is arbitrary.
 pub(crate) fn mono_ms() -> f64 {
-    #[cfg(not(target_arch = "wasm32"))]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "std"))]
     {
         use std::sync::OnceLock;
         use std::time::Instant;
         static START: OnceLock<Instant> = OnceLock::new();
         START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1_000.0
     }
-    #[cfg(target_arch = "wasm32")]
+    #[cfg(all(target_arch = "wasm32", feature = "std"))]
     {
         js_sys::Date::now()
+    }
+    // In no_std (any arch): return 0.0 (only deltas are used; callers
+    // that need real time must supply a custom Clock implementation).
+    #[cfg(not(feature = "std"))]
+    {
+        0.0
     }
 }

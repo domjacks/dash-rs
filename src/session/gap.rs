@@ -515,7 +515,7 @@ mod tests {
         assert!(gc.tick(2.0, &buf, false).is_none()); // tick 1 (last_pos = None, no stall yet)
         assert!(gc.tick(2.0, &buf, false).is_none()); // tick 2 (stall_ticks = 1)
         assert!(gc.tick(2.0, &buf, false).is_none()); // tick 3 (stall_ticks = 2)
-        // Tick 4: stall_ticks reaches 3 → stall declared → StallRecovery.
+                                                      // Tick 4: stall_ticks reaches 3 → stall declared → StallRecovery.
         let target = gc.tick(2.0, &buf, false);
         assert!(target.is_some());
         let t = target.unwrap();
@@ -576,7 +576,7 @@ mod tests {
         let buf = ranges(&[(0.0, 3.0), (4.0, 8.0)]);
         gc.tick(3.05, &buf, false); // emits target
         gc.on_seek(); // simulate seek completed
-        // After on_seek, the same gap can be jumped again if encountered.
+                      // After on_seek, the same gap can be jumped again if encountered.
         assert!(gc.tick(3.05, &buf, false).is_some());
     }
 

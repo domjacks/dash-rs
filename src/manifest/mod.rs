@@ -3,7 +3,15 @@ pub mod parser;
 
 use alloc::sync::Arc;
 
-use url::Url;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
+
+use crate::Url;
 
 use crate::{
     error::DashError,

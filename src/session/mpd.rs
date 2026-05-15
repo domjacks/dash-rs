@@ -6,16 +6,22 @@
 //! Mirrors `MpdHelper.js`, `DashManifestModel.js`, and parts of
 //! `TemplateSegmentsGetter.js` in dash.js.
 
-use crate::manifest::mpd_types::{AdaptationSet, Period, Representation, SegmentBase, SegmentList, SegmentTemplate};
+use crate::manifest::mpd_types::{
+    AdaptationSet, Period, Representation, SegmentBase, SegmentList, SegmentTemplate,
+};
 
-use crate::abr::RepresentationInfo;
-use super::MediaType;
 use super::timeline::count_timeline_segments;
+use super::MediaType;
+use crate::abr::RepresentationInfo;
 
 #[cfg(not(feature = "std"))]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
-use alloc::{string::{String, ToString}, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 // ── Public helpers ────────────────────────────────────────────────────────────
 
@@ -88,19 +94,27 @@ pub(super) fn merge_segment_templates(
 /// the `AdaptationSet` and its `Representation` children.
 fn is_video_adaptation(a: &AdaptationSet) -> bool {
     a.contentType.as_deref() == Some("video")
-        || a.mimeType.as_deref().is_some_and(|m| m.starts_with("video/"))
-        || a.representations
-            .iter()
-            .any(|r| r.mimeType.as_deref().is_some_and(|m| m.starts_with("video/")))
+        || a.mimeType
+            .as_deref()
+            .is_some_and(|m| m.starts_with("video/"))
+        || a.representations.iter().any(|r| {
+            r.mimeType
+                .as_deref()
+                .is_some_and(|m| m.starts_with("video/"))
+        })
 }
 
 /// Returns `true` when `adaptation` is an audio track.
 fn is_audio_adaptation(a: &AdaptationSet) -> bool {
     a.contentType.as_deref() == Some("audio")
-        || a.mimeType.as_deref().is_some_and(|m| m.starts_with("audio/"))
-        || a.representations
-            .iter()
-            .any(|r| r.mimeType.as_deref().is_some_and(|m| m.starts_with("audio/")))
+        || a.mimeType
+            .as_deref()
+            .is_some_and(|m| m.starts_with("audio/"))
+        || a.representations.iter().any(|r| {
+            r.mimeType
+                .as_deref()
+                .is_some_and(|m| m.starts_with("audio/"))
+        })
 }
 
 /// Return a reference to the best-matching adaptation set for `media_type`
@@ -121,17 +135,15 @@ pub(super) fn find_adaptation<'a>(
     media_type: &MediaType,
 ) -> Option<&'a AdaptationSet> {
     match media_type {
-        MediaType::Video => period
-            .adaptations
-            .iter()
-            .find(|a| is_video_adaptation(a)),
+        MediaType::Video => period.adaptations.iter().find(|a| is_video_adaptation(a)),
         MediaType::Audio => period
             .adaptations
             .iter()
             .filter(|a| is_audio_adaptation(a))
             .enumerate()
             .max_by_key(|(i, a)| {
-                let bw = a.representations
+                let bw = a
+                    .representations
                     .iter()
                     .filter_map(|r| r.bandwidth)
                     .max()
@@ -196,16 +208,15 @@ pub(super) fn extract_segment_timing(
     let seg_dur_ms = match (t.duration, t.timescale) {
         (Some(dur), Some(ts)) => dur / (ts as f64) * 1_000.0,
         (Some(dur), None) => dur * 1_000.0, // timescale defaults to 1
-        _ => {
-            t.SegmentTimeline
-                .as_ref()
-                .and_then(|tl| tl.segments.first())
-                .map(|s| {
-                    let ts = t.timescale.unwrap_or(1) as f64;
-                    s.d as f64 / ts * 1_000.0
-                })
-                .unwrap_or(2_000.0)
-        }
+        _ => t
+            .SegmentTimeline
+            .as_ref()
+            .and_then(|tl| tl.segments.first())
+            .map(|s| {
+                let ts = t.timescale.unwrap_or(1) as f64;
+                s.d as f64 / ts * 1_000.0
+            })
+            .unwrap_or(2_000.0),
     };
 
     // For SegmentTimeline streams derive total_segments from the timeline count.
@@ -220,7 +231,11 @@ pub(super) fn extract_segment_timing(
             None
         } else {
             let count = count_timeline_segments(&tl.segments);
-            if count > 0 { Some(count) } else { None }
+            if count > 0 {
+                Some(count)
+            } else {
+                None
+            }
         }
     } else {
         let effective_duration = period.duration.or(presentation_duration);
@@ -272,7 +287,12 @@ pub(super) fn extract_representations(adaptation: &AdaptationSet) -> Vec<Represe
 /// string is found even when lower-bandwidth representations omit it.
 pub(super) fn adaptation_mime_type(adaptation: &AdaptationSet) -> String {
     // Helper: first codec string declared in any representation.
-    let rep_codecs = || adaptation.representations.iter().find_map(|r| r.codecs.as_deref());
+    let rep_codecs = || {
+        adaptation
+            .representations
+            .iter()
+            .find_map(|r| r.codecs.as_deref())
+    };
 
     if let Some(mime) = &adaptation.mimeType {
         // Prefer AS-level @codecs; fall back to first Representation that has them.
@@ -500,8 +520,8 @@ mod tests {
 mod extended_tests {
     use super::*;
     use crate::manifest::mpd_types::{
-        AdaptationSet, BaseURL, Initialization, Period, Representation,
-        SegmentBase, SegmentList, SegmentTemplate, SegmentTimeline, SegmentURL, S,
+        AdaptationSet, BaseURL, Initialization, Period, Representation, SegmentBase, SegmentList,
+        SegmentTemplate, SegmentTimeline, SegmentURL, S,
     };
     use crate::session::MediaType;
 
@@ -550,7 +570,11 @@ mod extended_tests {
 
         let found = find_adaptation(&period, &MediaType::Audio).unwrap();
         assert_eq!(
-            found.representations.iter().map(|r| r.bandwidth.unwrap()).max(),
+            found
+                .representations
+                .iter()
+                .map(|r| r.bandwidth.unwrap())
+                .max(),
             Some(320_000),
             "should pick the higher-bandwidth audio AdaptationSet"
         );
@@ -607,10 +631,16 @@ mod extended_tests {
     fn extract_segment_timing_basic() {
         // 2-second segments: duration=180000, timescale=90000
         let a = adaptation_with_template(180_000.0, 90_000, 1);
-        let (start, dur_ms, total) =
-            extract_segment_timing(&a, &Period::default(), Some(core::time::Duration::from_secs(60)));
+        let (start, dur_ms, total) = extract_segment_timing(
+            &a,
+            &Period::default(),
+            Some(core::time::Duration::from_secs(60)),
+        );
         assert_eq!(start, 1);
-        assert!((dur_ms - 2_000.0).abs() < 1.0, "expected 2000 ms, got {dur_ms}");
+        assert!(
+            (dur_ms - 2_000.0).abs() < 1.0,
+            "expected 2000 ms, got {dur_ms}"
+        );
         // 60 s / 2 s = 30 segments
         assert_eq!(total, Some(30));
     }
@@ -630,7 +660,10 @@ mod extended_tests {
         // Dynamic stream: no mediaPresentationDuration, no Period duration.
         let a = adaptation_with_template(96_000.0, 48_000, 1);
         let (_, _, total) = extract_segment_timing(&a, &Period::default(), None);
-        assert!(total.is_none(), "live stream should have None total_segments");
+        assert!(
+            total.is_none(),
+            "live stream should have None total_segments"
+        );
     }
 
     #[test]
@@ -639,7 +672,11 @@ mod extended_tests {
         let mut tmpl = SegmentTemplate::default();
         tmpl.timescale = Some(1_000);
         tmpl.SegmentTimeline = Some(SegmentTimeline {
-            segments: vec![S { t: Some(0), d: 2_000, r: Some(-1) }],
+            segments: vec![S {
+                t: Some(0),
+                d: 2_000,
+                r: Some(-1),
+            }],
         });
         a.SegmentTemplate = Some(tmpl);
         a.representations = vec![Representation::default()];
@@ -663,9 +700,21 @@ mod extended_tests {
         tmpl.timescale = Some(1_000);
         tmpl.SegmentTimeline = Some(SegmentTimeline {
             segments: vec![
-                S { t: Some(0),     d: 2_000, r: None },
-                S { t: Some(2_000), d: 2_000, r: None },
-                S { t: Some(4_000), d: 2_000, r: None },
+                S {
+                    t: Some(0),
+                    d: 2_000,
+                    r: None,
+                },
+                S {
+                    t: Some(2_000),
+                    d: 2_000,
+                    r: None,
+                },
+                S {
+                    t: Some(4_000),
+                    d: 2_000,
+                    r: None,
+                },
             ],
         });
         a.SegmentTemplate = Some(tmpl);
@@ -681,13 +730,28 @@ mod extended_tests {
     fn extract_representations_sorted_ascending() {
         let mut a = AdaptationSet::default();
         a.representations = vec![
-            { let mut r = Representation::default(); r.bandwidth = Some(3_000_000); r.id = Some("high".into()); r },
-            { let mut r = Representation::default(); r.bandwidth = Some(500_000);   r.id = Some("low".into());  r },
-            { let mut r = Representation::default(); r.bandwidth = Some(1_500_000); r.id = Some("mid".into());  r },
+            {
+                let mut r = Representation::default();
+                r.bandwidth = Some(3_000_000);
+                r.id = Some("high".into());
+                r
+            },
+            {
+                let mut r = Representation::default();
+                r.bandwidth = Some(500_000);
+                r.id = Some("low".into());
+                r
+            },
+            {
+                let mut r = Representation::default();
+                r.bandwidth = Some(1_500_000);
+                r.id = Some("mid".into());
+                r
+            },
         ];
         let reps = extract_representations(&a);
         assert_eq!(reps.len(), 3);
-        assert_eq!(reps[0].bandwidth, 500_000,   "index 0 should be lowest");
+        assert_eq!(reps[0].bandwidth, 500_000, "index 0 should be lowest");
         assert_eq!(reps[2].bandwidth, 3_000_000, "index 2 should be highest");
     }
 
@@ -695,11 +759,19 @@ mod extended_tests {
     fn extract_representations_skips_missing_bandwidth() {
         let mut a = AdaptationSet::default();
         a.representations = vec![
-            { let mut r = Representation::default(); r.bandwidth = Some(1_000_000); r },
+            {
+                let mut r = Representation::default();
+                r.bandwidth = Some(1_000_000);
+                r
+            },
             Representation::default(), // no bandwidth
         ];
         let reps = extract_representations(&a);
-        assert_eq!(reps.len(), 1, "representation without bandwidth should be skipped");
+        assert_eq!(
+            reps.len(),
+            1,
+            "representation without bandwidth should be skipped"
+        );
     }
 
     // ── adaptation_mime_type ──────────────────────────────────────────────────
@@ -708,7 +780,7 @@ mod extended_tests {
     fn adaptation_mime_type_as_level_mime_with_codecs() {
         let mut a = AdaptationSet::default();
         a.mimeType = Some("video/mp4".into());
-        a.codecs   = Some("avc1.64001f".into());
+        a.codecs = Some("avc1.64001f".into());
         assert_eq!(
             adaptation_mime_type(&a),
             r#"video/mp4;codecs="avc1.64001f""#
@@ -739,7 +811,7 @@ mod extended_tests {
         let mut a = AdaptationSet::default();
         let mut r = Representation::default();
         r.mimeType = Some("video/webm".into());
-        r.codecs   = Some("vp9".into());
+        r.codecs = Some("vp9".into());
         a.representations = vec![r];
         assert_eq!(adaptation_mime_type(&a), r#"video/webm;codecs="vp9""#);
     }
@@ -763,20 +835,27 @@ mod extended_tests {
     fn merge_segment_lists_repr_urls_win() {
         let mut repr = Representation::default();
         repr.SegmentList = Some(SegmentList {
-            duration:      Some(2_000),
-            timescale:     Some(1_000),
+            duration: Some(2_000),
+            timescale: Some(1_000),
             segment_urls: vec![
-                SegmentURL { media: Some("seg1.m4s".into()), ..Default::default() },
-                SegmentURL { media: Some("seg2.m4s".into()), ..Default::default() },
+                SegmentURL {
+                    media: Some("seg1.m4s".into()),
+                    ..Default::default()
+                },
+                SegmentURL {
+                    media: Some("seg2.m4s".into()),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         });
 
         let mut a = AdaptationSet::default();
         a.SegmentList = Some(SegmentList {
-            segment_urls: vec![
-                SegmentURL { media: Some("other.m4s".into()), ..Default::default() },
-            ],
+            segment_urls: vec![SegmentURL {
+                media: Some("other.m4s".into()),
+                ..Default::default()
+            }],
             ..Default::default()
         });
 
@@ -789,19 +868,22 @@ mod extended_tests {
     fn merge_segment_lists_duration_inherited_from_adaptation() {
         let mut repr = Representation::default();
         repr.SegmentList = Some(SegmentList {
-            segment_urls: vec![SegmentURL { media: Some("s.m4s".into()), ..Default::default() }],
+            segment_urls: vec![SegmentURL {
+                media: Some("s.m4s".into()),
+                ..Default::default()
+            }],
             ..Default::default()
         });
 
         let mut a = AdaptationSet::default();
         a.SegmentList = Some(SegmentList {
-            duration:  Some(4_000),
+            duration: Some(4_000),
             timescale: Some(1_000),
             ..Default::default()
         });
 
         let merged = merge_segment_lists(Some(&repr), &a, &Period::default()).unwrap();
-        assert_eq!(merged.duration,  Some(4_000));
+        assert_eq!(merged.duration, Some(4_000));
         assert_eq!(merged.timescale, Some(1_000));
     }
 
@@ -811,13 +893,22 @@ mod extended_tests {
     fn extract_segment_list_timing_basic() {
         let mut a = AdaptationSet::default();
         a.SegmentList = Some(SegmentList {
-            duration:  Some(2_000),
+            duration: Some(2_000),
             timescale: Some(1_000),
             startNumber: Some(1),
             segment_urls: vec![
-                SegmentURL { media: Some("seg1.m4s".into()), ..Default::default() },
-                SegmentURL { media: Some("seg2.m4s".into()), ..Default::default() },
-                SegmentURL { media: Some("seg3.m4s".into()), ..Default::default() },
+                SegmentURL {
+                    media: Some("seg1.m4s".into()),
+                    ..Default::default()
+                },
+                SegmentURL {
+                    media: Some("seg2.m4s".into()),
+                    ..Default::default()
+                },
+                SegmentURL {
+                    media: Some("seg3.m4s".into()),
+                    ..Default::default()
+                },
             ],
             ..Default::default()
         });
@@ -883,7 +974,10 @@ mod extended_tests {
     #[test]
     fn segment_base_media_path_from_repr() {
         let mut repr = Representation::default();
-        repr.BaseURL = vec![BaseURL { base: "video.mp4".into(), ..Default::default() }];
+        repr.BaseURL = vec![BaseURL {
+            base: "video.mp4".into(),
+            ..Default::default()
+        }];
         let path = segment_base_media_path(Some(&repr), &AdaptationSet::default());
         assert_eq!(path, "video.mp4");
     }
@@ -891,7 +985,10 @@ mod extended_tests {
     #[test]
     fn segment_base_media_path_from_adaptation() {
         let mut a = AdaptationSet::default();
-        a.BaseURL = vec![BaseURL { base: "audio.mp4".into(), ..Default::default() }];
+        a.BaseURL = vec![BaseURL {
+            base: "audio.mp4".into(),
+            ..Default::default()
+        }];
         let path = segment_base_media_path(None, &a);
         assert_eq!(path, "audio.mp4");
     }

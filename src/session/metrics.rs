@@ -27,10 +27,7 @@ use alloc::collections::VecDeque;
 #[cfg(not(feature = "std"))]
 use alloc::{string::String, vec::Vec};
 
-use crate::{
-    abr::AbrDecisionReason,
-    session::MediaType,
-};
+use crate::{abr::AbrDecisionReason, session::MediaType};
 
 /// Maximum number of entries kept per metric list.
 ///
@@ -180,7 +177,7 @@ mod tests {
             url: format!("https://example.com/seg{seg}.m4s"),
             bytes_received: 4096,
             transfer_duration_ms: 50.0,
-            throughput_bps: Some(4096_f64 * 8.0 * 1000.0 / 50.0),  // 655360 bps
+            throughput_bps: Some(4096_f64 * 8.0 * 1000.0 / 50.0), // 655360 bps
             quality_index: 0,
         }
     }
@@ -231,7 +228,10 @@ mod tests {
         // Must stay at capacity.
         assert_eq!(m.http_requests.len(), METRICS_CAPACITY);
         // Oldest (seg 0) must have been evicted; newest is at the back.
-        assert_eq!(m.last_http_request().unwrap().segment_number, METRICS_CAPACITY as u64);
+        assert_eq!(
+            m.last_http_request().unwrap().segment_number,
+            METRICS_CAPACITY as u64
+        );
         // Front is seg 1 (seg 0 was evicted).
         assert_eq!(m.http_requests.front().unwrap().segment_number, 1);
     }

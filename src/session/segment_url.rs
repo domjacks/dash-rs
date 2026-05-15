@@ -14,12 +14,16 @@
 //! Mirrors `TemplateSegmentsGetter.js` and parts of `URLLoader.js` in dash.js.
 
 use crate::manifest::mpd_types::{AdaptationSet, BaseURL, Period};
-use url::Url;
+use crate::Url;
 
 #[cfg(not(feature = "std"))]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
-use alloc::{string::{String, ToString}, vec::Vec};
+use alloc::{
+    borrow::ToOwned,
+    string::{String, ToString},
+    vec::Vec,
+};
 
 /// A resolved CDN candidate URL paired with its blacklist key.
 ///
@@ -179,7 +183,10 @@ pub(super) fn collect_candidate_base_urls(
         .map(|(url, svc)| {
             let service_location =
                 svc.unwrap_or_else(|| url.host_str().unwrap_or(url.as_str()).to_owned());
-            CandidateUrl { url, service_location }
+            CandidateUrl {
+                url,
+                service_location,
+            }
         })
         .collect()
 }
@@ -230,7 +237,10 @@ fn priority_weighted_order(bases: &[BaseURL]) -> Vec<&BaseURL> {
     let mut by_priority: alloc::collections::BTreeMap<u64, Vec<&BaseURL>> =
         alloc::collections::BTreeMap::new();
     for b in bases {
-        by_priority.entry(b.priority.unwrap_or(1)).or_default().push(b);
+        by_priority
+            .entry(b.priority.unwrap_or(1))
+            .or_default()
+            .push(b);
     }
 
     let mut result = Vec::with_capacity(bases.len());
@@ -352,7 +362,10 @@ mod extended_tests {
     use url::Url;
 
     fn base_url(s: &str) -> BaseURL {
-        BaseURL { base: s.to_owned(), ..Default::default() }
+        BaseURL {
+            base: s.to_owned(),
+            ..Default::default()
+        }
     }
 
     fn base_url_with_svc(s: &str, svc: &str) -> BaseURL {
@@ -492,11 +505,7 @@ mod extended_tests {
             &a,
             &[],
         );
-        assert!(
-            result.as_str().ends_with("video/"),
-            "resolved: {}",
-            result
-        );
+        assert!(result.as_str().ends_with("video/"), "resolved: {}", result);
         assert!(result.as_str().contains("origin.example.com"));
     }
 
@@ -513,8 +522,11 @@ mod extended_tests {
             &AdaptationSet::default(),
             &[],
         );
-        assert!(result.as_str().contains("primary.example.com"),
-            "should pick first BaseURL: {}", result);
+        assert!(
+            result.as_str().contains("primary.example.com"),
+            "should pick first BaseURL: {}",
+            result
+        );
         assert!(!result.as_str().contains("secondary.example.com"));
     }
 }

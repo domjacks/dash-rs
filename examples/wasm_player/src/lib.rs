@@ -119,13 +119,13 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
 
     // ── Build the DashSession ──────────────────────────────────────────────
 
-    let url = Url::parse(&mpd_url)
-        .map_err(|e| JsValue::from_str(&format!("invalid MPD URL: {e}")))?;
+    let url =
+        Url::parse(&mpd_url).map_err(|e| JsValue::from_str(&format!("invalid MPD URL: {e}")))?;
 
     // Each struct gets its own clone of the bridge (cheap JS reference copy).
-    let clock   = BridgeClock::new(JsValue::clone(bridge.as_ref()).unchecked_into());
+    let clock = BridgeClock::new(JsValue::clone(bridge.as_ref()).unchecked_into());
     let fetcher = BridgeFetcher::new(JsValue::clone(bridge.as_ref()).unchecked_into());
-    let ms      = BridgeMediaSource::new(JsValue::clone(bridge.as_ref()).unchecked_into());
+    let ms = BridgeMediaSource::new(JsValue::clone(bridge.as_ref()).unchecked_into());
 
     let mut session = DashSession::from_url_with_clock(&url, fetcher, ms, clock)
         .await
@@ -134,7 +134,7 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     tracing::info!(
         has_video = session.has_video(),
         has_audio = session.has_audio(),
-        is_live   = session.is_live(),
+        is_live = session.is_live(),
         "session constructed"
     );
 
@@ -158,7 +158,10 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         session.apply_live_pts_remap();
         let seek_time = session.live_presentation_start_s();
         bridge.seek_to(seek_time);
-        tracing::info!(seek_time, "live stream: PTS remapped; seeked video element to live edge");
+        tracing::info!(
+            seek_time,
+            "live stream: PTS remapped; seeked video element to live edge"
+        );
     }
 
     // ── Segment fetch loop ─────────────────────────────────────────────────

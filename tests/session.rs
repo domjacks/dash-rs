@@ -16,13 +16,9 @@ use dash_rs::{
     abr::AbrMetrics,
     error::DashError,
     fetch::{FetchError, FetchRequest, FetchResponse, RequestType, SegmentFetcher},
-    media_source::{
-        stub::StubMediaSource,
-        MediaSource, ReadyState, SourceBuffer, TimeRange,
-    },
+    media_source::{stub::StubMediaSource, MediaSource, ReadyState, SourceBuffer, TimeRange},
     session::{DashSession, MediaType},
-    DashMetrics,
-    GapSeekReason,
+    DashMetrics, GapSeekReason,
 };
 
 // ── MPD XML fixtures ──────────────────────────────────────────────────────────
@@ -580,16 +576,24 @@ async fn timeline_vod_fetches_in_time_order() {
         .filter(|u| u.contains("chunk-"))
         .map(|u| {
             // URL looks like "http://example.com/chunk-270000.m4s"
-            u.rsplit('/').next().unwrap_or("")
-                .strip_prefix("chunk-").unwrap_or("")
-                .strip_suffix(".m4s").unwrap_or("")
+            u.rsplit('/')
+                .next()
+                .unwrap_or("")
+                .strip_prefix("chunk-")
+                .unwrap_or("")
+                .strip_suffix(".m4s")
+                .unwrap_or("")
                 .parse()
                 .expect("non-numeric time in URL")
         })
         .collect();
 
     assert_eq!(times.len(), 3, "expected 3 media segment fetches");
-    assert_eq!(times, vec![0u64, 270_000, 540_000], "unexpected $Time$ sequence");
+    assert_eq!(
+        times,
+        vec![0u64, 270_000, 540_000],
+        "unexpected $Time$ sequence"
+    );
 }
 
 /// A live MPD with a specific `startNumber` value, used to test the
@@ -903,9 +907,13 @@ async fn timeline_repeat_attribute_produces_correct_times() {
         .iter()
         .filter(|u| u.contains("chunk-"))
         .map(|u| {
-            u.rsplit('/').next().unwrap_or("")
-                .strip_prefix("chunk-").unwrap_or("")
-                .strip_suffix(".m4s").unwrap_or("")
+            u.rsplit('/')
+                .next()
+                .unwrap_or("")
+                .strip_prefix("chunk-")
+                .unwrap_or("")
+                .strip_suffix(".m4s")
+                .unwrap_or("")
                 .parse()
                 .expect("non-numeric time in URL")
         })
@@ -999,10 +1007,7 @@ impl SegmentFetcher for UtcMockFetcher {
 async fn utc_direct_scheme_sets_offset() {
     // Use a fixed point well in the past: 2000-01-01T00:00:00Z = 946 684 800 s.
     const SERVER_TIME: f64 = 946_684_800.0;
-    let xml = live_mpd_with_utc_timing(
-        "urn:mpeg:dash:utc:direct:2014",
-        "2000-01-01T00:00:00Z",
-    );
+    let xml = live_mpd_with_utc_timing("urn:mpeg:dash:utc:direct:2014", "2000-01-01T00:00:00Z");
 
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
@@ -1234,7 +1239,11 @@ async fn emsg_v1_event_delivered_to_subscriber() {
     let ev = events.try_recv().expect("expected one emsg event");
     assert_eq!(ev.scheme_id_uri, "urn:scte:scte35:2014:xml+bin");
     assert_eq!(ev.value, "1");
-    assert!((ev.presentation_time_s - 5.0).abs() < 1e-6, "pt={}", ev.presentation_time_s);
+    assert!(
+        (ev.presentation_time_s - 5.0).abs() < 1e-6,
+        "pt={}",
+        ev.presentation_time_s
+    );
     assert!((ev.duration_s - 1.0).abs() < 1e-6, "dur={}", ev.duration_s);
     assert_eq!(ev.id, 77);
     assert_eq!(&ev.message_data[..], b"splice-info");
@@ -1264,7 +1273,11 @@ async fn emsg_v0_fields_preserved_through_broadcast() {
     let ev = events.try_recv().expect("expected v0 emsg event");
     assert_eq!(ev.scheme_id_uri, "urn:example:v0");
     assert_eq!(ev.value, "myval");
-    assert!((ev.presentation_time_s - 2.0).abs() < 1e-9, "pt={}", ev.presentation_time_s);
+    assert!(
+        (ev.presentation_time_s - 2.0).abs() < 1e-9,
+        "pt={}",
+        ev.presentation_time_s
+    );
     assert!((ev.duration_s - 3.0).abs() < 1e-9, "dur={}", ev.duration_s);
     assert_eq!(ev.id, 99);
     assert_eq!(&ev.message_data[..], b"v0data");
@@ -1286,12 +1299,16 @@ async fn emsg_no_subscriber_does_not_panic() {
     let result = session
         .fetch_next_segment(MediaType::Video, &default_metrics())
         .await;
-    assert!(result.is_ok(), "fetch_next_segment must succeed with no emsg subscribers");
+    assert!(
+        result.is_ok(),
+        "fetch_next_segment must succeed with no emsg subscribers"
+    );
 }
 
 /// Multiple `emsg` boxes in a single segment each produce an independent event.
 #[tokio::test]
-async fn emsg_two_events_in_one_segment() {    let mut emsg_bytes = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
+async fn emsg_two_events_in_one_segment() {
+    let mut emsg_bytes = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
     emsg_bytes.extend_from_slice(&make_emsg_v1("urn:b", "", 1000, 2000, 500, 2, b"second"));
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
@@ -1379,8 +1396,16 @@ async fn current_metrics_throughput_nonzero_after_first_fetch() {
         .unwrap();
 
     // Before any fetch: throughput must be 0.
-    assert_eq!(session.current_metrics(MediaType::Video, 0.0).throughput_bps, 0.0);
-    assert_eq!(session.current_metrics(MediaType::Video, 0.0).latency_ms, 0.0);
+    assert_eq!(
+        session
+            .current_metrics(MediaType::Video, 0.0)
+            .throughput_bps,
+        0.0
+    );
+    assert_eq!(
+        session.current_metrics(MediaType::Video, 0.0).latency_ms,
+        0.0
+    );
 
     session
         .fetch_next_segment(MediaType::Video, &default_metrics())
@@ -1428,7 +1453,10 @@ async fn current_metrics_throughput_ema_updates_each_fetch() {
         "EMA should converge to {sample_bps} bps when all samples are equal, got {}",
         m.throughput_bps
     );
-    assert!(m.throughput_bps > 0.0, "throughput must be non-zero after fetches");
+    assert!(
+        m.throughput_bps > 0.0,
+        "throughput must be non-zero after fetches"
+    );
     assert_eq!(m.latency_ms, duration_ms as f64);
 }
 
@@ -1461,8 +1489,18 @@ async fn current_metrics_audio_and_video_independent() {
         .unwrap();
 
     // Before any fetches both tracks report 0.
-    assert_eq!(session.current_metrics(MediaType::Video, 0.0).throughput_bps, 0.0);
-    assert_eq!(session.current_metrics(MediaType::Audio, 0.0).throughput_bps, 0.0);
+    assert_eq!(
+        session
+            .current_metrics(MediaType::Video, 0.0)
+            .throughput_bps,
+        0.0
+    );
+    assert_eq!(
+        session
+            .current_metrics(MediaType::Audio, 0.0)
+            .throughput_bps,
+        0.0
+    );
 
     // Fetch only the video track.
     session
@@ -1471,9 +1509,16 @@ async fn current_metrics_audio_and_video_independent() {
         .unwrap();
 
     // Video should now be non-zero; audio must still be 0.
-    assert!(session.current_metrics(MediaType::Video, 0.0).throughput_bps > 0.0);
+    assert!(
+        session
+            .current_metrics(MediaType::Video, 0.0)
+            .throughput_bps
+            > 0.0
+    );
     assert_eq!(
-        session.current_metrics(MediaType::Audio, 0.0).throughput_bps,
+        session
+            .current_metrics(MediaType::Audio, 0.0)
+            .throughput_bps,
         0.0,
         "audio EMA must remain 0 until an audio segment is fetched"
     );
@@ -1527,7 +1572,11 @@ async fn segmentlist_vod_fetches_in_order() {
     // Filter to media segments only (exclude any init fetches).
     let media_urls: Vec<&String> = urls.iter().filter(|u| u.contains("seg-v1")).collect();
 
-    assert_eq!(media_urls.len(), 3, "expected 3 segment fetches; got {urls:?}");
+    assert_eq!(
+        media_urls.len(),
+        3,
+        "expected 3 segment fetches; got {urls:?}"
+    );
 
     // Verify the URLs are fetched in declaration order.
     for (i, expected_suffix) in ["seg-v1-1.m4s", "seg-v1-2.m4s", "seg-v1-3.m4s"]
@@ -1721,10 +1770,8 @@ impl SegmentFetcher for SegmentBaseFetcher {
 async fn segmentbase_fetches_sidx_then_first_segment() {
     // sidx: timescale=1000, 3 segments each 3000 ticks (3 s), 4096 bytes each.
     let sidx = make_test_sidx(1000, &[3000, 3000, 4000]);
-    let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let fetcher =
-        SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
+    let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
     let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
         .await
@@ -1741,8 +1788,15 @@ async fn segmentbase_fetches_sidx_then_first_segment() {
     // [1] = init segment fetch (byte range 0-999, from Initialization@range)
     // [2] = sidx fetch (byte range 1000-1999)
     // [3] = first segment fetch (byte range 2000..2000+4095 = 2000-6095)
-    assert!(entries.len() >= 4, "expected at least 4 fetches, got {entries:?}");
-    assert_eq!(entries[2].1, Some((1000, 1999)), "sidx fetch must use indexRange");
+    assert!(
+        entries.len() >= 4,
+        "expected at least 4 fetches, got {entries:?}"
+    );
+    assert_eq!(
+        entries[2].1,
+        Some((1000, 1999)),
+        "sidx fetch must use indexRange"
+    );
     // first segment starts immediately after index_end_offset (2000) + first_offset (0).
     assert_eq!(
         entries[3].1,
@@ -1787,10 +1841,8 @@ async fn segmentbase_eos_after_all_subsegments() {
 #[tokio::test]
 async fn segmentbase_init_segment_uses_byte_range() {
     let sidx = make_test_sidx(1000, &[3000]);
-    let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let fetcher =
-        SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
+    let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> = Arc::new(Mutex::new(Vec::new()));
+    let fetcher = SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
     let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
         .await
@@ -1894,7 +1946,9 @@ fn bitrate_cap_clamps_abr_decision() {
     let high_metrics = AbrMetrics::new(10_000_000.0, 10_000.0);
 
     // Without a cap, the ABR should pick "high" (index 2).
-    let _decision = session.select_quality(&MediaType::Video, &high_metrics).unwrap();
+    let _decision = session
+        .select_quality(&MediaType::Video, &high_metrics)
+        .unwrap();
     // Note: select_quality uses the ABR directly (uncapped); we verify cap
     // state via max_bitrate() instead of asserting the uncapped index here.
 
@@ -2023,15 +2077,32 @@ async fn multi_period_advances_on_period_end() {
 
     // Fetch 1 — period 0, segment 1. The period index stays at 0 until
     // the next call detects period 0's EOS.
-    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
-    assert_eq!(session.current_period_index(), 0, "should still be in period 0 after first fetch");
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.current_period_index(),
+        0,
+        "should still be in period 0 after first fetch"
+    );
 
     // Fetch 2 — period 0 EOS detected → auto-advance to period 1 → period 1, segment 1.
-    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
-    assert_eq!(session.current_period_index(), 1, "should be in period 1 after second fetch");
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.current_period_index(),
+        1,
+        "should be in period 1 after second fetch"
+    );
 
     // Fetch 3 — period 1 exhausted, no period 2 → EndOfStream.
-    let err = session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap_err();
+    let err = session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, dash_rs::error::DashError::EndOfStream { .. }),
         "expected EndOfStream, got {err:?}"
@@ -2102,7 +2173,10 @@ async fn multi_period_eos_after_last_period() {
     }
 
     // 4th fetch → EndOfStream.
-    let err = session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap_err();
+    let err = session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, dash_rs::error::DashError::EndOfStream { .. }),
         "expected EndOfStream after all 3 periods, got {err:?}"
@@ -2154,7 +2228,11 @@ async fn xlink_period_onload_is_inlined() {
         .expect("session construction should succeed after XLink resolution");
 
     // The remote period was inlined: session has exactly one period.
-    assert_eq!(session.period_count(), 1, "inlined period should be present");
+    assert_eq!(
+        session.period_count(),
+        1,
+        "inlined period should be present"
+    );
 
     // The session can fetch a segment whose URL comes from the remote period's
     // SegmentTemplate — confirming the remote content is active.
@@ -2203,7 +2281,11 @@ async fn xlink_period_resolve_to_zero_removes_period() {
         .expect("session construction should succeed");
 
     // The resolve-to-zero period was removed; only p1 remains.
-    assert_eq!(session.period_count(), 1, "resolve-to-zero period should be removed");
+    assert_eq!(
+        session.period_count(),
+        1,
+        "resolve-to-zero period should be removed"
+    );
 }
 
 /// A `Period` with `xlink:actuate="onRequest"` must NOT be resolved eagerly.
@@ -2238,7 +2320,11 @@ async fn xlink_period_onrequest_is_not_fetched() {
         .expect("session construction should succeed");
 
     // Both periods are present: p1 (normal) and p2 (unresolved placeholder).
-    assert_eq!(session.period_count(), 2, "onRequest placeholder must remain in manifest");
+    assert_eq!(
+        session.period_count(),
+        2,
+        "onRequest placeholder must remain in manifest"
+    );
 }
 
 /// An `AdaptationSet` with `xlink:actuate="onLoad"` must be fetched and
@@ -2329,9 +2415,7 @@ struct RoutesFetcher {
 }
 
 impl RoutesFetcher {
-    fn new(
-        routes: impl IntoIterator<Item = (String, Vec<Result<String, ()>>)>,
-    ) -> Self {
+    fn new(routes: impl IntoIterator<Item = (String, Vec<Result<String, ()>>)>) -> Self {
         Self {
             routes: Arc::new(Mutex::new(
                 routes
@@ -2479,7 +2563,11 @@ async fn refresh_manifest_updates_location_urls_from_refreshed_manifest() {
         .await
         .unwrap();
 
-    assert_eq!(session.location_urls().len(), 2, "initial manifest has 2 Location entries");
+    assert_eq!(
+        session.location_urls().len(),
+        2,
+        "initial manifest has 2 Location entries"
+    );
 
     session.refresh_manifest().await.unwrap();
 
@@ -2608,11 +2696,7 @@ impl SegmentFetcher for CdnFetcher {
 #[tokio::test]
 async fn cdn_blacklist_skips_failing_cdn_on_subsequent_fetches() {
     let attempted: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-    let fetcher = CdnFetcher::new(
-        TWO_CDN_MPD,
-        &["cdn1.example.com"],
-        Arc::clone(&attempted),
-    );
+    let fetcher = CdnFetcher::new(TWO_CDN_MPD, &["cdn1.example.com"], Arc::clone(&attempted));
 
     let url = Url::parse("http://primary.example.com/manifest.mpd").unwrap();
     let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
@@ -2636,7 +2720,10 @@ async fn cdn_blacklist_skips_failing_cdn_on_subsequent_fetches() {
         .iter()
         .filter(|u| u.contains("cdn1.example.com"))
         .count();
-    assert_eq!(cdn1_count_after_first, 1, "cdn1 should have been tried once on first fetch");
+    assert_eq!(
+        cdn1_count_after_first, 1,
+        "cdn1 should have been tried once on first fetch"
+    );
 
     // Clear the recording for the second fetch.
     attempted.lock().unwrap().clear();
@@ -2644,9 +2731,7 @@ async fn cdn_blacklist_skips_failing_cdn_on_subsequent_fetches() {
     // Second fetch: cdn1 is blacklisted → only cdn2 should be tried.
     // EOS after 1 segment (total_segments = 1), so we expect EndOfStream here.
     // We just need to verify cdn1 was NOT attempted regardless of the outcome.
-    let _ = session
-        .fetch_next_segment(MediaType::Video, &metrics)
-        .await; // may succeed or return EOS — we only care about the URL log
+    let _ = session.fetch_next_segment(MediaType::Video, &metrics).await; // may succeed or return EOS — we only care about the URL log
 
     let urls_after_second = attempted.lock().unwrap();
     let cdn1_count_after_second = urls_after_second
@@ -2691,14 +2776,20 @@ async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
             let host = request.url.host_str().unwrap_or("").to_string();
 
             if host == "cdn1.example.com" {
-                return Err(FetchError::Http { status: 503, url: request.url });
+                return Err(FetchError::Http {
+                    status: 503,
+                    url: request.url,
+                });
             }
 
             // cdn2: fail on first call, succeed on second.
             let mut n = self.cdn2_calls.lock().unwrap();
             *n += 1;
             if *n == 1 {
-                return Err(FetchError::Http { status: 503, url: request.url });
+                return Err(FetchError::Http {
+                    status: 503,
+                    url: request.url,
+                });
             }
             Ok(FetchResponse {
                 final_url: request.url,
@@ -2708,7 +2799,9 @@ async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
             })
         }
 
-        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> { Ok(true) }
+        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+            Ok(true)
+        }
         fn abort(&self) {}
     }
 
@@ -2730,7 +2823,10 @@ async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
 
     // First fetch: cdn1 fails (blacklisted), cdn2 fails (blacklisted) → error.
     let first = session.fetch_next_segment(MediaType::Video, &metrics).await;
-    assert!(first.is_err(), "first fetch should fail when both CDNs are down");
+    assert!(
+        first.is_err(),
+        "first fetch should fail when both CDNs are down"
+    );
 
     // Second fetch: both CDNs are blacklisted → safety net kicks in → cdn1 fails
     // again, cdn2 succeeds on its second call.
@@ -2884,7 +2980,10 @@ fn tick_gap_returns_none_when_position_in_buffer() {
     let mut session = session_from_xml(SEEK_MPD);
     // Position 2.0 is inside [0, 5] — no gap, no stall.
     let result = session.tick_gap(2.0, &gap_buffered(), false);
-    assert!(result.is_none(), "no seek needed when inside buffered range");
+    assert!(
+        result.is_none(),
+        "no seek needed when inside buffered range"
+    );
 }
 
 /// When the position is just before a buffered gap, tick_gap recommends a
@@ -2971,8 +3070,12 @@ async fn seek_to_remapped_live_snaps_to_correct_segment() {
     struct FixedClock1000 {}
     #[async_trait(?Send)]
     impl dash_rs::clock::Clock for FixedClock1000 {
-        fn now_ms(&self) -> f64 { 0.0 }
-        fn unix_s(&self) -> f64 { 1000.0 }
+        fn now_ms(&self) -> f64 {
+            0.0
+        }
+        fn unix_s(&self) -> f64 {
+            1000.0
+        }
         async fn set_timeout(&self, _ms: f64) {}
     }
 
@@ -2981,8 +3084,9 @@ async fn seek_to_remapped_live_snaps_to_correct_segment() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let clock = Arc::new(FixedClock1000 {});
 
-    let mut session = DashSession::from_mpd_with_clock(mpd, base_url, fetcher, open_stub_source(), clock)
-        .expect("session construction failed");
+    let mut session =
+        DashSession::from_mpd_with_clock(mpd, base_url, fetcher, open_stub_source(), clock)
+            .expect("session construction failed");
 
     // live_edge = floor(1000/4)+1 = 251, safety = 3 → initial_seg = 248
     // remap_offset = (248−1) × 4 = 988 s
@@ -3090,9 +3194,21 @@ async fn buffered_reflects_appended_timed_chunks() {
     .unwrap();
 
     let ranges = sink.buffered();
-    assert_eq!(ranges.len(), 1, "expected one buffered range; got {ranges:?}");
-    assert!((ranges[0].start - 0.0).abs() < 1e-9, "start = {}", ranges[0].start);
-    assert!((ranges[0].end   - 4.0).abs() < 1e-9, "end   = {}", ranges[0].end);
+    assert_eq!(
+        ranges.len(),
+        1,
+        "expected one buffered range; got {ranges:?}"
+    );
+    assert!(
+        (ranges[0].start - 0.0).abs() < 1e-9,
+        "start = {}",
+        ranges[0].start
+    );
+    assert!(
+        (ranges[0].end - 4.0).abs() < 1e-9,
+        "end   = {}",
+        ranges[0].end
+    );
 }
 
 #[test]
@@ -3168,24 +3284,42 @@ const MULTI_AUDIO_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 #[test]
 fn audio_only_has_video_false_has_audio_true() {
     let session = session_from_xml(AUDIO_ONLY_MPD);
-    assert!(!session.has_video(), "has_video should be false for audio-only stream");
-    assert!(session.has_audio(), "has_audio should be true for audio-only stream");
+    assert!(
+        !session.has_video(),
+        "has_video should be false for audio-only stream"
+    );
+    assert!(
+        session.has_audio(),
+        "has_audio should be true for audio-only stream"
+    );
 }
 
 /// has_video() returns true and has_audio() returns false for a video-only MPD.
 #[test]
 fn video_only_has_video_true_has_audio_false() {
     let session = session_from_xml(STATIC_MPD); // STATIC_MPD has only a video AdaptationSet
-    assert!(session.has_video(), "has_video should be true for video-only stream");
-    assert!(!session.has_audio(), "has_audio should be false for video-only stream");
+    assert!(
+        session.has_video(),
+        "has_video should be true for video-only stream"
+    );
+    assert!(
+        !session.has_audio(),
+        "has_audio should be false for video-only stream"
+    );
 }
 
 /// has_video() and has_audio() both return true for a standard AV stream.
 #[test]
 fn av_stream_has_both_tracks() {
     let session = session_from_xml(SEEK_MPD); // SEEK_MPD has both video and audio
-    assert!(session.has_video(), "has_video should be true for AV stream");
-    assert!(session.has_audio(), "has_audio should be true for AV stream");
+    assert!(
+        session.has_video(),
+        "has_video should be true for AV stream"
+    );
+    assert!(
+        session.has_audio(),
+        "has_audio should be true for AV stream"
+    );
 }
 
 /// fetch_next_segment(Video) returns NoRepresentations for an audio-only stream.
@@ -3233,7 +3367,11 @@ fn audio_only_representations_count() {
 fn multi_audio_selects_highest_bandwidth_adaptation_set() {
     let session = session_from_xml(MULTI_AUDIO_MPD);
     let reps = session.audio_representations();
-    assert_eq!(reps.len(), 2, "should select the 2-rep AAC-LC AdaptationSet");
+    assert_eq!(
+        reps.len(),
+        2,
+        "should select the 2-rep AAC-LC AdaptationSet"
+    );
     // The selected AdaptationSet should be the AAC-LC one (ids lc128 / lc320).
     let ids: Vec<&str> = reps.iter().map(|r| r.id.as_str()).collect();
     assert!(
@@ -3257,7 +3395,10 @@ fn multi_audio_max_bandwidth_is_320kbps() {
         .map(|r| r.bandwidth)
         .max()
         .unwrap_or(0);
-    assert_eq!(max_bps, 320_000, "max audio bandwidth should be 320 000 bps (AAC-LC)");
+    assert_eq!(
+        max_bps, 320_000,
+        "max audio bandwidth should be 320 000 bps (AAC-LC)"
+    );
 }
 
 // ── MEDIUM-9: adaptation_mime_type AdaptationSet-level @codecs ────────────────
@@ -3469,9 +3610,13 @@ async fn fetch_next_segment_eos_when_past_availability_end_time() {
     struct PastClock;
     #[async_trait(?Send)]
     impl Clock for PastClock {
-        fn now_ms(&self) -> f64 { 0.0 }
+        fn now_ms(&self) -> f64 {
+            0.0
+        }
         // Return a very large Unix timestamp — the stream ended long ago.
-        fn unix_s(&self) -> f64 { 9_999_999_999.0 }
+        fn unix_s(&self) -> f64 {
+            9_999_999_999.0
+        }
         async fn set_timeout(&self, _ms: f64) {}
     }
 
@@ -3601,7 +3746,9 @@ async fn utc_timing_http_head_resolved_via_head_date() {
                 bytes_received: len,
             })
         }
-        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> { Ok(true) }
+        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+            Ok(true)
+        }
         async fn head_date(&self, _url: &Url) -> Result<Option<String>, FetchError> {
             Ok(Some(self.date_str.to_owned()))
         }
@@ -3666,8 +3813,7 @@ async fn seek_to_anchors_timeline_next_segment_time() {
     let mpd = dash_rs::manifest::parse(MPD_XML).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let mut session =
-        DashSession::from_mpd(mpd, base_url, fetcher, open_stub_source()).unwrap();
+    let mut session = DashSession::from_mpd(mpd, base_url, fetcher, open_stub_source()).unwrap();
 
     // Seek to 4 s — should land on the segment starting at t=4000.
     session.seek_to(4.0);
@@ -3811,8 +3957,12 @@ struct FixedClock {
 
 #[async_trait::async_trait(?Send)]
 impl dash_rs::clock::Clock for FixedClock {
-    fn now_ms(&self) -> f64 { self.now_ms_val }
-    fn unix_s(&self) -> f64 { self.unix_s_val }
+    fn now_ms(&self) -> f64 {
+        self.now_ms_val
+    }
+    fn unix_s(&self) -> f64 {
+        self.unix_s_val
+    }
     async fn set_timeout(&self, _ms: f64) {}
 }
 
@@ -3849,7 +3999,10 @@ async fn availability_time_offset_widens_live_edge() {
     }
 
     // now=401 s: without ATO start=98; with ATO=3.5 → start=99.
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 401.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 401.0,
+    });
 
     // Without ATO (0.0) — baseline.
     let mpd_no_ato = dash_rs::manifest::parse(&live_mpd_with_ato("0")).unwrap();
@@ -3860,7 +4013,8 @@ async fn availability_time_offset_widens_live_edge() {
         fetcher_no_ato,
         open_stub_source(),
         Arc::clone(&clock) as Arc<dyn Clock>,
-    ).unwrap();
+    )
+    .unwrap();
     let no_ato_seg = session_no_ato.current_segment_number(&MediaType::Video);
 
     // With ATO = 3.5 s — live edge should be one segment ahead.
@@ -3872,11 +4026,15 @@ async fn availability_time_offset_widens_live_edge() {
         fetcher_ato,
         open_stub_source(),
         Arc::clone(&clock) as Arc<dyn Clock>,
-    ).unwrap();
+    )
+    .unwrap();
     let ato_seg = session_ato.current_segment_number(&MediaType::Video);
 
     assert_eq!(no_ato_seg, 98, "without ATO segment should be 98");
-    assert_eq!(ato_seg, 99, "with ATO=3.5s segment should be 99 (one ahead)");
+    assert_eq!(
+        ato_seg, 99,
+        "with ATO=3.5s segment should be 99 (one ahead)"
+    );
 }
 
 /// `availabilityTimeOffset` equal to a full segment duration allows the
@@ -3904,7 +4062,10 @@ async fn availability_time_offset_full_segment_duration() {
 
     // now=400s, seg_dur=4s, ATO=4s → effective elapsed=404s
     // live_edge = floor(404/4) + 1 = 101 + 1 = 102, safety=3 → 99
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 400.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 400.0,
+    });
     let mpd = dash_rs::manifest::parse(live_mpd_ato_full()).unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let session = DashSession::from_mpd_with_clock(
@@ -3913,7 +4074,8 @@ async fn availability_time_offset_full_segment_duration() {
         fetcher,
         open_stub_source(),
         Arc::clone(&clock) as Arc<dyn Clock>,
-    ).unwrap();
+    )
+    .unwrap();
     assert_eq!(session.current_segment_number(&MediaType::Video), 99);
 }
 
@@ -3955,8 +4117,8 @@ fn make_prft_v0_bytes(ntp_timestamp: u64, media_time: u32) -> Vec<u8> {
     let mut buf = Vec::with_capacity(total_size as usize);
     buf.extend_from_slice(&total_size.to_be_bytes());
     buf.extend_from_slice(b"prft");
-    buf.push(0);                        // version = 0
-    buf.extend_from_slice(&[0u8; 3]);   // flags
+    buf.push(0); // version = 0
+    buf.extend_from_slice(&[0u8; 3]); // flags
     buf.extend_from_slice(&1u32.to_be_bytes()); // reference_track_id
     buf.extend_from_slice(&ntp_timestamp.to_be_bytes());
     buf.extend_from_slice(&media_time.to_be_bytes());
@@ -3988,7 +4150,10 @@ async fn last_producer_reference_time_is_populated_from_segment() {
   </Period>
 </MPD>"#;
 
-    let fetcher = PrftFetcher { mpd_xml: MPD_XML.to_owned(), segment_data: segment };
+    let fetcher = PrftFetcher {
+        mpd_xml: MPD_XML.to_owned(),
+        segment_data: segment,
+    };
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
     let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
         .await
@@ -3996,7 +4161,9 @@ async fn last_producer_reference_time_is_populated_from_segment() {
 
     // Before any segment fetch, the accessor returns None.
     assert!(
-        session.last_producer_reference_time(&MediaType::Video).is_none(),
+        session
+            .last_producer_reference_time(&MediaType::Video)
+            .is_none(),
         "expected None before first segment fetch"
     );
 
@@ -4005,7 +4172,10 @@ async fn last_producer_reference_time_is_populated_from_segment() {
 
     // Fetch one media segment (returns the prft-containing payload).
     let metrics = default_metrics();
-    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap();
 
     let prft = session
         .last_producer_reference_time(&MediaType::Video)
@@ -4016,7 +4186,8 @@ async fn last_producer_reference_time_is_populated_from_segment() {
     // wall_clock_s should be 1704067200.0
     assert!(
         (prft.wall_clock_s - 1_704_067_200.0).abs() < 1.0,
-        "wall_clock_s = {}", prft.wall_clock_s
+        "wall_clock_s = {}",
+        prft.wall_clock_s
     );
 }
 
@@ -4046,7 +4217,10 @@ async fn throughput_tracker_non_zero_after_first_segment() {
 
     // Use a 100-byte fake segment so that throughput_bps() returns a finite value.
     let segment_data = Bytes::from(vec![0u8; 100]);
-    let fetcher = PrftFetcher { mpd_xml: MPD_XML.to_owned(), segment_data };
+    let fetcher = PrftFetcher {
+        mpd_xml: MPD_XML.to_owned(),
+        segment_data,
+    };
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
     let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
         .await
@@ -4058,7 +4232,10 @@ async fn throughput_tracker_non_zero_after_first_segment() {
 
     session.fetch_init_segment(MediaType::Video).await.unwrap();
     let metrics = default_metrics();
-    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap();
 
     // After fetching: throughput_bps should be > 0.
     let after = session.current_metrics(MediaType::Video, 0.0);
@@ -4367,10 +4544,16 @@ async fn live_av_both_tracks_snapped_to_live_edge() {
     let mpd = dash_rs::manifest::parse(LIVE_AV_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
@@ -4381,8 +4564,14 @@ async fn live_av_both_tracks_snapped_to_live_edge() {
     // live_edge = floor(1000/4)+1 = 251, safety = 3 → 248
     let v_seg = session.current_segment_number(&MediaType::Video);
     let a_seg = session.current_segment_number(&MediaType::Audio);
-    assert_eq!(v_seg, 248, "video segment_number should be at live edge 248");
-    assert_eq!(a_seg, 248, "audio segment_number should be at live edge 248");
+    assert_eq!(
+        v_seg, 248,
+        "video segment_number should be at live edge 248"
+    );
+    assert_eq!(
+        a_seg, 248,
+        "audio segment_number should be at live edge 248"
+    );
 }
 
 // ── 2. Live AV: fetching both tracks succeeds ─────────────────────────────────
@@ -4456,19 +4645,31 @@ async fn live_audio_only_live_edge_snapped() {
     let mpd = dash_rs::manifest::parse(LIVE_AUDIO_ONLY_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
 
-    assert!(!session.has_video(), "audio-only stream must not have a video track");
+    assert!(
+        !session.has_video(),
+        "audio-only stream must not have a video track"
+    );
     assert!(session.has_audio(), "audio track must be present");
 
     let a_seg = session.current_segment_number(&MediaType::Audio);
-    assert_eq!(a_seg, 248, "audio segment_number should be at live edge 248");
+    assert_eq!(
+        a_seg, 248,
+        "audio segment_number should be at live edge 248"
+    );
 }
 
 // ── 5. Live audio-only: fetch succeeds ───────────────────────────────────────
@@ -4582,10 +4783,16 @@ async fn live_timeline_r_minus_one_live_edge_next_segment_time_set() {
     let mpd = dash_rs::manifest::parse(LIVE_TIMELINE_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
@@ -4626,7 +4833,11 @@ async fn live_timeline_fetch_uses_live_edge_time() {
 
     let urls = recorded.lock().unwrap();
     // urls[0] = init segment; urls[1] = first media segment.
-    assert!(urls.len() >= 2, "expected init + media segment; got {}", urls.len());
+    assert!(
+        urls.len() >= 2,
+        "expected init + media segment; got {}",
+        urls.len()
+    );
     let media_url = &urls[1];
     assert!(
         media_url.contains(&expected_ticks.to_string()),
@@ -4667,7 +4878,11 @@ async fn live_timeline_consecutive_fetches_advance_time() {
 
     let urls = recorded.lock().unwrap();
     // urls[0] = init; urls[1..=3] = media segments.
-    assert!(urls.len() >= 4, "expected init + 3 media segments; got {}", urls.len());
+    assert!(
+        urls.len() >= 4,
+        "expected init + 3 media segments; got {}",
+        urls.len()
+    );
 
     let t0 = expected_ticks;
     let t1 = t0 + seg_dur_ticks;
@@ -4675,15 +4890,18 @@ async fn live_timeline_consecutive_fetches_advance_time() {
 
     assert!(
         urls[1].contains(&t0.to_string()),
-        "segment 1 URL should contain t={t0}; got {}", urls[1]
+        "segment 1 URL should contain t={t0}; got {}",
+        urls[1]
     );
     assert!(
         urls[2].contains(&t1.to_string()),
-        "segment 2 URL should contain t={t1}; got {}", urls[2]
+        "segment 2 URL should contain t={t1}; got {}",
+        urls[2]
     );
     assert!(
         urls[3].contains(&t2.to_string()),
-        "segment 3 URL should contain t={t2}; got {}", urls[3]
+        "segment 3 URL should contain t={t2}; got {}",
+        urls[3]
     );
 }
 
@@ -4701,10 +4919,16 @@ async fn apply_live_pts_remap_timeline_uses_next_segment_time() {
     let mpd = dash_rs::manifest::parse(LIVE_TIMELINE_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let mut session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
@@ -4728,10 +4952,16 @@ async fn live_presentation_start_s_timeline_returns_near_zero_after_remap() {
     let mpd = dash_rs::manifest::parse(LIVE_TIMELINE_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let mut session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
@@ -4776,7 +5006,10 @@ async fn refresh_manifest_resnaps_live_edge_when_segment_falls_behind() {
     // Seek backward to simulate a long pause / buffer underrun.
     session.seek_to(0.0);
     let after_seek = session.current_segment_number(&MediaType::Video);
-    assert_eq!(after_seek, 1, "after seek_to(0), segment_number should be 1");
+    assert_eq!(
+        after_seek, 1,
+        "after seek_to(0), segment_number should be 1"
+    );
 
     // Refresh should snap back to live edge.
     session.refresh_manifest().await.unwrap();
@@ -4833,10 +5066,16 @@ async fn live_audio_only_apply_live_pts_remap_uses_audio_track_offset() {
     let mpd = dash_rs::manifest::parse(LIVE_AUDIO_ONLY_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let mut session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
@@ -5006,8 +5245,8 @@ async fn vod_av_eos_fires_independently_per_track() {
 
     let mut video_eos_count = 0u32;
     let mut audio_eos_count = 0u32;
-    let mut video_ok_count  = 0u32;
-    let mut audio_ok_count  = 0u32;
+    let mut video_ok_count = 0u32;
+    let mut audio_ok_count = 0u32;
 
     for _ in 0..10 {
         match session.fetch_next_segment(MediaType::Video, &metrics).await {
@@ -5022,8 +5261,14 @@ async fn vod_av_eos_fires_independently_per_track() {
         }
     }
 
-    assert_eq!(video_ok_count, 3, "video should have 3 successful fetches (3 segments)");
-    assert_eq!(audio_ok_count, 2, "audio should have 2 successful fetches (2 segments)");
+    assert_eq!(
+        video_ok_count, 3,
+        "video should have 3 successful fetches (3 segments)"
+    );
+    assert_eq!(
+        audio_ok_count, 2,
+        "audio should have 2 successful fetches (2 segments)"
+    );
     assert!(video_eos_count >= 1, "video should have reached EOS");
     assert!(audio_eos_count >= 1, "audio should have reached EOS");
 }
@@ -5161,7 +5406,9 @@ async fn timeline_vod_av_both_tracks_fetch_in_time_order() {
                 Err(e) => panic!("unexpected audio error: {e}"),
             }
         }
-        if video_done && audio_done { break; }
+        if video_done && audio_done {
+            break;
+        }
     }
 
     assert!(video_done, "video must reach EOS");
@@ -5169,27 +5416,47 @@ async fn timeline_vod_av_both_tracks_fetch_in_time_order() {
 
     // Verify URL ordering: v-0.m4s before v-4000.m4s, a-0.m4s before a-4000.m4s.
     let urls = recorded.lock().unwrap();
-    let video_media: Vec<_> = urls.iter().filter(|u| u.contains("/v-") && !u.contains("init")).collect();
-    let audio_media: Vec<_> = urls.iter().filter(|u| u.contains("/a-") && !u.contains("init")).collect();
+    let video_media: Vec<_> = urls
+        .iter()
+        .filter(|u| u.contains("/v-") && !u.contains("init"))
+        .collect();
+    let audio_media: Vec<_> = urls
+        .iter()
+        .filter(|u| u.contains("/a-") && !u.contains("init"))
+        .collect();
 
-    assert_eq!(video_media.len(), 2, "expected 2 video media segments; got {}", video_media.len());
-    assert_eq!(audio_media.len(), 2, "expected 2 audio media segments; got {}", audio_media.len());
+    assert_eq!(
+        video_media.len(),
+        2,
+        "expected 2 video media segments; got {}",
+        video_media.len()
+    );
+    assert_eq!(
+        audio_media.len(),
+        2,
+        "expected 2 audio media segments; got {}",
+        audio_media.len()
+    );
 
     assert!(
         video_media[0].contains("v-0.m4s"),
-        "first video segment should be v-0.m4s; got {}", video_media[0]
+        "first video segment should be v-0.m4s; got {}",
+        video_media[0]
     );
     assert!(
         video_media[1].contains("v-4000.m4s"),
-        "second video segment should be v-4000.m4s; got {}", video_media[1]
+        "second video segment should be v-4000.m4s; got {}",
+        video_media[1]
     );
     assert!(
         audio_media[0].contains("a-0.m4s"),
-        "first audio segment should be a-0.m4s; got {}", audio_media[0]
+        "first audio segment should be a-0.m4s; got {}",
+        audio_media[0]
     );
     assert!(
         audio_media[1].contains("a-4000.m4s"),
-        "second audio segment should be a-4000.m4s; got {}", audio_media[1]
+        "second audio segment should be a-4000.m4s; got {}",
+        audio_media[1]
     );
 }
 
@@ -5208,7 +5475,11 @@ async fn multi_period_av_advances_through_period_boundary() {
         .unwrap();
 
     assert_eq!(session.period_count(), 2, "should have 2 periods");
-    assert_eq!(session.current_period_index(), 0, "should start in period 0");
+    assert_eq!(
+        session.current_period_index(),
+        0,
+        "should start in period 0"
+    );
 
     let metrics = default_metrics();
 
@@ -5238,10 +5509,15 @@ async fn multi_period_av_advances_through_period_boundary() {
                 Err(e) => panic!("unexpected audio error: {e}"),
             }
         }
-        if video_done && audio_done { break; }
+        if video_done && audio_done {
+            break;
+        }
     }
 
-    assert!(period1_completed, "session must have advanced through period boundary to period 1");
+    assert!(
+        period1_completed,
+        "session must have advanced through period boundary to period 1"
+    );
     assert!(video_done, "video must reach EOS after all periods");
     assert!(audio_done, "audio must reach EOS after all periods");
 
@@ -5252,10 +5528,22 @@ async fn multi_period_av_advances_through_period_boundary() {
     let has_p1_audio = urls.iter().any(|u| u.contains("p1-a-"));
     let has_p2_audio = urls.iter().any(|u| u.contains("p2-a-"));
 
-    assert!(has_p1_video, "period 1 video segment must have been fetched");
-    assert!(has_p2_video, "period 2 video segment must have been fetched");
-    assert!(has_p1_audio, "period 1 audio segment must have been fetched");
-    assert!(has_p2_audio, "period 2 audio segment must have been fetched");
+    assert!(
+        has_p1_video,
+        "period 1 video segment must have been fetched"
+    );
+    assert!(
+        has_p2_video,
+        "period 2 video segment must have been fetched"
+    );
+    assert!(
+        has_p1_audio,
+        "period 1 audio segment must have been fetched"
+    );
+    assert!(
+        has_p2_audio,
+        "period 2 audio segment must have been fetched"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -5338,7 +5626,8 @@ fn tick_gap_small_gap_jumped_regardless_of_jump_large_gaps_setting() {
     let target = result.unwrap();
     assert!(
         matches!(target.reason, GapSeekReason::GapJump { .. }),
-        "reason should be GapJump; got {:?}", target.reason
+        "reason should be GapJump; got {:?}",
+        target.reason
     );
 }
 
@@ -5384,17 +5673,27 @@ impl MediaSource for AudioUnsupportedMediaSource {
     fn is_type_supported(&self, mime_type: &str) -> bool {
         !mime_type.starts_with("audio/")
     }
-    fn ready_state(&self) -> ReadyState { self.0.ready_state() }
-    fn duration(&self) -> Option<f64> { self.0.duration() }
-    fn set_duration(&mut self, d: f64) -> Result<(), DashError> { self.0.set_duration(d) }
+    fn ready_state(&self) -> ReadyState {
+        self.0.ready_state()
+    }
+    fn duration(&self) -> Option<f64> {
+        self.0.duration()
+    }
+    fn set_duration(&mut self, d: f64) -> Result<(), DashError> {
+        self.0.set_duration(d)
+    }
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
         self.0.add_source_buffer(mime_type)
     }
     fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
         self.0.remove_source_buffer(mime_type)
     }
-    async fn end_of_stream(&mut self) -> Result<(), DashError> { self.0.end_of_stream().await }
-    fn close(&mut self) { self.0.close() }
+    async fn end_of_stream(&mut self) -> Result<(), DashError> {
+        self.0.end_of_stream().await
+    }
+    fn close(&mut self) {
+        self.0.close()
+    }
 }
 
 #[test]
@@ -5430,17 +5729,24 @@ async fn apply_live_pts_remap_sets_sink_timestamp_offset() {
     let mpd = dash_rs::manifest::parse(LIVE_AV_EPOCH_MPD).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let clock = Arc::new(FixedClock { now_ms_val: 0.0, unix_s_val: 1_000.0 });
+    let clock = Arc::new(FixedClock {
+        now_ms_val: 0.0,
+        unix_s_val: 1_000.0,
+    });
 
     let mut session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn dash_rs::clock::Clock>,
     )
     .unwrap();
 
     // Before remap: offset must be 0.
     assert_eq!(
-        session.live_pts_remap_offset_s(), 0.0,
+        session.live_pts_remap_offset_s(),
+        0.0,
         "remap offset should be 0 before apply_live_pts_remap"
     );
 
@@ -5474,7 +5780,10 @@ fn notify_paused_toggles_is_paused() {
     assert!(session.is_paused(), "should be paused after notify_paused");
 
     session.notify_playing();
-    assert!(!session.is_paused(), "should not be paused after notify_playing");
+    assert!(
+        !session.is_paused(),
+        "should not be paused after notify_playing"
+    );
 }
 
 /// Calling `notify_paused` twice is idempotent — `is_paused` remains true.
@@ -5483,7 +5792,10 @@ fn notify_paused_idempotent() {
     let mut session = session_from_xml(STATIC_MPD);
     session.notify_paused();
     session.notify_paused(); // second call must not panic
-    assert!(session.is_paused(), "should still be paused after double notify_paused");
+    assert!(
+        session.is_paused(),
+        "should still be paused after double notify_paused"
+    );
 }
 
 /// After `notify_playing` → `notify_paused` → `notify_playing`, paused time
@@ -5493,16 +5805,20 @@ fn notify_paused_idempotent() {
 /// We use a `FixedClock` so that `now_ms()` is fully controlled.
 #[test]
 fn estimated_buffer_level_excludes_paused_time() {
+    use dash_rs::clock::Clock;
     use std::cell::Cell;
     use std::sync::Arc;
-    use dash_rs::clock::Clock;
 
     // A clock whose `now_ms` advances on demand.
     struct StepClock(Cell<f64>);
     #[async_trait(?Send)]
     impl Clock for StepClock {
-        fn now_ms(&self) -> f64 { self.0.get() }
-        fn unix_s(&self) -> f64 { 0.0 }
+        fn now_ms(&self) -> f64 {
+            self.0.get()
+        }
+        fn unix_s(&self) -> f64 {
+            0.0
+        }
         async fn set_timeout(&self, _ms: f64) {}
     }
     // Safety: single-threaded test.
@@ -5515,9 +5831,13 @@ fn estimated_buffer_level_excludes_paused_time() {
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mut session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn Clock>,
-    ).unwrap();
+    )
+    .unwrap();
 
     // t=0: start playing; pretend 5 segments (5×2000ms=10s) are already
     // accounted for by a prior fetch (we set initial_segment_number manually
@@ -5595,22 +5915,29 @@ fn estimated_playback_position_s_nonzero_after_notify_playing() {
     // Even without sleeping, the position should be ≥ 0 and ≤ a few seconds.
     let pos = session.estimated_playback_position_s();
     assert!(pos >= 0.0, "position must be non-negative; got {pos}");
-    assert!(pos < 30.0, "position should be plausible (< 30 s); got {pos}");
+    assert!(
+        pos < 30.0,
+        "position should be plausible (< 30 s); got {pos}"
+    );
 }
 
 /// Pausing stops the playback clock; the position does not advance during
 /// the pause window.  We use a `StepClock` for determinism.
 #[test]
 fn estimated_playback_position_s_excludes_paused_time() {
+    use dash_rs::clock::Clock;
     use std::cell::Cell;
     use std::sync::Arc;
-    use dash_rs::clock::Clock;
 
     struct StepClock2(Cell<f64>);
     #[async_trait(?Send)]
     impl Clock for StepClock2 {
-        fn now_ms(&self) -> f64 { self.0.get() }
-        fn unix_s(&self) -> f64 { 0.0 }
+        fn now_ms(&self) -> f64 {
+            self.0.get()
+        }
+        fn unix_s(&self) -> f64 {
+            0.0
+        }
         async fn set_timeout(&self, _ms: f64) {}
     }
     unsafe impl Send for StepClock2 {}
@@ -5622,9 +5949,13 @@ fn estimated_playback_position_s_excludes_paused_time() {
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mut session = DashSession::from_mpd_with_clock(
-        mpd, base_url, fetcher, open_stub_source(),
+        mpd,
+        base_url,
+        fetcher,
+        open_stub_source(),
         Arc::clone(&clock) as Arc<dyn Clock>,
-    ).unwrap();
+    )
+    .unwrap();
 
     // t=0: start playing
     clock.0.set(0.0);
@@ -5633,7 +5964,10 @@ fn estimated_playback_position_s_excludes_paused_time() {
     // t=4000: 4 s elapsed playing
     clock.0.set(4_000.0);
     let pos_before_pause = session.estimated_playback_position_s();
-    assert!((pos_before_pause - 4.0).abs() < 0.01, "pos before pause = {pos_before_pause}");
+    assert!(
+        (pos_before_pause - 4.0).abs() < 0.01,
+        "pos before pause = {pos_before_pause}"
+    );
 
     // t=4000: pause
     session.notify_paused();
@@ -5662,7 +5996,10 @@ fn estimated_playback_position_s_excludes_paused_time() {
 async fn prune_all_tracks_noop_at_time_zero() {
     let mut session = session_from_xml(STATIC_MPD);
     // Should succeed without error even when no data is buffered.
-    session.prune_all_tracks(0.0, 30.0).await.expect("prune must not fail");
+    session
+        .prune_all_tracks(0.0, 30.0)
+        .await
+        .expect("prune must not fail");
 }
 
 /// `prune_all_tracks` succeeds even when both tracks are absent.
@@ -5671,7 +6008,10 @@ async fn prune_all_tracks_succeeds_with_no_tracks() {
     // Use an audio-only MPD so video track is absent.
     let mut session = session_from_xml(AUDIO_ONLY_MPD);
     assert!(!session.has_video(), "self-check");
-    session.prune_all_tracks(60.0, 0.0).await.expect("prune must not fail with absent video track");
+    session
+        .prune_all_tracks(60.0, 0.0)
+        .await
+        .expect("prune must not fail with absent video track");
 }
 
 /// `prune_all_tracks(current_time_s, keep_s)` removes buffered data up to
@@ -5682,7 +6022,7 @@ async fn prune_all_tracks_succeeds_with_no_tracks() {
 #[tokio::test]
 async fn prune_all_tracks_with_positive_time() {
     let mut session = session_from_xml(SEEK_MPD); // has both video + audio
-    // With an empty buffer, pruning any window is a no-op (no ranges to remove).
+                                                  // With an empty buffer, pruning any window is a no-op (no ranges to remove).
     session
         .prune_all_tracks(100.0, 30.0)
         .await
@@ -5714,7 +6054,9 @@ async fn abandon_timeout_returns_segment_abandoned_error() {
     use std::future;
 
     // A fetcher that hangs forever on media segments.
-    struct HangingFetcher { manifest: bytes::Bytes }
+    struct HangingFetcher {
+        manifest: bytes::Bytes,
+    }
 
     #[async_trait(?Send)]
     impl SegmentFetcher for HangingFetcher {
@@ -5741,12 +6083,16 @@ async fn abandon_timeout_returns_segment_abandoned_error() {
             future::pending::<()>().await;
             unreachable!()
         }
-        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> { Ok(true) }
+        async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
+            Ok(true)
+        }
         fn abort(&self) {}
     }
 
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let fetcher = HangingFetcher { manifest: bytes::Bytes::from(STATIC_MPD.to_string()) };
+    let fetcher = HangingFetcher {
+        manifest: bytes::Bytes::from(STATIC_MPD.to_string()),
+    };
     let mut session = DashSession::from_url(&url, fetcher, open_stub_source())
         .await
         .unwrap();
@@ -5754,7 +6100,9 @@ async fn abandon_timeout_returns_segment_abandoned_error() {
     // Set a 1 ms timeout — will fire almost immediately.
     session.set_abandon_timeout_ms(Some(1));
 
-    let result = session.fetch_next_segment(MediaType::Video, &default_metrics()).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &default_metrics())
+        .await;
     assert!(
         matches!(result, Err(DashError::SegmentAbandoned { .. })),
         "expected SegmentAbandoned with 1 ms timeout, got {result:?}"
@@ -6013,14 +6361,21 @@ async fn metrics_http_request_recorded_after_fetch() {
         .await
         .unwrap();
 
-    assert_eq!(session.metrics().http_requests.len(), 0,
-        "no HTTP records before any fetch");
+    assert_eq!(
+        session.metrics().http_requests.len(),
+        0,
+        "no HTTP records before any fetch"
+    );
 
     let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
-    session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+    session
+        .fetch_next_segment(MediaType::Video, &metrics)
+        .await
+        .unwrap();
 
     assert_eq!(
-        session.metrics().http_requests.len(), 1,
+        session.metrics().http_requests.len(),
+        1,
         "exactly one HTTP record after one fetch"
     );
 }
@@ -6037,11 +6392,23 @@ async fn metrics_http_request_has_correct_fields() {
 
     // 10 Mbps throughput → ABR should select highest quality (index 2 = "high").
     let high_metrics = AbrMetrics::new(10_000_000.0, 4_000.0);
-    session.fetch_next_segment(MediaType::Video, &high_metrics).await.unwrap();
+    session
+        .fetch_next_segment(MediaType::Video, &high_metrics)
+        .await
+        .unwrap();
 
-    let rec = session.metrics().last_http_request().expect("must have a record");
-    assert_eq!(rec.segment_number, 1, "first segment number is 1 (startNumber=1)");
-    assert_eq!(rec.quality_index, 2, "10 Mbps throughput must select highest rep (index 2)");
+    let rec = session
+        .metrics()
+        .last_http_request()
+        .expect("must have a record");
+    assert_eq!(
+        rec.segment_number, 1,
+        "first segment number is 1 (startNumber=1)"
+    );
+    assert_eq!(
+        rec.quality_index, 2,
+        "10 Mbps throughput must select highest rep (index 2)"
+    );
     assert!(rec.bytes_received == 0, "stub fetcher returns empty bytes");
     assert!(!rec.url.is_empty(), "URL must be non-empty");
 }
@@ -6057,9 +6424,13 @@ async fn metrics_buffer_level_sample_recorded_per_fetch() {
 
     let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
     for i in 1..=3u64 {
-        session.fetch_next_segment(MediaType::Video, &metrics).await.unwrap();
+        session
+            .fetch_next_segment(MediaType::Video, &metrics)
+            .await
+            .unwrap();
         assert_eq!(
-            session.metrics().buffer_level_samples.len(), i as usize,
+            session.metrics().buffer_level_samples.len(),
+            i as usize,
             "buffer_level_samples must grow by one per fetch"
         );
     }
@@ -6077,19 +6448,34 @@ async fn metrics_representation_switch_recorded() {
 
     // First fetch at low throughput → selects index 0 ("low").
     let low_metrics = AbrMetrics::new(200_000.0, 4_000.0);
-    session.fetch_next_segment(MediaType::Video, &low_metrics).await.unwrap();
-    assert_eq!(session.metrics().representation_switches.len(), 0,
-        "no switch on the first fetch (initial selection is not a switch)");
+    session
+        .fetch_next_segment(MediaType::Video, &low_metrics)
+        .await
+        .unwrap();
+    assert_eq!(
+        session.metrics().representation_switches.len(),
+        0,
+        "no switch on the first fetch (initial selection is not a switch)"
+    );
 
     // Second fetch at very high throughput → ABR up-switches.
     let high_metrics = AbrMetrics::new(50_000_000.0, 12_000.0);
-    session.fetch_next_segment(MediaType::Video, &high_metrics).await.unwrap();
+    session
+        .fetch_next_segment(MediaType::Video, &high_metrics)
+        .await
+        .unwrap();
 
     // There may or may not be a switch depending on switch-history throttle;
     // if a switch occurred validate the record.
     if let Some(sw) = session.metrics().last_switch() {
-        assert_eq!(sw.to_index, 2, "up-switch with 50 Mbps must target highest rep");
-        assert!(sw.to_index > sw.from_index, "to_index must be higher than from_index");
+        assert_eq!(
+            sw.to_index, 2,
+            "up-switch with 50 Mbps must target highest rep"
+        );
+        assert!(
+            sw.to_index > sw.from_index,
+            "to_index must be higher than from_index"
+        );
     }
     // (switch-history throttle may suppress the switch on the second segment —
     // the important invariant is that if a record exists it is well-formed)
@@ -6147,15 +6533,19 @@ async fn metrics_ring_buffer_caps_at_100() {
 /// time and corrupt the buffer-level estimate).
 #[tokio::test]
 async fn sync_pause_state_idempotent() {
-    use std::sync::Arc;
     use dash_rs::clock::Clock;
     use std::cell::Cell;
+    use std::sync::Arc;
 
     struct AdvancingClock(Cell<f64>);
     #[async_trait(?Send)]
     impl Clock for AdvancingClock {
-        fn now_ms(&self) -> f64 { self.0.get() }
-        fn unix_s(&self) -> f64 { 0.0 }
+        fn now_ms(&self) -> f64 {
+            self.0.get()
+        }
+        fn unix_s(&self) -> f64 {
+            0.0
+        }
         async fn set_timeout(&self, _ms: f64) {}
     }
     unsafe impl Send for AdvancingClock {}
@@ -6165,9 +6555,9 @@ async fn sync_pause_state_idempotent() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
     let base = url::Url::parse("http://example.com/").unwrap();
-    let mut session = DashSession::from_mpd_with_clock(
-        mpd, base, fetcher, open_stub_source(), clock.clone(),
-    ).unwrap();
+    let mut session =
+        DashSession::from_mpd_with_clock(mpd, base, fetcher, open_stub_source(), clock.clone())
+            .unwrap();
 
     session.notify_playing();
 
@@ -6190,15 +6580,19 @@ async fn sync_pause_state_idempotent() {
 /// draining when playing is signalled.
 #[tokio::test]
 async fn sync_pause_state_pause_resume_unfreezes_estimate() {
-    use std::sync::Arc;
     use dash_rs::clock::Clock;
     use std::cell::Cell;
+    use std::sync::Arc;
 
     struct SteppableClock(Cell<f64>);
     #[async_trait(?Send)]
     impl Clock for SteppableClock {
-        fn now_ms(&self) -> f64 { self.0.get() }
-        fn unix_s(&self) -> f64 { 0.0 }
+        fn now_ms(&self) -> f64 {
+            self.0.get()
+        }
+        fn unix_s(&self) -> f64 {
+            0.0
+        }
         async fn set_timeout(&self, _ms: f64) {}
     }
     unsafe impl Send for SteppableClock {}
@@ -6208,9 +6602,9 @@ async fn sync_pause_state_pause_resume_unfreezes_estimate() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
     let base = url::Url::parse("http://example.com/").unwrap();
-    let mut session = DashSession::from_mpd_with_clock(
-        mpd, base, fetcher, open_stub_source(), clock.clone(),
-    ).unwrap();
+    let mut session =
+        DashSession::from_mpd_with_clock(mpd, base, fetcher, open_stub_source(), clock.clone())
+            .unwrap();
 
     session.notify_playing();
 
@@ -6254,9 +6648,7 @@ async fn wait_for_buffer_capacity_returns_immediately_when_below_target() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
     let base = url::Url::parse("http://example.com/").unwrap();
-    let mut session = DashSession::from_mpd(
-        mpd, base, fetcher, open_stub_source(),
-    ).unwrap();
+    let mut session = DashSession::from_mpd(mpd, base, fetcher, open_stub_source()).unwrap();
 
     session.notify_playing();
 
@@ -6283,16 +6675,16 @@ mod run_driver_tests {
     // optionally injects a fixed throughput override.
     struct CountingDriver {
         /// Number of times `on_iteration_start` has been called.
-        iterations:      u32,
+        iterations: u32,
         /// Loop exits (via `should_continue`) once this count is reached.
-        max_iterations:  u32,
+        max_iterations: u32,
         /// Most recent video quality-decision index from `on_iteration`.
         last_video_index: Option<usize>,
         /// Most recent video quality-decision reason from `on_iteration`.
         last_video_reason: Option<AbrDecisionReason>,
         /// Fixed throughput to feed into ABR, or `None` to let the library
         /// use its internal `ThroughputTracker`.
-        throughput_bps:  Option<f64>,
+        throughput_bps: Option<f64>,
     }
 
     unsafe impl Send for CountingDriver {}
@@ -6300,7 +6692,9 @@ mod run_driver_tests {
 
     #[async_trait]
     impl PlaybackDriver for CountingDriver {
-        fn position_s(&self) -> f64 { 0.0 }
+        fn position_s(&self) -> f64 {
+            0.0
+        }
 
         fn should_continue(&self) -> bool {
             self.iterations < self.max_iterations
@@ -6324,11 +6718,11 @@ mod run_driver_tests {
 
     fn counting_driver(max: u32, throughput: Option<f64>) -> CountingDriver {
         CountingDriver {
-            iterations:        0,
-            max_iterations:    max,
-            last_video_index:  None,
+            iterations: 0,
+            max_iterations: max,
+            last_video_index: None,
             last_video_reason: None,
-            throughput_bps:    throughput,
+            throughput_bps: throughput,
         }
     }
 
@@ -6344,7 +6738,10 @@ mod run_driver_tests {
         let mut drv = counting_driver(u32::MAX, None);
         session.run(&mut drv).await.unwrap();
         // 3 segments → EOS fires on the 4th fetch call → 4 loop iterations.
-        assert_eq!(drv.iterations, 4, "expected 4 iterations (3 fetches + 1 EOS detection)");
+        assert_eq!(
+            drv.iterations, 4,
+            "expected 4 iterations (3 fetches + 1 EOS detection)"
+        );
     }
 
     /// `should_continue()` returning `false` exits the loop before EOS.

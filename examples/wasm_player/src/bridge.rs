@@ -101,7 +101,8 @@ extern "C" {
 
     // sb.changeType(mimeType)
     #[wasm_bindgen(method, catch, js_name = changeType)]
-    pub(crate) fn change_type(this: &JsBridge, sb_id: &str, mime_type: &str) -> Result<(), JsValue>;
+    pub(crate) fn change_type(this: &JsBridge, sb_id: &str, mime_type: &str)
+        -> Result<(), JsValue>;
 
     // sb.buffered  →  flat Float64Array [start0, end0, start1, end1, …]
     #[wasm_bindgen(method, js_name = getBuffered)]
@@ -163,8 +164,8 @@ pub(crate) fn js_err(val: JsValue) -> String {
         .and_then(|v| v.as_string());
     match (name, message) {
         (Some(n), Some(m)) if !m.is_empty() => format!("{n}: {m}"),
-        (Some(n), _) if !n.is_empty()       => n,
-        (_, Some(m)) if !m.is_empty()        => m,
+        (Some(n), _) if !n.is_empty() => n,
+        (_, Some(m)) if !m.is_empty() => m,
         _ => js_sys::JSON::stringify(&val)
             .ok()
             .and_then(|s| s.as_string())

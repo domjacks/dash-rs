@@ -239,18 +239,12 @@ mod tests {
 
     #[test]
     fn iso_pt1h() {
-        assert_eq!(
-            parse_iso_duration("PT1H"),
-            Some(Duration::from_secs(3_600))
-        );
+        assert_eq!(parse_iso_duration("PT1H"), Some(Duration::from_secs(3_600)));
     }
 
     #[test]
     fn iso_p1d() {
-        assert_eq!(
-            parse_iso_duration("P1D"),
-            Some(Duration::from_secs(86_400))
-        );
+        assert_eq!(parse_iso_duration("P1D"), Some(Duration::from_secs(86_400)));
     }
 
     #[test]
@@ -341,10 +335,7 @@ mod tests {
     #[test]
     fn pre_epoch() {
         // 1969-12-31T00:00:00Z = -86400
-        assert_eq!(
-            parse_xs_datetime("1969-12-31T00:00:00Z"),
-            Some(-86_400.0)
-        );
+        assert_eq!(parse_xs_datetime("1969-12-31T00:00:00Z"), Some(-86_400.0));
     }
 
     #[test]
@@ -388,10 +379,7 @@ mod tests {
     #[test]
     fn leading_trailing_whitespace_accepted() {
         // `s.trim()` is called at the top of `parse_xs_datetime`.
-        assert_eq!(
-            parse_xs_datetime("  1970-01-01T00:00:00Z  "),
-            Some(0.0)
-        );
+        assert_eq!(parse_xs_datetime("  1970-01-01T00:00:00Z  "), Some(0.0));
     }
 
     #[test]

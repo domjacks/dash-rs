@@ -12,8 +12,8 @@ use dash_rs::{
     media_source::{MediaSource, ReadyState, SourceBuffer},
     DashError,
 };
-use wasm_bindgen::JsValue;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::JsValue;
 
 use crate::bridge::{js_err, JsBridge};
 use crate::source_buffer::BridgeSourceBuffer;
@@ -21,13 +21,16 @@ use crate::source_buffer::BridgeSourceBuffer;
 // ── BridgeMediaSource ─────────────────────────────────────────────────────────
 
 pub(crate) struct BridgeMediaSource {
-    bridge:     JsBridge,
+    bridge: JsBridge,
     mime_to_id: HashMap<String, String>,
 }
 
 impl BridgeMediaSource {
     pub(crate) fn new(bridge: JsBridge) -> Self {
-        Self { bridge, mime_to_id: HashMap::new() }
+        Self {
+            bridge,
+            mime_to_id: HashMap::new(),
+        }
     }
 }
 
@@ -35,15 +38,19 @@ impl BridgeMediaSource {
 impl MediaSource for BridgeMediaSource {
     fn ready_state(&self) -> ReadyState {
         match self.bridge.get_ready_state().as_str() {
-            "open"  => ReadyState::Open,
+            "open" => ReadyState::Open,
             "ended" => ReadyState::Ended,
-            _       => ReadyState::Closed,
+            _ => ReadyState::Closed,
         }
     }
 
     fn duration(&self) -> Option<f64> {
         let d = self.bridge.get_duration();
-        if d.is_nan() || d < 0.0 { None } else { Some(d) }
+        if d.is_nan() || d < 0.0 {
+            None
+        } else {
+            Some(d)
+        }
     }
 
     fn set_duration(&mut self, duration: f64) -> Result<(), DashError> {
@@ -66,7 +73,8 @@ impl MediaSource for BridgeMediaSource {
 
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
         tracing::debug!(mime_type, "BridgeMediaSource: addSourceBuffer");
-        let sb_id = self.bridge
+        let sb_id = self
+            .bridge
             .add_source_buffer(mime_type)
             .map_err(|e| DashError::AppendFailed(js_err(e)))?;
         self.mime_to_id.insert(mime_type.to_owned(), sb_id.clone());
@@ -78,9 +86,12 @@ impl MediaSource for BridgeMediaSource {
     }
 
     fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
-        let sb_id = self.mime_to_id.remove(mime_type).ok_or_else(|| {
-            DashError::SourceBufferNotFound { mime_type: mime_type.to_owned() }
-        })?;
+        let sb_id =
+            self.mime_to_id
+                .remove(mime_type)
+                .ok_or_else(|| DashError::SourceBufferNotFound {
+                    mime_type: mime_type.to_owned(),
+                })?;
         self.bridge
             .remove_source_buffer_by_id(&sb_id)
             .map_err(|e| DashError::AppendFailed(js_err(e)))?;

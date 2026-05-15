@@ -47,34 +47,37 @@ impl BridgeFetcher {
 #[async_trait(?Send)]
 impl SegmentFetcher for BridgeFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
-        let range_header = request
-            .byte_range
-            .map(|(s, e)| format!("bytes={s}-{e}"));
+        let range_header = request.byte_range.map(|(s, e)| format!("bytes={s}-{e}"));
 
-        let resolved = JsFuture::from(
-            self.bridge.fetch_bytes(request.url.as_str(), range_header),
-        )
-        .await
-        .map_err(|e| FetchError::Network {
-            url:     request.url.clone(),
-            message: js_err(e),
-        })?;
+        let resolved = JsFuture::from(self.bridge.fetch_bytes(request.url.as_str(), range_header))
+            .await
+            .map_err(|e| FetchError::Network {
+                url: request.url.clone(),
+                message: js_err(e),
+            })?;
 
         // Cast the resolved JS object to our typed FetchResult accessor.
-        let result: FetchResult       = resolved.unchecked_into();
-        let data                      = Bytes::from(result.data().to_vec());
-        let bytes_received            = data.len() as u64;
-        let transfer_duration_ms      = result.duration_ms() as u64;
-        let final_url                 = Url::parse(&result.final_url())
-            .unwrap_or_else(|_| request.url.clone());
+        let result: FetchResult = resolved.unchecked_into();
+        let data = Bytes::from(result.data().to_vec());
+        let bytes_received = data.len() as u64;
+        let transfer_duration_ms = result.duration_ms() as u64;
+        let final_url = Url::parse(&result.final_url()).unwrap_or_else(|_| request.url.clone());
 
-        Ok(FetchResponse { final_url, data, transfer_duration_ms, bytes_received })
+        Ok(FetchResponse {
+            final_url,
+            data,
+            transfer_duration_ms,
+            bytes_received,
+        })
     }
 
     async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
         let ok = JsFuture::from(self.bridge.check_exists(url.as_str()))
             .await
-            .map_err(|e| FetchError::Network { url: url.clone(), message: js_err(e) })?;
+            .map_err(|e| FetchError::Network {
+                url: url.clone(),
+                message: js_err(e),
+            })?;
         Ok(ok.as_bool().unwrap_or(false))
     }
 

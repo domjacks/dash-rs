@@ -17,7 +17,7 @@ use crate::bridge::JsBridge;
 /// Stores `start_ms` (captured at construction) so that [`Clock::now_ms`]
 /// returns elapsed time rather than an absolute `performance.now()` value.
 pub(crate) struct BridgeClock {
-    bridge:   JsBridge,
+    bridge: JsBridge,
     start_ms: f64,
 }
 

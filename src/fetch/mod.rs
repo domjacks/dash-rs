@@ -1,12 +1,16 @@
 pub mod stub;
 
+use crate::Url;
+#[cfg(not(feature = "std"))]
+use alloc::{
+    borrow::ToOwned,
+    boxed::Box,
+    string::{String, ToString},
+    vec::Vec,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
-use url::Url;
-
-#[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String, vec::Vec};
 
 // ── Error ─────────────────────────────────────────────────────────────────────
 
@@ -177,7 +181,9 @@ mod tests {
     fn throughput_computes_correctly() {
         // 125 000 bytes in 1 000 ms = 1 Mbps.
         let resp = make_response(125_000, 1_000);
-        let bps = resp.throughput_bps().expect("should return Some for non-zero duration");
+        let bps = resp
+            .throughput_bps()
+            .expect("should return Some for non-zero duration");
         assert!(
             (bps - 1_000_000.0).abs() < 1.0,
             "expected 1_000_000 bps, got {bps}"
@@ -186,8 +192,8 @@ mod tests {
 
     #[test]
     fn with_byte_range_sets_field() {
-        let req = FetchRequest::new(dummy_url(), RequestType::MediaSegment)
-            .with_byte_range(100, 199);
+        let req =
+            FetchRequest::new(dummy_url(), RequestType::MediaSegment).with_byte_range(100, 199);
         assert_eq!(req.byte_range, Some((100, 199)));
     }
 
