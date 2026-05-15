@@ -523,8 +523,9 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
-| Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
-| Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
+ | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
+ | `PlaybackDriver` trait + `IterationSummary` (`DashSession::run`) | `src/session/driver.rs` |
+ | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
 | Epoch-scale PTS remapping (`apply_live_pts_remap`, `live_pts_remap_offset_s`) | `src/session/mod.rs` |
 | Formal metrics (`DashMetrics`, `HttpRequestRecord`, `RepresentationSwitchRecord`, `BufferLevelSample`) | `src/session/metrics.rs` |
 | MPD helpers (`merge_segment_templates`, `extract_segment_timing`, `find_adaptation`, etc.) | `src/session/mpd.rs` |

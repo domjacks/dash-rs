@@ -29,7 +29,7 @@
 //! media_source.open();
 //!
 //! // 2. Load the manifest and start a session.
-//! let url = Url::parse("https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd").unwrap();
+//! let url = Url::parse("https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd").unwrap();
 //! let mut session = DashSession::from_url(&url, StubSegmentFetcher, media_source).await?;
 //!
 //! // 3. Provide real throughput / buffer measurements; use zeroed placeholders here.
@@ -63,3 +63,4 @@ pub use session::{
     BufferLevelSample, DashEvent, DashMetrics, DashSession, GapControllerSettings, GapSeekReason,
     GapSeekTarget, HttpRequestRecord, MediaType, RepresentationSwitchRecord,
 };
+pub use session::driver::{IterationSummary, PlaybackDriver};

@@ -21,6 +21,7 @@
 //! | `utc` | `resolve_utc_timing`, `query_http_utc` — `UTCTiming` clock-sync |
 
 mod blacklist;
+pub mod driver;
 mod gap;
 mod live;
 pub mod metrics;
@@ -1435,6 +1436,189 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// ```
     pub fn clock_arc(&self) -> Arc<dyn Clock> {
         Arc::clone(&self.clock)
+    }
+
+    // ── High-level playback loop ──────────────────────────────────────────────
+
+    /// Drive the full DASH segment fetch loop until end-of-stream (or until
+    /// [`PlaybackDriver::should_continue`] returns `false`).
+    ///
+    /// This is the recommended entry point for applications that want the
+    /// library to handle the fetch-loop bookkeeping.  Per-iteration callbacks
+    /// on [`PlaybackDriver`] let callers inject platform-specific behaviour
+    /// (renderer position, pause state, gap-fill seek, throughput measurement,
+    /// progress reporting) without duplicating the loop structure.
+    ///
+    /// # What `run` does each iteration
+    ///
+    /// 1. Calls [`PlaybackDriver::sync_pause_state`][Self::sync_pause_state]
+    ///    so buffer-level estimates stay accurate during pauses.
+    /// 2. Calls [`PlaybackDriver::on_iteration_start`] with the session's
+    ///    current estimated playback position.
+    /// 3. Optionally calls [`prune_all_tracks`][Self::prune_all_tracks] when
+    ///    [`PlaybackDriver::enable_pruning`] returns `true`.
+    /// 4. Ticks the gap controller and calls
+    ///    [`PlaybackDriver::on_gap_seek`] when a seek is recommended.
+    /// 5. Waits for the primary (video-preferred) buffer to drain below
+    ///    [`buffer_target_ms`][Self::buffer_target_ms].
+    /// 6. Fetches the next video segment; handles `EndOfStream` gracefully.
+    /// 7. Waits for the audio buffer to drain below the threshold returned by
+    ///    [`PlaybackDriver::audio_gate_target_ms`].
+    /// 8. Fetches the next audio segment; handles `EndOfStream` gracefully.
+    /// 9. Calls [`PlaybackDriver::on_iteration`] with an [`IterationSummary`].
+    ///
+    /// After the loop, [`end_of_stream`][Self::end_of_stream] is called
+    /// regardless of whether the exit was via EOS or `should_continue`.
+    ///
+    /// [`IterationSummary`]: driver::IterationSummary
+    /// [`PlaybackDriver`]: driver::PlaybackDriver
+    pub async fn run<D: driver::PlaybackDriver>(
+        &mut self,
+        drv: &mut D,
+    ) -> Result<(), DashError> {
+        use driver::IterationSummary;
+
+        let gate = if self.has_video() { MediaType::Video } else { MediaType::Audio };
+        let mut video_done = !self.has_video();
+        let mut audio_done = !self.has_audio();
+
+        self.notify_playing();
+
+        loop {
+            if video_done && audio_done {
+                break;
+            }
+            if !drv.should_continue() {
+                break;
+            }
+
+            // ── 1. Pause sync ────────────────────────────────────────────────
+            self.sync_pause_state(drv.is_paused());
+
+            // ── 2. Iteration start ───────────────────────────────────────────
+            let session_pos = self.estimated_playback_position_s();
+            drv.on_iteration_start(session_pos);
+
+            // ── 3. Optional pruning ──────────────────────────────────────────
+            if drv.enable_pruning() {
+                self.prune_all_tracks(session_pos, self.buffer_to_keep_s()).await?;
+            }
+
+            // ── 4. Gap controller ────────────────────────────────────────────
+            {
+                let pos = drv.position_s();
+                let buffered = self.buffered(gate.clone());
+                if let Some(target) = self.tick_gap(pos, &buffered, drv.is_paused()) {
+                    tracing::info!(
+                        pos,
+                        seek_to = target.position_s,
+                        reason  = ?target.reason,
+                        "gap controller: seeking"
+                    );
+                    self.seek_to(target.position_s);
+                    drv.on_gap_seek(target).await;
+                    self.notify_playing();
+                }
+            }
+
+            // ── 5. Video buffer gate ─────────────────────────────────────────
+            self.wait_for_buffer_capacity(&gate, || drv.is_paused()).await;
+
+            // ── 6. Video fetch ───────────────────────────────────────────────
+            let pos      = drv.position_s();
+            let bps      = drv.throughput_override_bps();
+            let mut video_decision = None;
+
+            if !video_done {
+                let mut m = self.current_metrics(MediaType::Video, pos);
+                if let Some(b) = bps { m.throughput_bps = b; }
+                match self.fetch_next_segment(MediaType::Video, &m).await {
+                    Ok(d) => {
+                        tracing::debug!(index = d.index, reason = ?d.reason, "video segment fetched");
+                        video_decision = Some(d);
+                    }
+                    Err(DashError::EndOfStream { .. }) => {
+                        tracing::info!("video: end of stream");
+                        video_done = true;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // ── 7. Audio buffer gate (custom target via driver) ──────────────
+            if !audio_done {
+                let vbuf = self.estimated_buffer_level_ms(&MediaType::Video);
+                let audio_target = drv.audio_gate_target_ms(vbuf, self.buffer_target_ms());
+                let clock = Arc::clone(&self.clock);
+                while self.estimated_buffer_level_ms(&MediaType::Audio) >= audio_target {
+                    tracing::debug!(
+                        buf_ms = self.estimated_buffer_level_ms(&MediaType::Audio) as u64,
+                        target_ms = audio_target as u64,
+                        "audio buffer gate: waiting"
+                    );
+                    clock.set_timeout(500.0).await;
+                    self.sync_pause_state(drv.is_paused());
+                }
+            }
+
+            // ── 8. Audio fetch ───────────────────────────────────────────────
+            let mut audio_decision = None;
+
+            if !audio_done {
+                let mut m = self.current_metrics(MediaType::Audio, pos);
+                if let Some(b) = bps { m.throughput_bps = b; }
+                match self.fetch_next_segment(MediaType::Audio, &m).await {
+                    Ok(d) => {
+                        tracing::debug!(index = d.index, reason = ?d.reason, "audio segment fetched");
+                        audio_decision = Some(d);
+                    }
+                    Err(DashError::EndOfStream { .. }) => {
+                        tracing::info!("audio: end of stream");
+                        audio_done = true;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+
+            // ── 9. Progress callback ─────────────────────────────────────────
+            let (last_url, last_tms, last_tbps) = self
+                .metrics()
+                .last_http_request()
+                .map(|r| {
+                    (r.url.clone(), r.transfer_duration_ms, r.throughput_bps.unwrap_or(0.0))
+                })
+                .unwrap_or_default();
+
+            let video_bw = video_decision
+                .as_ref()
+                .and_then(|d| self.video_representations().get(d.index))
+                .map(|r| r.bandwidth)
+                .unwrap_or(0);
+            let audio_bw = audio_decision
+                .as_ref()
+                .and_then(|d| self.audio_representations().get(d.index))
+                .map(|r| r.bandwidth)
+                .unwrap_or(0);
+
+            drv.on_iteration(&IterationSummary {
+                position_s:          session_pos,
+                video_decision:      video_decision.as_ref(),
+                audio_decision:      audio_decision.as_ref(),
+                video_bandwidth:     video_bw,
+                audio_bandwidth:     audio_bw,
+                video_buffer_ms:     self.estimated_buffer_level_ms(&MediaType::Video),
+                audio_buffer_ms:     self.estimated_buffer_level_ms(&MediaType::Audio),
+                buffer_target_ms:    self.buffer_target_ms(),
+                http_request_count:  self.metrics().http_requests.len(),
+                switch_count:        self.metrics().representation_switches.len(),
+                last_transfer_url:   last_url,
+                last_transfer_ms:    last_tms,
+                last_throughput_bps: last_tbps,
+            });
+        }
+
+        self.end_of_stream().await?;
+        Ok(())
     }
 
     /// Estimated buffer level ahead of the current playback position, in

@@ -57,15 +57,298 @@ two traits.
 
 ## Getting started
 
-Add dash-rs to your `Cargo.toml`:
+To play a DASH stream you need to provide three trait implementations and a
+driver struct, then call two functions. The library handles ABR, buffer gating,
+live manifest refresh, multi-period transitions, gap detection, and
+end-of-stream signalling.
+
+| What to implement | Trait | Role |
+|---|---|---|
+| Segment fetcher | `SegmentFetcher` | Downloads manifests and media segments |
+| Media buffer | `SourceBuffer` | Receives raw fMP4/WebM bytes; `append_buffer` feeds them to your decoder |
+| Media container | `MediaSource` | Creates `SourceBuffer` instances and signals end-of-stream |
+| Playback driver | `PlaybackDriver` | Supplies the renderer's position and pause state to the fetch loop |
+
+### 1. Add the dependency
 
 ```toml
 [dependencies]
-dash-rs = { git = "https://github.com/jacksd60/dash-rs" }
-
-# dash-rs uses async traits; bring a runtime of your choice
-tokio = { version = "1", features = ["full"] }
+dash-rs     = { git = "https://github.com/jacksd60/dash-rs" }
+async-trait = "0.1"
+bytes       = "1"
+reqwest     = { version = "0.12", features = ["stream"] }
+tokio       = { version = "1", features = ["full"] }
 ```
+
+### 2. Implement `SegmentFetcher`
+
+Called by the session to download every manifest and media segment.
+
+```rust
+use std::time::Instant;
+use async_trait::async_trait;
+use dash_rs::fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
+use url::Url;
+
+struct HttpFetcher {
+    client: reqwest::Client,
+}
+
+impl HttpFetcher {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::builder()
+                .user_agent("my-player/0.1")
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .expect("failed to build HTTP client"),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl SegmentFetcher for HttpFetcher {
+    async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse, FetchError> {
+        let mut builder = self.client.get(req.url.as_str());
+        if let Some((start, end)) = req.byte_range {
+            builder = builder.header("Range", format!("bytes={start}-{end}"));
+        }
+        let t0   = Instant::now();
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| FetchError::Network { url: req.url.clone(), message: e.to_string() })?;
+        let status = resp.status().as_u16();
+        if status != 200 && status != 206 {
+            return Err(FetchError::Http { status, url: req.url });
+        }
+        let data = resp
+            .bytes()
+            .await
+            .map_err(|e| FetchError::Network { url: req.url.clone(), message: e.to_string() })?;
+        Ok(FetchResponse {
+            final_url:            req.url,
+            transfer_duration_ms: t0.elapsed().as_millis() as u64,
+            bytes_received:       data.len() as u64,
+            data,
+        })
+    }
+
+    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
+        let resp = self.client
+            .head(url.as_str())
+            .send()
+            .await
+            .map_err(|e| FetchError::Network { url: url.clone(), message: e.to_string() })?;
+        Ok(resp.status().is_success())
+    }
+
+    fn abort(&self) {}
+}
+```
+
+### 3. Implement `SourceBuffer` and `MediaSource`
+
+`SourceBuffer` is where your decoder integration lives.  Implement
+`append_buffer` to forward `chunk.data` to your pipeline — every other method
+is bookkeeping used by the session.
+
+`MediaSource` creates `SourceBuffer` instances (one per track) and signals
+end-of-stream to the renderer.
+
+```rust
+use async_trait::async_trait;
+use dash_rs::{
+    error::DashError,
+    media_source::{Chunk, MediaSource, ReadyState, SourceBuffer, TimeRange},
+};
+
+// ── SourceBuffer ──────────────────────────────────────────────────────────────
+
+struct MySourceBuffer {
+    mime:      String,
+    ts_offset: f64,
+    win_start: f64,
+    win_end:   f64,
+}
+
+impl MySourceBuffer {
+    fn new(mime: &str) -> Self {
+        Self {
+            mime:      mime.to_string(),
+            ts_offset: 0.0,
+            win_start: 0.0,
+            win_end:   f64::INFINITY,
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl SourceBuffer for MySourceBuffer {
+    fn mime_type(&self)           -> &str           { &self.mime }
+    fn is_updating(&self)         -> bool           { false }
+    fn buffered(&self)            -> Vec<TimeRange> { vec![] }
+    fn timestamp_offset(&self)    -> f64            { self.ts_offset }
+    fn set_timestamp_offset(&mut self, v: f64)      { self.ts_offset = v; }
+    fn append_window_start(&self) -> f64            { self.win_start }
+    fn set_append_window_start(&mut self, v: f64)   { self.win_start = v; }
+    fn append_window_end(&self)   -> f64            { self.win_end }
+    fn set_append_window_end(&mut self, v: f64)     { self.win_end = v; }
+
+    async fn append_buffer(&mut self, chunk: Chunk) -> Result<(), DashError> {
+        // Send chunk.data to your decoder here.
+        // chunk.label identifies the track, e.g. "video/init" or "audio/seg-3".
+        let _ = chunk;
+        Ok(())
+    }
+
+    async fn remove(&mut self, _: f64, _: f64) -> Result<(), DashError> { Ok(()) }
+    async fn abort(&mut self)                   -> Result<(), DashError> { Ok(()) }
+    async fn change_type(&mut self, mime: &str) -> Result<(), DashError> {
+        self.mime = mime.to_string();
+        Ok(())
+    }
+}
+
+// ── MediaSource ───────────────────────────────────────────────────────────────
+
+struct MyMediaSource {
+    duration: Option<f64>,
+}
+
+impl MyMediaSource {
+    fn new() -> Self { Self { duration: None } }
+}
+
+#[async_trait(?Send)]
+impl MediaSource for MyMediaSource {
+    fn ready_state(&self) -> ReadyState  { ReadyState::Open }
+    fn duration(&self)    -> Option<f64> { self.duration }
+
+    fn set_duration(&mut self, d: f64) -> Result<(), DashError> {
+        self.duration = Some(d);
+        Ok(())
+    }
+
+    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
+        Ok(Box::new(MySourceBuffer::new(mime_type)))
+    }
+
+    fn remove_source_buffer(&mut self, _: &str) -> Result<(), DashError> { Ok(()) }
+
+    async fn end_of_stream(&mut self) -> Result<(), DashError> {
+        // Signal your renderer that all media has been delivered.
+        Ok(())
+    }
+
+    fn close(&mut self) {}
+}
+```
+
+### 4. Implement `PlaybackDriver`
+
+`PlaybackDriver` is how `run()` reads your renderer's state.  `position_s` is
+the only required method — every other method has a sensible default.
+
+```rust
+use async_trait::async_trait;
+use dash_rs::session::driver::PlaybackDriver;
+
+struct MyDriver {
+    // Your renderer handle, or nothing for a headless setup.
+}
+
+#[async_trait(?Send)]
+impl PlaybackDriver for MyDriver {
+    /// Current playback position in seconds.
+    /// For a headless setup (no real renderer) returning 0.0 is fine.
+    fn position_s(&self) -> f64 {
+        0.0 // replace with: self.renderer.current_position_s()
+    }
+
+    /// Whether the renderer is currently paused.
+    /// Keeps the buffer-level estimate accurate while paused.
+    fn is_paused(&self) -> bool {
+        false // replace with: self.renderer.is_paused()
+    }
+}
+```
+
+Override additional methods as needed:
+
+| Method | Default | When to override |
+|---|---|---|
+| `on_gap_seek(target)` | no-op | Seek the renderer when the gap controller fills a stall |
+| `throughput_override_bps()` | `None` (internal tracker) | Feed externally measured bandwidth to the ABR controller |
+| `audio_gate_target_ms(vbuf, default)` | `default` | Slave audio buffering to video level (e.g. GStreamer) |
+| `enable_pruning()` | `false` | Evict old buffer data on native renderers |
+| `should_continue()` | `true` | Exit the fetch loop early |
+| `on_iteration_start(pos)` | no-op | Advance per-iteration state before a fetch |
+| `on_iteration(summary)` | no-op | Progress reporting and UI updates after each segment pair |
+
+### 5. Start playback
+
+```rust
+use url::Url;
+use dash_rs::session::DashSession;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let url = Url::parse("https://example.com/stream.mpd")?;
+    let mut session = DashSession::from_url(
+        &url,
+        HttpFetcher::new(),
+        MyMediaSource::new(),
+    ).await?;
+
+    // Live streams only: shift large epoch-scale decode timestamps to ≈ 0
+    // so the first segment lands at a predictable position in the renderer.
+    // Do NOT call this for GStreamer — use GstMediaSource::set_live_mode(true) instead.
+    if session.is_live() {
+        session.apply_live_pts_remap().await?;
+    }
+
+    // run() handles ABR, buffer gating, gap detection, live manifest refresh,
+    // multi-period transitions, and end-of-stream. It calls notify_playing()
+    // internally — do not call it before run().
+    session.run(&mut MyDriver {}).await?;
+
+    Ok(())
+}
+```
+
+`from_url` fetches and parses the MPD, resolves XLink references, syncs the UTC
+clock for live streams, and snaps to the live edge.  `run()` returns `Ok(())`
+once `end_of_stream()` has been called on your `MediaSource`.
+
+For platforms without `std::time::Instant` (e.g. WASM), use
+`from_url_with_clock` and pass a [`Clock`] implementation — see
+[Injecting a custom clock](#injecting-a-custom-clock) below.
+
+### Seeking
+
+Gap-fill seeks (skipping over stalls or missing segments) are delivered to your
+driver via `on_gap_seek` while `run()` is active — override the method to seek
+your renderer.
+
+For user-initiated seeks, interrupt the loop by returning `false` from
+`should_continue()`, then seek and restart:
+
+```rust
+// Exit the loop cleanly.
+driver.stop();                             // sets should_continue() → false
+session.run(&mut driver).await?;           // drains current iteration and returns
+
+// Reposition the fetch cursor to the nearest segment boundary.
+let snapped_s = session.seek_to(target_s);
+
+// Restart the playing clock and resume fetching.
+session.notify_playing();
+session.run(&mut driver).await?;
+```
+
+`seek_to` snaps to the nearest segment boundary, returns the snapped position,
+and automatically resets the gap controller.
 
 ### Injecting a custom clock (WASM / embedded)
 
@@ -112,122 +395,6 @@ let session = DashSession::from_url_with_clock(
 `SystemClock` (the default) uses `std::time::Instant` and `futures_timer::Delay`
 and works with any async executor without requiring tokio.
 
-### Minimal example
-
-```rust
-use std::sync::Arc;
-use url::Url;
-use dash_rs::{
-    abr::AbrMetrics,
-    fetch::stub::StubSegmentFetcher,
-    media_source::stub::StubMediaSource,
-    session::{DashSession, MediaType},
-};
-
-#[tokio::main]
-async fn main() -> Result<(), dash_rs::DashError> {
-    // 1. Open a media sink (replace with your real MediaSource implementation).
-    let mut media_source = StubMediaSource::new();
-    media_source.open();
-
-    // 2. Load the manifest and start a session.
-    //    Use StubSegmentFetcher for now; replace with an HTTP fetcher later.
-    let url = Url::parse("https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd")?;
-    let mut session = DashSession::from_url(
-        &url,
-        StubSegmentFetcher,
-        media_source,
-    ).await?;
-
-    // 3. Inspect what's in the manifest.
-    for (i, rep) in session.video_representations().iter().enumerate() {
-        println!("[{i}] {}kbps {}x{}", rep.bandwidth / 1000,
-            rep.width.unwrap_or(0), rep.height.unwrap_or(0));
-    }
-
-    // 4. Drive the fetch loop.
-    //    Supply real throughput / buffer measurements in a production app.
-    let metrics = AbrMetrics::new(
-        4_000_000.0,  // 4 Mbps measured throughput
-        10_000.0,     // 10 s of buffer already filled
-    );
-    let decision = session.fetch_next_segment(MediaType::Video, &metrics).await?;
-    println!("fetched at quality index {} ({:?})", decision.index, decision.reason);
-
-    session.end_of_stream().await?;
-    Ok(())
-}
-```
-
-### Providing your own `MediaSource`
-
-Implement the two traits to connect dash-rs to your rendering backend:
-
-```rust
-use async_trait::async_trait;
-use dash_rs::{
-    error::DashError,
-    media_source::{Chunk, MediaSource, ReadyState, SourceBuffer, TimeRange},
-};
-
-struct MySourceBuffer { /* ... */ }
-
-#[async_trait(?Send)]
-impl SourceBuffer for MySourceBuffer {
-    fn mime_type(&self) -> &str { "video/mp4" }
-    fn is_updating(&self) -> bool { false }
-    fn buffered(&self) -> Vec<TimeRange> { vec![] }
-    fn timestamp_offset(&self) -> f64 { 0.0 }
-    fn set_timestamp_offset(&mut self, _: f64) {}
-    fn append_window_start(&self) -> f64 { 0.0 }
-    fn set_append_window_start(&mut self, _: f64) {}
-    fn append_window_end(&self) -> f64 { f64::INFINITY }
-    fn set_append_window_end(&mut self, _: f64) {}
-
-    async fn append_buffer(&mut self, chunk: Chunk) -> Result<(), DashError> {
-        // Feed chunk.data to your decoder / renderer here.
-        Ok(())
-    }
-    async fn remove(&mut self, _start: f64, _end: f64) -> Result<(), DashError> { Ok(()) }
-    async fn abort(&mut self) -> Result<(), DashError> { Ok(()) }
-    async fn change_type(&mut self, _mime: &str) -> Result<(), DashError> { Ok(()) }
-}
-```
-
-### Providing your own `SegmentFetcher`
-
-```rust
-use async_trait::async_trait;
-use dash_rs::fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
-use url::Url;
-
-struct HttpFetcher { client: reqwest::Client }
-
-#[async_trait(?Send)]
-impl SegmentFetcher for HttpFetcher {
-    async fn fetch(&self, req: FetchRequest) -> Result<FetchResponse, FetchError> {
-        let resp = self.client.get(req.url.as_str()).send().await
-            .map_err(|e| FetchError::Network { url: req.url.clone(), message: e.to_string() })?;
-        let status = resp.status().as_u16();
-        if status != 200 {
-            return Err(FetchError::Http { status, url: req.url });
-        }
-        let data = resp.bytes().await
-            .map_err(|e| FetchError::Network { url: req.url.clone(), message: e.to_string() })?;
-        let bytes_received = data.len() as u64;
-        Ok(FetchResponse { final_url: req.url, data, transfer_duration_ms: 0, bytes_received })
-    }
-
-    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let resp = self.client.head(url.as_str()).send().await
-            .map_err(|e| FetchError::Network { url: url.clone(), message: e.to_string() })?;
-        Ok(resp.status().is_success())
-    }
-
-    fn abort(&self) {}
-}
-```
-
 ### Custom ABR rules
 
 ```rust
@@ -249,250 +416,57 @@ let controller = AbrController::with_rules(vec![Box::new(MyRule)]);
 
 ---
 
-## Building a complete playback app
+## Inspecting session state
 
-This section walks through the full lifecycle of a dash-rs application: opening
-the media sink, loading the manifest, driving the fetch loop with buffer-level
-gating and pause tracking, handling gaps and seeks, and tearing down cleanly.
-The code is intentionally generic — substitute your renderer's real pause/seek
-APIs for the `renderer.*` placeholders.
-
-### 1. Open the session
+Access session state at any point — before, during (via `on_iteration_start` or
+`on_iteration` in your `PlaybackDriver`), or after `run()`.
 
 ```rust
-use dash_rs::{
-    abr::AbrMetrics,
-    error::DashError,
-    session::{DashSession, MediaType},
-};
-use url::Url;
+use dash_rs::session::MediaType;
 
-// `MyMediaSource` and `MyFetcher` are your concrete implementations of the
-// `MediaSource` and `SegmentFetcher` traits (see sections below).
-let mut media_source = MyMediaSource::new();
-media_source.open();
-
-let url = Url::parse("https://example.com/stream/manifest.mpd")?;
-let mut session = DashSession::from_url(&url, MyFetcher::new(), media_source).await?;
-```
-
-`from_url` fetches and parses the MPD, resolves any XLink references, syncs the
-UTC clock (if `UTCTiming` is present), and snaps to the live edge for dynamic
-streams.  For VOD it returns immediately.
-
-For platforms without `std::time::Instant` (e.g. WASM), use
-`from_url_with_clock` and pass your `Clock` implementation (see the Clock
-section above).
-
-### 2. Start playback
-
-```rust
-// Tell the media sink to start consuming data.
-session.media_source_mut().set_playing()?;
-
-// Start the wall-clock used by estimated_buffer_level_ms.
-// Call this immediately after set_playing — not before.
-session.notify_playing();
-```
-
-For **live streams only**, call `apply_live_pts_remap()` between `from_url` and
-`set_playing`.  This shifts decode timestamps so the first live-edge segment
-lands at presentation time ≈ 0, which is required for MSE/browser playback and
-for `seek_to` coordinates to be correct:
-
-```rust
-if session.is_live() {
-    session.apply_live_pts_remap().await?;
-    // For WASM/MSE players: seek the renderer to the live presentation start.
-    let start_s = session.live_presentation_start_s();
-    renderer.seek(start_s);
-}
-
-session.media_source_mut().set_playing()?;
-session.notify_playing();
-```
-
-GStreamer clients must **not** call `apply_live_pts_remap()` — use
-`GstMediaSource::set_live_mode(true)` instead.
-
-### 3. The fetch loop
-
-The fetch loop follows the same pattern as dash.js's `ScheduleController`:
-
-1. Keep pause state in sync so the buffer estimate stays accurate.
-2. Run the gap controller to detect and jump over stalls.
-3. Gate on buffer level — sleep until there is room below the target.
-4. Fetch the next segment for each active track.
-5. Repeat until all tracks signal `EndOfStream`.
-
-```rust
-// Use the track that is always present as the gate target.
-// If the stream has video, gate on video; otherwise gate on audio.
-let gate_type = if session.has_video() { MediaType::Video } else { MediaType::Audio };
-
-let mut video_done = !session.has_video();
-let mut audio_done = !session.has_audio();
-
-loop {
-    if video_done && audio_done { break; }
-
-    // --- Pause sync ---------------------------------------------------------
-    // Tell the session whether the renderer is currently paused so that
-    // estimated_buffer_level_ms stays accurate.  This is idempotent; call it
-    // every iteration regardless of whether the state changed.
-    session.sync_pause_state(renderer.is_paused());
-
-    // --- Gap controller -----------------------------------------------------
-    // Detect stalls and gap-jump; returns a seek target when action is needed.
-    let buffered = session.buffered(gate_type.clone());
-    if let Some(target) = session.tick_gap(renderer.position_s(), &buffered, renderer.is_paused()) {
-        renderer.seek(target.position_s);
-        // seek_to repositions the segment fetcher AND resets the gap controller.
-        session.seek_to(target.position_s);
-        // Restart the playing clock after the seek.
-        session.notify_playing();
-    }
-
-    // --- Buffer gate --------------------------------------------------------
-    // Sleep (in 500 ms increments) until the estimated buffer level is below
-    // buffer_target_ms, and handle pause/resume transitions automatically.
-    // Returns immediately if already below target or if the stream is paused.
-    session.wait_for_buffer_capacity(&gate_type, || renderer.is_paused()).await;
-
-    // --- Fetch segments -----------------------------------------------------
-    // Construct AbrMetrics from real measurements in a production app.
-    let metrics = AbrMetrics::new(
-        renderer.measured_throughput_bps(),
-        session.estimated_buffer_level_ms(&gate_type),
-    );
-
-    if !video_done {
-        match session.fetch_next_segment(MediaType::Video, &metrics).await {
-            Ok(decision) => {
-                tracing::debug!(index = decision.index, reason = ?decision.reason, "video quality");
-            }
-            Err(DashError::EndOfStream { .. }) => {
-                video_done = true;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    if !audio_done {
-        match session.fetch_next_segment(MediaType::Audio, &metrics).await {
-            Ok(_) => {}
-            Err(DashError::EndOfStream { .. }) => {
-                audio_done = true;
-            }
-            Err(e) => return Err(e),
-        }
-    }
-}
-```
-
-Key behaviours of `fetch_next_segment`:
-- **Multi-period**: transparently calls `try_advance_period` at period
-  boundaries — re-fetches init segments and continues without surfacing an error.
-- **Live manifest refresh**: calls `refresh_manifest_if_due` automatically on
-  every iteration.
-- **ABR**: calls `AbrController::select` then `record_switch` if the quality
-  changed.
-
-### 4. Tear down
-
-```rust
-// Signal EOS to the media sink after both tracks are exhausted.
-session.end_of_stream().await?;
-```
-
-For GStreamer, wait for the pipeline EOS event after this call before
-destroying the pipeline.
-
-### 5. Pause and resume
-
-Pause and resume are handled entirely through `sync_pause_state` and the
-renderer.  There is no separate dash-rs API call needed:
-
-```rust
-// When the user presses pause:
-renderer.pause();
-// sync_pause_state will pick this up on the next loop iteration.
-
-// When the user presses play:
-renderer.play();
-// sync_pause_state will call notify_playing() internally, restarting the clock.
-```
-
-`wait_for_buffer_capacity` returns immediately while paused and wakes up again
-automatically once `sync_pause_state` sees the renderer has resumed.
-
-### 6. Seeking
-
-```rust
-// When the user scrubs to a new position:
-renderer.seek(requested_s);
-
-// seek_to snaps to the nearest segment boundary and returns the snapped time.
-let snapped_s = session.seek_to(requested_s);
-
-// Optionally reposition the renderer to the exact snapped boundary.
-if (snapped_s - requested_s).abs() > 0.5 {
-    renderer.seek(snapped_s);
-}
-
-// Restart the playing clock after the seek.
-session.notify_playing();
-```
-
-`seek_to` automatically resets the gap controller, so `tick_gap` starts fresh
-from the new position.
-
-### 7. Live streams — additional considerations
-
-| Concern | API |
-|---|---|
-| Is the stream live? | `session.is_live()` |
-| PTS remapping (MSE/WASM only) | `session.apply_live_pts_remap().await?` |
-| First renderable position after remap | `session.live_presentation_start_s()` |
-| Force a manifest refresh now | `session.refresh_manifest().await?` |
-| Check if a refresh is due | `session.should_refresh_manifest()` |
-| Target latency (if `ServiceDescription` is present) | `session.target_latency_ms()` |
-| Playback rate range for latency catch-up | `session.playback_rate_range()` |
-
-For live streams, `fetch_next_segment` never returns `EndOfStream` unless
-`availabilityEndTime` is reached or a segment fetch fails after the stream has
-ended.  Drive the loop indefinitely and handle network errors with a retry or
-backoff strategy.
-
-### 8. Inspecting session state
-
-```rust
-// Available representations (sorted ascending by bandwidth).
+// Available representations, sorted ascending by bandwidth.
 for (i, rep) in session.video_representations().iter().enumerate() {
     println!("[{i}] {}kbps {}×{}", rep.bandwidth / 1000,
         rep.width.unwrap_or(0), rep.height.unwrap_or(0));
 }
 
-// Currently selected representation.
+// Currently active representation.
 if let Some(rep) = session.current_representation(&MediaType::Video) {
     println!("playing at {}kbps", rep.bandwidth / 1000);
 }
 
-// Buffer level estimate.
+// Estimated buffer level.
 let buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
 println!("video buffer: {:.1} s", buf_ms / 1000.0);
 
-// Cap quality (e.g. enforce a data-saver mode).
+// Cap quality, e.g. to enforce a data-saver mode.
 session.set_max_bitrate(MediaType::Video, 2_000_000);
-
-// Remove the cap.
 session.clear_max_bitrate(MediaType::Video);
 
-// Current period index in a multi-period stream.
+// Current period in a multi-period stream.
 println!("period {}/{}", session.current_period_index() + 1, session.period_count());
 ```
 
-### 9. Subscribing to events
+The `on_iteration` callback in `PlaybackDriver` receives an [`IterationSummary`]
+after every segment pair, which carries the same values without requiring a
+reference to the session:
+
+```rust
+fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+    println!(
+        "video={:?} buf={:.1}s  audio={:?} buf={:.1}s  throughput={:.0}kbps",
+        s.video_decision.map(|d| d.index),
+        s.video_buffer_ms / 1_000.0,
+        s.audio_decision.map(|d| d.index),
+        s.audio_buffer_ms / 1_000.0,
+        s.last_throughput_bps / 1_000.0,
+    );
+}
+```
+
+---
+
+## Subscribing to events
 
 ```rust
 use dash_rs::session::DashEvent;
@@ -505,7 +479,7 @@ tokio::spawn(async move {
                 println!("{media_type:?} switched {from_index} → {to_index}");
             }
             DashEvent::InbandEvent { scheme_id_uri, value, data, .. } => {
-                // DASH emsg (e.g. splice cues, ID3 metadata).
+                // DASH emsg events (e.g. splice cues, ID3 metadata).
                 println!("emsg {scheme_id_uri} {value:?}: {} bytes", data.len());
             }
             _ => {}
@@ -573,7 +547,7 @@ cargo run --example http_fetch -- https://your-stream/manifest.mpd
 Expected output (excerpt):
 
 ```
-Loaded manifest: https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd
+Loaded manifest: https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
 Video representations (sorted by bandwidth):
   [0]   256kbps  320x180
   [1]   512kbps  512x288
@@ -653,7 +627,7 @@ cargo run --features sink-gstreamer --example gstreamer_player -- https://your-s
 Expected output (excerpt):
 
 ```
-Loaded manifest: https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd
+Loaded manifest: https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
 Pipeline playing.
 
 === Fetching 8 segments (buffer target: 12 s) ===

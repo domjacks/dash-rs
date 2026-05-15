@@ -9,12 +9,15 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use dash_rs::{
-    abr::AbrMetrics,
     fetch::stub::StubSegmentFetcher,
     manifest::MPD,
     media_source::stub::StubMediaSource,
-    session::{DashSession, MediaType},
+    session::{
+        driver::{IterationSummary, PlaybackDriver},
+        DashSession,
+    },
     DashError,
 };
 use url::Url;
@@ -86,32 +89,49 @@ async fn main() -> Result<(), DashError> {
         );
     }
 
-    // 4. Simulate a short fetch loop — 5 segments per track.
+    // 4. Simulate a short fetch loop — 5 segments per track — via PlaybackDriver.
+    //    Throughput escalates each iteration so the ABR controller should step
+    //    up quality over time.
     println!("\n=== Fetching segments ===");
-    for seg in 1..=5u32 {
-        // Supply realistic-looking metrics that improve over time.
-        let throughput_bps = 1_200_000.0 + (seg as f64) * 400_000.0;
-        let buffer_level_ms = (seg as f64) * 4_000.0;
-        let metrics = AbrMetrics::new(throughput_bps, buffer_level_ms);
 
-        let video_decision = session
-            .fetch_next_segment(MediaType::Video, &metrics)
-            .await?;
-        let audio_decision = session
-            .fetch_next_segment(MediaType::Audio, &metrics)
-            .await?;
-
-        println!(
-            "  seg {seg}: video quality={} ({:?}), audio quality={} ({:?})",
-            video_decision.index,
-            video_decision.reason,
-            audio_decision.index,
-            audio_decision.reason,
-        );
+    /// [`PlaybackDriver`] for the basic stub example.
+    ///
+    /// Provides an escalating synthetic throughput so the ABR controller
+    /// steps up representation quality over the five iterations.
+    struct BasicPlaybackDriver {
+        /// 1-based iteration counter; 0 before the first `on_iteration_start`.
+        seg: u32,
     }
 
-    // 5. Signal end of stream.
-    session.end_of_stream().await?;
+    #[async_trait(?Send)]
+    impl PlaybackDriver for BasicPlaybackDriver {
+        fn position_s(&self) -> f64 { (self.seg as f64) * 4.0 }
+
+        fn should_continue(&self) -> bool { self.seg < 5 }
+
+        fn on_iteration_start(&mut self, _pos: f64) { self.seg += 1; }
+
+        fn throughput_override_bps(&self) -> Option<f64> {
+            Some(1_200_000.0 + (self.seg as f64) * 400_000.0)
+        }
+
+        fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+            let vid = s.video_decision.map(|d| (d.index, format!("{:?}", d.reason)));
+            let aud = s.audio_decision.map(|d| (d.index, format!("{:?}", d.reason)));
+            println!(
+                "  seg {}: video quality={} ({:?}), audio quality={} ({:?})",
+                self.seg,
+                vid.as_ref().map(|(i, _)| i.to_string()).unwrap_or_else(|| "done".into()),
+                vid.as_ref().map(|(_, r)| r.as_str()).unwrap_or("-"),
+                aud.as_ref().map(|(i, _)| i.to_string()).unwrap_or_else(|| "done".into()),
+                aud.as_ref().map(|(_, r)| r.as_str()).unwrap_or("-"),
+            );
+        }
+    }
+
+    let mut driver = BasicPlaybackDriver { seg: 0 };
+    session.run(&mut driver).await?;
+
     println!("\nEnd of stream signalled. Done.");
 
     Ok(())

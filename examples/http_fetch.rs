@@ -25,7 +25,7 @@ use bytes::Bytes;
 use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     media_source::stub::StubMediaSource,
-    session::{DashSession, MediaType},
+    session::{driver::{IterationSummary, PlaybackDriver}, DashSession, MediaType},
     DashError,
 };
 use url::Url;
@@ -129,7 +129,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
 /// BBC R&D Big Buck Bunny MPEG-DASH test stream (common-init variant).
 /// Uses `SegmentTemplate` with `$Number$` addressing — compatible with the
 /// current `resolve_segment_url` implementation.
-const DEFAULT_MPD_URL: &str = "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
+const DEFAULT_MPD_URL: &str = "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd";
 
 /// Number of media segments to fetch per track after the init segment.
 const SEGMENTS_TO_FETCH: u32 = 4;
@@ -211,76 +211,72 @@ async fn main() -> Result<(), DashError> {
     }
     println!();
 
-    // 6. Segment fetch loop.  Real throughput from the previous segment is
-    //    fed into AbrMetrics so quality decisions react to actual bandwidth.
+    // 6. Segment fetch loop via PlaybackDriver.
+    //    Real throughput from the fetcher feeds the ABR controller each
+    //    iteration; `should_continue` exits after SEGMENTS_TO_FETCH pairs.
     println!("=== Fetching {SEGMENTS_TO_FETCH} segments ===");
     println!(
         "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {}",
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "fetch ms"
     );
 
-    // Track whether each track has reached end-of-stream.
-    let mut video_done = !session.has_video();
-    let mut audio_done = !session.has_audio();
-
-    for seg in 1..=SEGMENTS_TO_FETCH {
-        if video_done && audio_done {
-            break;
-        }
-
-        // Read throughput measured by the fetcher during the previous segment.
-        let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        // Simple buffer model: assume each segment is 4 seconds of content.
-        let buf_ms = (seg as f64) * 4_000.0;
-
-        // ── Video ──────────────────────────────────────────────────────────────
-        let t_fetch = Instant::now();
-        let (vid_idx, vid_reason) = if !video_done {
-            let mut metrics = session.current_metrics(MediaType::Video, session.estimated_playback_position_s());
-            metrics.throughput_bps = throughput_bps;
-            metrics.buffer_level_ms = buf_ms;
-            match session.fetch_next_segment(MediaType::Video, &metrics).await {
-                Ok(d) => (d.index.to_string(), format!("{:?}", d.reason)),
-                Err(DashError::EndOfStream { .. }) => {
-                    video_done = true;
-                    ("done".into(), "-".into())
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            ("done".into(), "-".into())
-        };
-        let fetch_ms = t_fetch.elapsed().as_millis();
-
-        // ── Audio ──────────────────────────────────────────────────────────────
-        let (aud_idx, aud_reason) = if !audio_done {
-            let mut metrics = session.current_metrics(MediaType::Audio, session.estimated_playback_position_s());
-            metrics.throughput_bps = throughput_bps;
-            metrics.buffer_level_ms = buf_ms;
-            match session.fetch_next_segment(MediaType::Audio, &metrics).await {
-                Ok(d) => (d.index.to_string(), format!("{:?}", d.reason)),
-                Err(DashError::EndOfStream { .. }) => {
-                    audio_done = true;
-                    ("done".into(), "-".into())
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            ("done".into(), "-".into())
-        };
-
-        // Re-read throughput after both fetches for the next iteration.
-        let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-
-        println!(
-            "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps measured)",
-            seg, vid_idx, vid_reason, aud_idx, aud_reason, fetch_ms,
-            measured_bps / 1_000.0,
-        );
+    /// [`PlaybackDriver`] for the HTTP fetch example.
+    ///
+    /// Stops the loop after [`SEGMENTS_TO_FETCH`] iterations and feeds real
+    /// measured throughput back into the ABR controller.
+    struct HttpPlaybackDriver {
+        throughput_tracker: Arc<AtomicU64>,
+        segments_fetched:   u32,
+        last_transfer_ms:   f64,
     }
 
-    // 7. Signal end of stream.
-    session.end_of_stream().await?;
+    #[async_trait(?Send)]
+    impl PlaybackDriver for HttpPlaybackDriver {
+        fn position_s(&self) -> f64 { 0.0 }
+
+        fn should_continue(&self) -> bool {
+            self.segments_fetched < SEGMENTS_TO_FETCH
+        }
+
+        fn on_iteration_start(&mut self, _session_pos: f64) {
+            self.segments_fetched += 1;
+        }
+
+        fn throughput_override_bps(&self) -> Option<f64> {
+            let raw = self.throughput_tracker.load(Ordering::Relaxed);
+            if raw == 0 { None } else { Some(f64::from_bits(raw)) }
+        }
+
+        fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+            self.last_transfer_ms = s.last_transfer_ms;
+
+            let (vid_idx, vid_reason) = s.video_decision
+                .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
+                .unwrap_or_else(|| ("done".into(), "-".into()));
+            let (aud_idx, aud_reason) = s.audio_decision
+                .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
+                .unwrap_or_else(|| ("done".into(), "-".into()));
+
+            println!(
+                "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps measured)",
+                self.segments_fetched,
+                vid_idx, vid_reason,
+                aud_idx, aud_reason,
+                s.last_transfer_ms as u64,
+                s.last_throughput_bps / 1_000.0,
+            );
+        }
+    }
+
+    // 7. run() fetches until should_continue() returns false, then calls
+    //    end_of_stream() and returns.
+    let mut driver = HttpPlaybackDriver {
+        throughput_tracker: Arc::clone(&throughput_tracker),
+        segments_fetched:   0,
+        last_transfer_ms:   0.0,
+    };
+    session.run(&mut driver).await?;
+
     println!("\nEnd of stream. Done.");
 
     Ok(())

@@ -62,7 +62,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
-    session::{DashSession, MediaType},
+    session::{driver::{IterationSummary, PlaybackDriver}, DashSession, MediaType},
     DashError,
 };
 use gst::prelude::*;
@@ -158,7 +158,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
 // ── Fetch / session task ──────────────────────────────────────────────────────
 
 /// BBC R&D Big Buck Bunny MPEG-DASH test stream (common-init variant).
-const DEFAULT_MPD_URL: &str = "https://rdmedia.bbc.co.uk/bbb/2/client_manifest-common_init.mpd";
+const DEFAULT_MPD_URL: &str = "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd";
 
 /// Runs inside the tokio runtime on the background OS thread.
 async fn run_session(
@@ -231,22 +231,79 @@ async fn run_session(
     // pipeline to Playing so decoding and rendering begin.
     session.media_source_mut().set_playing()?;
 
-    // Tell the session the pipeline clock has started so buffer-level
-    // estimates subtract elapsed playing time from pushed content duration.
-    // This mirrors dash.js reading dashMetrics.getCurrentBufferLevel().
-    session.notify_playing();
+    // ── GstPlaybackDriver ────────────────────────────────────────────────────
 
-    // ── Segment fetch loop — dash.js ScheduleController pattern ──────────────
-    //
-    // After each append completes, check estimated buffer level against the
-    // target (default 12 s, matching bufferTimeDefault in dash.js).
-    //
-    //   buffer_level < target  → fetch the next segment immediately
-    //   buffer_level ≥ target  → wait via Clock::set_timeout and re-check
-    //
-    // This prevents pushing all segments at once (which would let EOS race
-    // through the pipeline before any frames are rendered) while still
-    // fetching eagerly whenever the buffer is not yet full.
+    /// [`PlaybackDriver`] for the GStreamer player.
+    ///
+    /// - Uses the session's own estimated position (no external renderer query).
+    /// - Slaves the audio gate to the video buffer level + 1 s so that audio
+    ///   and video stay in lock-step (mirrors dash.js ScheduleController).
+    /// - Enables buffer pruning so old data is evicted from GStreamer's appsrc.
+    /// - Pushes a console progress row after every segment pair.
+    struct GstPlaybackDriver {
+        is_paused:         Arc<AtomicBool>,
+        throughput_tracker: Arc<AtomicU64>,
+        /// Session's estimated playback position — updated at iteration start.
+        cached_pos_s:      f64,
+        seg:               u32,
+    }
+
+    impl GstPlaybackDriver {
+        fn new(is_paused: Arc<AtomicBool>, throughput_tracker: Arc<AtomicU64>) -> Self {
+            Self { is_paused, throughput_tracker, cached_pos_s: 0.0, seg: 0 }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl PlaybackDriver for GstPlaybackDriver {
+        fn position_s(&self) -> f64 { self.cached_pos_s }
+
+        fn is_paused(&self) -> bool { self.is_paused.load(Ordering::Relaxed) }
+
+        fn throughput_override_bps(&self) -> Option<f64> {
+            Some(f64::from_bits(self.throughput_tracker.load(Ordering::Relaxed)))
+        }
+
+        fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {
+            // Slave audio target to video level so audio never races ahead.
+            // For audio-only streams video_buffer_ms is 0, so we fall back
+            // to the session default.
+            if video_buffer_ms > 0.0 {
+                video_buffer_ms.min(default_ms) + 1_000.0
+            } else {
+                default_ms
+            }
+        }
+
+        fn enable_pruning(&self) -> bool { true }
+
+        fn on_iteration_start(&mut self, session_position_s: f64) {
+            self.cached_pos_s = session_position_s;
+            self.seg += 1;
+        }
+
+        fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+            let measured_bps = f64::from_bits(self.throughput_tracker.load(Ordering::Relaxed));
+            let buf_ms = if s.video_buffer_ms > 0.0 { s.video_buffer_ms } else { s.audio_buffer_ms };
+
+            let (vid_idx, vid_reason, video_ms) = s.video_decision
+                .map(|d| (d.index.to_string(), format!("{:?}", d.reason), s.last_transfer_ms as u128))
+                .unwrap_or_else(|| ("done".into(), "-".into(), 0));
+            let (aud_idx, aud_reason) = s.audio_decision
+                .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
+                .unwrap_or_else(|| ("done".into(), "-".into()));
+
+            println!(
+                "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
+                self.seg,
+                vid_idx, vid_reason,
+                aud_idx, aud_reason,
+                buf_ms / 1_000.0,
+                video_ms,
+                measured_bps / 1_000.0,
+            );
+        }
+    }
 
     println!(
         "\n=== Fetching all segments (buffer target: {:.0} s) ===",
@@ -257,146 +314,9 @@ async fn run_session(
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
     );
 
-    // Track completion independently per track.  EOS on one track must not
-    // short-circuit the other — mirrors dash.js calling mediaSource.endOfStream()
-    // only after ALL tracks have been exhausted.  For audio-only or video-only
-    // streams, mark the absent track as done immediately so the loop skips it.
-    let mut video_done = !session.has_video();
-    let mut audio_done = !session.has_audio();
-    let mut seg: u32 = 0;
+    let mut driver = GstPlaybackDriver::new(is_paused, throughput_tracker);
+    session.run(&mut driver).await?;
 
-    loop {
-        if video_done && audio_done {
-            break;
-        }
-
-        seg += 1;
-
-        // Sync pause state with the GLib bus watch's atomic flag.
-        session.sync_pause_state(is_paused.load(Ordering::Relaxed));
-
-        // Prune old buffer data to bound memory usage.
-        // Use the wall-clock position estimate when a GStreamer query is not
-        // easily available from this thread.
-        let pos_s = session.estimated_playback_position_s();
-        session
-            .prune_all_tracks(pos_s, session.buffer_to_keep_s())
-            .await?;
-
-        // ── Video: gate on buffer level, then fetch ──────────────────────────
-        // (type alias avoids repeating the tuple annotation)
-        let video_result: Option<(usize, String, u128)> = if !video_done {
-            session
-                .wait_for_buffer_capacity(&MediaType::Video, || {
-                    is_paused.load(Ordering::Relaxed)
-                })
-                .await;
-
-            let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-            // Use current_metrics() so SwitchHistoryRule sees the real
-            // current_index; then overwrite throughput and buffer with live
-            // measurements (current_metrics leaves those at 0).
-            let mut metrics = session.current_metrics(MediaType::Video, pos_s);
-            metrics.throughput_bps = throughput_bps;
-            metrics.buffer_level_ms = session.estimated_buffer_level_ms(&MediaType::Video);
-
-            let t_video = Instant::now();
-            match session.fetch_next_segment(MediaType::Video, &metrics).await {
-                Ok(d) => Some((
-                    d.index,
-                    format!("{:?}", d.reason),
-                    t_video.elapsed().as_millis(),
-                )),
-                Err(DashError::EndOfStream { .. }) => {
-                    video_done = true;
-                    None
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            None
-        };
-
-        // ── Audio: gate on buffer level, then fetch ──────────────────────────
-        // When video is present, dash.js slaves audio target to the video
-        // buffer level + 1 s so that audio and video stay in lock-step.
-        // For audio-only streams, gate on the audio buffer level directly
-        // against buffer_target_ms (video buffer level would always be 0).
-        // The audio target is dynamic, so we use clock_arc() + sync_pause_state
-        // rather than wait_for_buffer_capacity (which uses buffer_target_ms).
-        let audio_result: Option<(usize, String)> = if !audio_done {
-            let audio_target_ms = if session.has_video() {
-                session
-                    .estimated_buffer_level_ms(&MediaType::Video)
-                    .min(session.buffer_target_ms())
-            } else {
-                session.buffer_target_ms()
-            };
-            let clock = session.clock_arc();
-            loop {
-                let buf = session.estimated_buffer_level_ms(&MediaType::Audio);
-                if buf < audio_target_ms + 1_000.0 {
-                    break;
-                }
-                tracing::debug!(
-                    buf_level_ms = buf as u64,
-                    target_ms = (audio_target_ms + 1_000.0) as u64,
-                    "audio buffer full — waiting"
-                );
-                clock.set_timeout(500.0).await;
-                session.sync_pause_state(is_paused.load(Ordering::Relaxed));
-            }
-
-            let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-            let mut audio_metrics = session.current_metrics(MediaType::Audio, pos_s);
-            audio_metrics.throughput_bps = throughput_bps;
-            audio_metrics.buffer_level_ms = session.estimated_buffer_level_ms(&MediaType::Audio);
-            match session
-                .fetch_next_segment(MediaType::Audio, &audio_metrics)
-                .await
-            {
-                Ok(d) => Some((d.index, format!("{:?}", d.reason))),
-                Err(DashError::EndOfStream { .. }) => {
-                    audio_done = true;
-                    None
-                }
-                Err(e) => return Err(e),
-            }
-        } else {
-            None
-        };
-
-        let measured_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
-        // For display, show whichever track's buffer level is meaningful.
-        let buf_ms = if session.has_video() {
-            session.estimated_buffer_level_ms(&MediaType::Video)
-        } else {
-            session.estimated_buffer_level_ms(&MediaType::Audio)
-        };
-
-        let (vid_idx, vid_reason, video_ms) = video_result
-            .map(|(i, r, ms)| (i.to_string(), r, ms))
-            .unwrap_or_else(|| ("done".into(), "-".into(), 0));
-        let (aud_idx, aud_reason) = audio_result
-            .map(|(i, r)| (i.to_string(), r))
-            .unwrap_or_else(|| ("done".into(), "-".into()));
-
-        println!(
-            "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
-            seg,
-            vid_idx,
-            vid_reason,
-            aud_idx,
-            aud_reason,
-            buf_ms / 1_000.0,
-            video_ms,
-            measured_bps / 1_000.0,
-        );
-    }
-
-    // All segments pushed.  Signal EOS so the pipeline drains and posts
-    // GST_MESSAGE_EOS once the last frame has been rendered.
-    session.end_of_stream().await?;
     println!("\nAll segments fetched — waiting for pipeline EOS…");
 
     Ok(())

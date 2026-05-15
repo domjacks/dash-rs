@@ -6269,3 +6269,143 @@ async fn wait_for_buffer_capacity_returns_immediately_when_below_target() {
     .await
     .expect("wait_for_buffer_capacity must return immediately when buffer is below target");
 }
+
+// ── DashSession::run() ────────────────────────────────────────────────────────
+
+mod run_driver_tests {
+    use super::*;
+    use dash_rs::{
+        abr::AbrDecisionReason,
+        session::driver::{IterationSummary, PlaybackDriver},
+    };
+
+    // A minimal driver that counts iterations, optionally caps them, and
+    // optionally injects a fixed throughput override.
+    struct CountingDriver {
+        /// Number of times `on_iteration_start` has been called.
+        iterations:      u32,
+        /// Loop exits (via `should_continue`) once this count is reached.
+        max_iterations:  u32,
+        /// Most recent video quality-decision index from `on_iteration`.
+        last_video_index: Option<usize>,
+        /// Most recent video quality-decision reason from `on_iteration`.
+        last_video_reason: Option<AbrDecisionReason>,
+        /// Fixed throughput to feed into ABR, or `None` to let the library
+        /// use its internal `ThroughputTracker`.
+        throughput_bps:  Option<f64>,
+    }
+
+    unsafe impl Send for CountingDriver {}
+    unsafe impl Sync for CountingDriver {}
+
+    #[async_trait]
+    impl PlaybackDriver for CountingDriver {
+        fn position_s(&self) -> f64 { 0.0 }
+
+        fn should_continue(&self) -> bool {
+            self.iterations < self.max_iterations
+        }
+
+        fn on_iteration_start(&mut self, _pos: f64) {
+            self.iterations += 1;
+        }
+
+        fn throughput_override_bps(&self) -> Option<f64> {
+            self.throughput_bps
+        }
+
+        fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+            if let Some(d) = s.video_decision {
+                self.last_video_index = Some(d.index);
+                self.last_video_reason = Some(d.reason.clone());
+            }
+        }
+    }
+
+    fn counting_driver(max: u32, throughput: Option<f64>) -> CountingDriver {
+        CountingDriver {
+            iterations:        0,
+            max_iterations:    max,
+            last_video_index:  None,
+            last_video_reason: None,
+            throughput_bps:    throughput,
+        }
+    }
+
+    /// `run()` fetches all segments of a short VOD stream and returns `Ok(())`.
+    ///
+    /// `VOD_AV_MPD`: 12 s presentation, 4 s/segment → 3 segments per track.
+    /// `run()` makes 4 loop iterations: 3 successful fetches + 1 EOS-detection
+    /// iteration (EOS fires when `segment_number − start_number ≥ total_segments`,
+    /// i.e. on the 4th call, not the 3rd).
+    #[tokio::test]
+    async fn run_fetches_all_vod_segments() {
+        let mut session = session_from_xml(VOD_AV_MPD);
+        let mut drv = counting_driver(u32::MAX, None);
+        session.run(&mut drv).await.unwrap();
+        // 3 segments → EOS fires on the 4th fetch call → 4 loop iterations.
+        assert_eq!(drv.iterations, 4, "expected 4 iterations (3 fetches + 1 EOS detection)");
+    }
+
+    /// `should_continue()` returning `false` exits the loop before EOS.
+    ///
+    /// `STATIC_MPD`: 30 s, 2 s/segment → 15 segments.  With `max_iterations=2`
+    /// only 2 iterations run; `run()` still calls `end_of_stream()` and
+    /// returns `Ok(())`.
+    #[tokio::test]
+    async fn run_exits_early_when_should_continue_false() {
+        let mut session = session_from_xml(STATIC_MPD);
+        let mut drv = counting_driver(2, None);
+        session.run(&mut drv).await.unwrap();
+        assert_eq!(drv.iterations, 2, "should stop after 2 iterations");
+    }
+
+    /// `throughput_override_bps` is forwarded into `AbrMetrics::throughput_bps`
+    /// before each ABR decision.
+    ///
+    /// `StubSourceBuffer::buffered()` always returns empty ranges (segments have
+    /// no timing), so `current_metrics` yields `buffer_level_ms = 0.0` every
+    /// iteration.  `InsufficientBufferRule` fires at 0 ms and is the most
+    /// conservative rule.
+    ///
+    /// The observable difference that proves the override reached `ThroughputRule`:
+    ///
+    /// - **No override** (throughput = 0 bps): `ThroughputRule` returns `Some(0)`
+    ///   (no quality fits within 0 bps, falls back to index 0).  It is the first
+    ///   rule to clamp `max_index` from 1 → 0, so `reason = ThroughputBased`.
+    ///
+    /// - **2 Mbps override**: `ThroughputRule` returns `Some(1)` (v2 = 1 Mbps
+    ///   fits within 1.8 Mbps usable), which does **not** reduce `max_index`
+    ///   (already 1).  `InsufficientBufferRule` then fires and clamps 1 → 0, so
+    ///   `reason = InsufficientBuffer`.
+    ///
+    /// The two different reasons confirm the override was applied.
+    #[tokio::test]
+    async fn run_throughput_override_reaches_abr() {
+        // Baseline: no throughput override → ThroughputRule clamps to 0 first.
+        {
+            let mut session = session_from_xml(MULTI_REP_MPD);
+            let mut drv = counting_driver(3, None);
+            session.run(&mut drv).await.unwrap();
+            assert_eq!(drv.iterations, 3);
+            assert_eq!(
+                drv.last_video_reason,
+                Some(AbrDecisionReason::ThroughputBased),
+                "with zero throughput, ThroughputRule should be the constraining rule"
+            );
+        }
+
+        // With override: ThroughputRule allows index 1; InsufficientBuffer clamps it.
+        {
+            let mut session = session_from_xml(MULTI_REP_MPD);
+            let mut drv = counting_driver(3, Some(2_000_000.0));
+            session.run(&mut drv).await.unwrap();
+            assert_eq!(drv.iterations, 3);
+            assert_eq!(
+                drv.last_video_reason,
+                Some(AbrDecisionReason::InsufficientBuffer),
+                "with 2 Mbps override ThroughputRule does not clamp — InsufficientBufferRule should be the constraining rule"
+            );
+        }
+    }
+}

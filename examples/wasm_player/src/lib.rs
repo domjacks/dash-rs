@@ -1,9 +1,20 @@
 //! WASM player example for dash-rs — JS-bridge architecture.
 //!
-//! All browser Web API calls live in the JavaScript layer (`index.html`).
+//! All browser Web API calls live in the JavaScript layer (`player.js`).
 //! Rust/WASM drives the DASH logic (ABR, manifest parsing, segment scheduling)
 //! and calls out to JS for every browser interaction via the [`JsBridge`]
-//! extern type.
+//! extern type defined in [`bridge`].
+//!
+//! # Module layout
+//!
+//! | Module | Contents |
+//! |---|---|
+//! | [`bridge`] | `JsBridge` extern type — every browser Web API method; `js_err` helper |
+//! | [`clock`] | `BridgeClock` — `Clock` impl via `performance.now()` / `Date.now()` |
+//! | [`source_buffer`] | `BridgeSourceBuffer` — `SourceBuffer` impl via MSE `SourceBuffer` |
+//! | [`media_source`] | `BridgeMediaSource` — `MediaSource` impl via MSE `MediaSource` |
+//! | [`fetcher`] | `BridgeFetcher` — `SegmentFetcher` impl via `window.fetch()` |
+//! | [`driver`] | `WasmPlaybackDriver` — `PlaybackDriver` impl; status JSON push |
 //!
 //! # API surface visible in JavaScript
 //!
@@ -47,579 +58,27 @@
 //! `index.html` in a browser.  The browser DevTools console and the on-screen
 //! API log both show every Web API call as it happens.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+mod bridge;
+mod clock;
+mod driver;
+mod fetcher;
+mod media_source;
+mod source_buffer;
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use js_sys::{Float64Array, Promise, Uint8Array};
 use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
-use dash_rs::{
-    clock::Clock,
-    fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
-    media_source::{Chunk, MediaSource, ReadyState, SourceBuffer, TimeRange},
-    session::{DashSession, MediaType},
-    DashError,
-};
-
-// ── JS error helper ───────────────────────────────────────────────────────────
-
-/// Format a `JsValue` (which may be a `DOMException`, `Error`, or plain value)
-/// into a human-readable string.
-fn js_err(val: JsValue) -> String {
-    if let Some(s) = val.as_string() {
-        return s;
-    }
-    let name = js_sys::Reflect::get(&val, &JsValue::from_str("name"))
-        .ok()
-        .and_then(|v| v.as_string());
-    let message = js_sys::Reflect::get(&val, &JsValue::from_str("message"))
-        .ok()
-        .and_then(|v| v.as_string());
-    match (name, message) {
-        (Some(n), Some(m)) if !m.is_empty() => format!("{n}: {m}"),
-        (Some(n), _) if !n.is_empty()       => n,
-        (_, Some(m)) if !m.is_empty()        => m,
-        _ => js_sys::JSON::stringify(&val)
-            .ok()
-            .and_then(|s| s.as_string())
-            .unwrap_or_else(|| "(opaque JS error)".to_owned()),
-    }
-}
-
-// ── JsBridge extern type ──────────────────────────────────────────────────────
-
-/// The JavaScript bridge object passed from `index.html`.
-///
-/// Every browser Web API call that dash-rs needs goes through one of these
-/// methods.  The JavaScript implementation of each method is the educational
-/// reference — open `index.html` to read the exact Web API calls.
-///
-/// Methods that can throw synchronously use `#[wasm_bindgen(catch)]` so that
-/// JavaScript exceptions surface as `Result::Err` in Rust rather than panics.
-/// Methods that return a `Promise` surface errors via the rejected branch of
-/// [`JsFuture`].
-#[wasm_bindgen]
-extern "C" {
-    pub type JsBridge;
-
-    // ── Clock ─────────────────────────────────────────────────────────────
-    // performance.now() — monotonic milliseconds since navigation start.
-    #[wasm_bindgen(method, js_name = nowMs)]
-    fn now_ms(this: &JsBridge) -> f64;
-
-    // Date.now() / 1000 — seconds since Unix epoch.
-    #[wasm_bindgen(method, js_name = unixNowS)]
-    fn unix_now_s(this: &JsBridge) -> f64;
-
-    // ── Utility ───────────────────────────────────────────────────────────
-    // new Promise(r => setTimeout(r, ms))
-    #[wasm_bindgen(method)]
-    fn sleep(this: &JsBridge, ms: f64) -> Promise;
-
-    // video.currentTime = time_s  — seek the media element to the live edge
-    // presentation position before any segments are appended.
-    #[wasm_bindgen(method, js_name = seekTo)]
-    fn seek_to(this: &JsBridge, time_s: f64);
-
-    // video.currentTime — current playback position in seconds.
-    // Passed to DashSession::current_metrics() so ABR buffer-level calculations
-    // use the real position rather than 0.0 (which would produce enormous
-    // buffer_level_ms values for epoch-scale live streams like BBC IPTV).
-    #[wasm_bindgen(method, js_name = getCurrentTime)]
-    fn get_current_time(this: &JsBridge) -> f64;
-
-    // video.paused — true while the element is paused.
-    // Passed to DashSession::tick_gap() to suppress gap jumps during user pause,
-    // mirroring dash.js GapController._shouldCheckForGaps().
-    #[wasm_bindgen(method, js_name = isPaused)]
-    fn is_paused(this: &JsBridge) -> bool;
-
-    // ── MediaSource lifecycle ─────────────────────────────────────────────
-    // new MediaSource() + URL.createObjectURL() + video.src= + sourceopen
-    #[wasm_bindgen(method, js_name = setupMediaSource)]
-    fn setup_media_source(this: &JsBridge) -> Promise;
-
-    // MediaSource.isTypeSupported(mimeType) — static capability check.
-    #[wasm_bindgen(method, js_name = isTypeSupported)]
-    fn is_type_supported(this: &JsBridge, mime_type: &str) -> bool;
-
-    // mediaSource.readyState  →  "open" | "ended" | "closed"
-    #[wasm_bindgen(method, js_name = getReadyState)]
-    fn get_ready_state(this: &JsBridge) -> String;
-
-    // mediaSource.duration
-    #[wasm_bindgen(method, js_name = getDuration)]
-    fn get_duration(this: &JsBridge) -> f64;
-
-    // mediaSource.duration = d
-    #[wasm_bindgen(method, catch, js_name = setDuration)]
-    fn set_duration(this: &JsBridge, d: f64) -> Result<(), JsValue>;
-
-    // mediaSource.addSourceBuffer(mimeType)  →  opaque buffer id
-    #[wasm_bindgen(method, catch, js_name = addSourceBuffer)]
-    fn add_source_buffer(this: &JsBridge, mime_type: &str) -> Result<String, JsValue>;
-
-    // mediaSource.removeSourceBuffer(sourceBuffers[id])
-    #[wasm_bindgen(method, catch, js_name = removeSourceBuffer)]
-    fn remove_source_buffer_by_id(this: &JsBridge, sb_id: &str) -> Result<(), JsValue>;
-
-    // mediaSource.endOfStream()
-    #[wasm_bindgen(method, catch, js_name = endOfStream)]
-    fn end_of_stream(this: &JsBridge) -> Result<(), JsValue>;
-
-    // URL.revokeObjectURL(objectUrl)
-    #[wasm_bindgen(method, js_name = close)]
-    fn close_bridge(this: &JsBridge);
-
-    // ── SourceBuffer operations ────────────────────────────────────────────
-    // sb.appendBuffer(data)  +  updateend event  →  Promise<void>
-    #[wasm_bindgen(method, js_name = appendBuffer)]
-    fn append_buffer(this: &JsBridge, sb_id: &str, data: &Uint8Array) -> Promise;
-
-    // sb.remove(start, end)  +  updateend event  →  Promise<void>
-    #[wasm_bindgen(method, js_name = removeRange)]
-    fn remove_range(this: &JsBridge, sb_id: &str, start: f64, end: f64) -> Promise;
-
-    // sb.abort()
-    #[wasm_bindgen(method, catch, js_name = abortBuffer)]
-    fn abort_buffer(this: &JsBridge, sb_id: &str) -> Result<(), JsValue>;
-
-    // sb.changeType(mimeType)
-    #[wasm_bindgen(method, catch, js_name = changeType)]
-    fn change_type(this: &JsBridge, sb_id: &str, mime_type: &str) -> Result<(), JsValue>;
-
-    // sb.buffered  →  flat Float64Array [start0, end0, start1, end1, …]
-    #[wasm_bindgen(method, js_name = getBuffered)]
-    fn get_buffered(this: &JsBridge, sb_id: &str) -> Float64Array;
-
-    // sb.updating
-    #[wasm_bindgen(method, js_name = isUpdating)]
-    fn is_updating(this: &JsBridge, sb_id: &str) -> bool;
-
-    // sb.timestampOffset
-    #[wasm_bindgen(method, js_name = getTimestampOffset)]
-    fn get_timestamp_offset(this: &JsBridge, sb_id: &str) -> f64;
-
-    #[wasm_bindgen(method, js_name = setTimestampOffset)]
-    fn set_timestamp_offset(this: &JsBridge, sb_id: &str, offset: f64);
-
-    // sb.appendWindowStart
-    #[wasm_bindgen(method, js_name = getAppendWindowStart)]
-    fn get_append_window_start(this: &JsBridge, sb_id: &str) -> f64;
-
-    #[wasm_bindgen(method, js_name = setAppendWindowStart)]
-    fn set_append_window_start(this: &JsBridge, sb_id: &str, start: f64);
-
-    // sb.appendWindowEnd
-    #[wasm_bindgen(method, js_name = getAppendWindowEnd)]
-    fn get_append_window_end(this: &JsBridge, sb_id: &str) -> f64;
-
-    #[wasm_bindgen(method, js_name = setAppendWindowEnd)]
-    fn set_append_window_end(this: &JsBridge, sb_id: &str, end: f64);
-
-    // ── Fetch API ──────────────────────────────────────────────────────────
-    // fetch(url, {mode:'cors', headers:{'Range':…}})  →  Promise<FetchResult>
-    // FetchResult = { data: Uint8Array, finalUrl: string, durationMs: number }
-    #[wasm_bindgen(method, js_name = fetchBytes)]
-    fn fetch_bytes(this: &JsBridge, url: &str, range_header: Option<String>) -> Promise;
-
-    // fetch(url, {method:'HEAD'})  →  Promise<bool>
-    #[wasm_bindgen(method, js_name = checkExists)]
-    fn check_exists(this: &JsBridge, url: &str) -> Promise;
-
-    // Debug panel status push — called once per fetch-loop iteration.
-    // The argument is a compact JSON string; JS calls JSON.parse on it and
-    // stores the result for the setInterval debug-panel updater.
-    #[wasm_bindgen(method, js_name = reportStatus)]
-    fn report_status(this: &JsBridge, json: &str);
-}
-
-// ── FetchResult extern type ───────────────────────────────────────────────────
-
-/// Typed accessors for the plain JS object `{ data, finalUrl, durationMs }`
-/// returned by `bridge.fetchBytes()`.
-#[wasm_bindgen]
-extern "C" {
-    type FetchResult;
-
-    #[wasm_bindgen(method, getter)]
-    fn data(this: &FetchResult) -> Uint8Array;
-
-    #[wasm_bindgen(method, getter, js_name = finalUrl)]
-    fn final_url(this: &FetchResult) -> String;
-
-    #[wasm_bindgen(method, getter, js_name = durationMs)]
-    fn duration_ms(this: &FetchResult) -> f64;
-}
-
-// ── BridgeClock ───────────────────────────────────────────────────────────────
-
-/// [`Clock`] implementation that calls `performance.now()` and `Date.now()`
-/// via the JS bridge.
-///
-/// Stores `start_ms` (captured at construction) so that [`Clock::now_ms`]
-/// returns elapsed time rather than an absolute `performance.now()` value.
-struct BridgeClock {
-    bridge:   JsBridge,
-    start_ms: f64,
-}
-
-impl BridgeClock {
-    fn new(bridge: JsBridge) -> Arc<Self> {
-        let start_ms = bridge.now_ms();
-        Arc::new(Self { bridge, start_ms })
-    }
-}
-
-// Safety: WASM is single-threaded.  `JsBridge` is a JS reference-counted
-// handle that is never accessed from multiple threads simultaneously.
-unsafe impl Send for BridgeClock {}
-unsafe impl Sync for BridgeClock {}
-
-#[async_trait(?Send)]
-impl Clock for BridgeClock {
-    /// Monotonic milliseconds elapsed since this clock was created.
-    fn now_ms(&self) -> f64 {
-        self.bridge.now_ms() - self.start_ms
-    }
-
-    /// Seconds since the Unix epoch (`Date.now() / 1000`).
-    fn unix_s(&self) -> f64 {
-        self.bridge.unix_now_s()
-    }
-
-    /// Resolves after `ms` milliseconds via `bridge.sleep()` (`setTimeout`).
-    async fn set_timeout(&self, ms: f64) {
-        JsFuture::from(self.bridge.sleep(ms)).await.ok();
-    }
-}
-
-// ── BridgeSourceBuffer ────────────────────────────────────────────────────────
-
-/// [`SourceBuffer`] implementation that delegates every operation to the JS
-/// bridge.
-///
-/// `sb_id` is the opaque identifier returned by `bridge.addSourceBuffer()`.
-/// The JS side uses it to look up the corresponding browser `SourceBuffer`
-/// object.
-///
-/// Append and remove operations return Promises in JS (resolved on the
-/// `updateend` event), so they are event-driven rather than polled — an
-/// improvement over the polling approach used by the previous `web_sys`-based
-/// implementation.
-struct BridgeSourceBuffer {
-    bridge:    JsBridge,
-    sb_id:     String,
-    mime_type: String,
-}
-
-#[async_trait(?Send)]
-impl SourceBuffer for BridgeSourceBuffer {
-    fn mime_type(&self) -> &str {
-        &self.mime_type
-    }
-
-    fn is_updating(&self) -> bool {
-        self.bridge.is_updating(&self.sb_id)
-    }
-
-    fn buffered(&self) -> Vec<TimeRange> {
-        // JS returns a flat Float64Array: [start0, end0, start1, end1, …]
-        self.bridge
-            .get_buffered(&self.sb_id)
-            .to_vec()
-            .chunks_exact(2)
-            .map(|c| TimeRange::new(c[0], c[1]))
-            .collect()
-    }
-
-    fn timestamp_offset(&self) -> f64 {
-        self.bridge.get_timestamp_offset(&self.sb_id)
-    }
-
-    fn set_timestamp_offset(&mut self, offset: f64) {
-        self.bridge.set_timestamp_offset(&self.sb_id, offset);
-    }
-
-    fn append_window_start(&self) -> f64 {
-        self.bridge.get_append_window_start(&self.sb_id)
-    }
-
-    fn set_append_window_start(&mut self, start: f64) {
-        self.bridge.set_append_window_start(&self.sb_id, start);
-    }
-
-    fn append_window_end(&self) -> f64 {
-        self.bridge.get_append_window_end(&self.sb_id)
-    }
-
-    fn set_append_window_end(&mut self, end: f64) {
-        self.bridge.set_append_window_end(&self.sb_id, end);
-    }
-
-    async fn append_buffer(&mut self, chunk: Chunk) -> Result<(), DashError> {
-        tracing::debug!(
-            mime_type = %self.mime_type,
-            label     = %chunk.label,
-            bytes     = chunk.data.len(),
-            "BridgeSourceBuffer: appendBuffer"
-        );
-        let array = Uint8Array::from(chunk.data.as_ref());
-        JsFuture::from(self.bridge.append_buffer(&self.sb_id, &array))
-            .await
-            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-        Ok(())
-    }
-
-    async fn remove(&mut self, start: f64, end: f64) -> Result<(), DashError> {
-        tracing::debug!(
-            mime_type = %self.mime_type,
-            start,
-            end,
-            "BridgeSourceBuffer: remove"
-        );
-        JsFuture::from(self.bridge.remove_range(&self.sb_id, start, end))
-            .await
-            .map_err(|e| DashError::RemoveFailed(js_err(e)))?;
-        Ok(())
-    }
-
-    async fn abort(&mut self) -> Result<(), DashError> {
-        tracing::debug!(mime_type = %self.mime_type, "BridgeSourceBuffer: abort");
-        self.bridge
-            .abort_buffer(&self.sb_id)
-            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-        Ok(())
-    }
-
-    async fn change_type(&mut self, mime_type: &str) -> Result<(), DashError> {
-        tracing::debug!(
-            old = %self.mime_type,
-            new = mime_type,
-            "BridgeSourceBuffer: changeType"
-        );
-        self.bridge
-            .change_type(&self.sb_id, mime_type)
-            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-        self.mime_type = mime_type.to_owned();
-        Ok(())
-    }
-}
-
-// ── BridgeMediaSource ─────────────────────────────────────────────────────────
-
-/// [`MediaSource`] implementation that delegates every operation to the JS
-/// bridge.
-///
-/// `mime_to_id` maps a MIME type string (e.g. `"video/mp4;codecs=avc1…"`) to
-/// the opaque source-buffer ID assigned by `bridge.addSourceBuffer()`, so that
-/// `remove_source_buffer` can find the right browser object by MIME type.
-struct BridgeMediaSource {
-    bridge:     JsBridge,
-    mime_to_id: HashMap<String, String>,
-}
-
-impl BridgeMediaSource {
-    fn new(bridge: JsBridge) -> Self {
-        Self { bridge, mime_to_id: HashMap::new() }
-    }
-}
-
-#[async_trait(?Send)]
-impl MediaSource for BridgeMediaSource {
-    fn ready_state(&self) -> ReadyState {
-        match self.bridge.get_ready_state().as_str() {
-            "open"  => ReadyState::Open,
-            "ended" => ReadyState::Ended,
-            _       => ReadyState::Closed,
-        }
-    }
-
-    fn duration(&self) -> Option<f64> {
-        let d = self.bridge.get_duration();
-        if d.is_nan() || d < 0.0 { None } else { Some(d) }
-    }
-
-    fn set_duration(&mut self, duration: f64) -> Result<(), DashError> {
-        self.bridge
-            .set_duration(duration)
-            .map_err(|e| DashError::AppendFailed(js_err(e)))
-    }
-
-    fn is_type_supported(&self, mime_type: &str) -> bool {
-        let supported = self.bridge.is_type_supported(mime_type);
-        if !supported {
-            tracing::warn!(
-                mime_type,
-                "MediaSource.isTypeSupported() returned false — \
-                 track will be skipped (HEVC requires Safari on macOS/iOS)"
-            );
-        }
-        supported
-    }
-
-    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
-        tracing::debug!(mime_type, "BridgeMediaSource: addSourceBuffer");
-        let sb_id = self.bridge
-            .add_source_buffer(mime_type)
-            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-        self.mime_to_id.insert(mime_type.to_owned(), sb_id.clone());
-        Ok(Box::new(BridgeSourceBuffer {
-            bridge:    self.bridge.clone().unchecked_into(),
-            sb_id,
-            mime_type: mime_type.to_owned(),
-        }))
-    }
-
-    fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError> {
-        let sb_id = self.mime_to_id.remove(mime_type).ok_or_else(|| {
-            DashError::SourceBufferNotFound { mime_type: mime_type.to_owned() }
-        })?;
-        self.bridge
-            .remove_source_buffer_by_id(&sb_id)
-            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
-        tracing::debug!(mime_type, "BridgeMediaSource: removeSourceBuffer");
-        Ok(())
-    }
-
-    async fn end_of_stream(&mut self) -> Result<(), DashError> {
-        tracing::info!("BridgeMediaSource: endOfStream");
-        self.bridge
-            .end_of_stream()
-            .map_err(|e| DashError::AppendFailed(js_err(e)))
-    }
-
-    fn close(&mut self) {
-        tracing::info!("BridgeMediaSource: close — revoking object URL");
-        self.bridge.close_bridge();
-    }
-}
-
-// ── BridgeFetcher ─────────────────────────────────────────────────────────────
-
-/// [`SegmentFetcher`] implementation backed by `window.fetch()` called from
-/// the JS bridge.
-///
-/// Byte-range requests (for `SegmentBase` and `SegmentList` with
-/// `@mediaRange`) pass a `Range: bytes=<start>-<end>` header to JS, where the
-/// explicit `fetch()` call is visible.
-struct BridgeFetcher {
-    bridge: JsBridge,
-}
-
-#[async_trait(?Send)]
-impl SegmentFetcher for BridgeFetcher {
-    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
-        let range_header = request
-            .byte_range
-            .map(|(s, e)| format!("bytes={s}-{e}"));
-
-        let resolved = JsFuture::from(
-            self.bridge.fetch_bytes(request.url.as_str(), range_header),
-        )
-        .await
-        .map_err(|e| FetchError::Network {
-            url:     request.url.clone(),
-            message: js_err(e),
-        })?;
-
-        // Cast the resolved JS object to our typed FetchResult accessor.
-        let result: FetchResult = resolved.unchecked_into();
-        let data              = Bytes::from(result.data().to_vec());
-        let bytes_received    = data.len() as u64;
-        let transfer_duration_ms = result.duration_ms() as u64;
-        let final_url         = Url::parse(&result.final_url())
-            .unwrap_or_else(|_| request.url.clone());
-
-        Ok(FetchResponse { final_url, data, transfer_duration_ms, bytes_received })
-    }
-
-    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let ok = JsFuture::from(self.bridge.check_exists(url.as_str()))
-            .await
-            .map_err(|e| FetchError::Network { url: url.clone(), message: js_err(e) })?;
-        Ok(ok.as_bool().unwrap_or(false))
-    }
-
-    fn abort(&self) {
-        // No-op: dropping the in-flight JsFuture cancels the underlying fetch
-        // in most browsers when no AbortController is attached.
-    }
-}
-
-// ── WASM entry point ──────────────────────────────────────────────────────────
-
-// ── Debug status helper ───────────────────────────────────────────────────────
-
-/// Build a compact JSON string describing the current session state.
-///
-/// The string is passed to `bridge.reportStatus()` once per fetch-loop
-/// iteration so the JavaScript debug panel can update without any structured
-/// data passing across the WASM boundary.  All values are primitive JSON
-/// scalars; no arrays or nested objects are used so there is no need for a
-/// serialisation library.
-///
-/// Key | Type   | Meaning
-/// ----|--------|---------------------------------------------------
-/// vi  | u32    | Video quality index (0-based)
-/// vc  | u32    | Video representation count (0 = track absent)
-/// vbps| u64    | Video declared bandwidth (bits/s)
-/// vbuf| f64    | Video buffer level (ms)
-/// ai  | u32    | Audio quality index (0-based)
-/// ac  | u32    | Audio representation count
-/// abps| u64    | Audio declared bandwidth (bits/s)
-/// abuf| f64    | Audio buffer level (ms)
-/// hc  | usize  | Total HTTP request records in DashMetrics
-/// sc  | usize  | Total representation-switch records
-/// url | string | Last segment URL (path only, `"` and `\` stripped)
-/// tms | f64    | Last transfer duration (ms)
-/// tbps| f64    | Last measured throughput (bits/s), 0 if unavailable
-/// live| bool   | Whether the session is a live stream
-fn build_status_json<F, M>(session: &DashSession<F, M>, position_s: f64) -> String
-where
-    F: dash_rs::fetch::SegmentFetcher,
-    M: dash_rs::media_source::MediaSource,
-{
-    // ── Video track ───────────────────────────────────────────────────────────
-    let vi   = session.current_metrics(MediaType::Video, position_s)
-                      .current_index.unwrap_or(0) as u32;
-    let vc   = session.representation_count(&MediaType::Video) as u32;
-    let vbps = session.current_representation(&MediaType::Video)
-                      .map(|r| r.bandwidth).unwrap_or(0);
-    let vbuf = session.estimated_buffer_level_ms(&MediaType::Video);
-
-    // ── Audio track ───────────────────────────────────────────────────────────
-    let ai   = session.current_metrics(MediaType::Audio, position_s)
-                      .current_index.unwrap_or(0) as u32;
-    let ac   = session.representation_count(&MediaType::Audio) as u32;
-    let abps = session.current_representation(&MediaType::Audio)
-                      .map(|r| r.bandwidth).unwrap_or(0);
-    let abuf = session.estimated_buffer_level_ms(&MediaType::Audio);
-
-    // ── DashMetrics ───────────────────────────────────────────────────────────
-    let m    = session.metrics();
-    let hc   = m.http_requests.len();
-    let sc   = m.representation_switches.len();
-
-    // Last HTTP record — strip characters that would break the JSON string.
-    let (url_safe, tms, tbps) = if let Some(r) = m.last_http_request() {
-        let safe = r.url.replace('"', "").replace('\\', "");
-        (safe, r.transfer_duration_ms, r.throughput_bps.unwrap_or(0.0))
-    } else {
-        (String::new(), 0.0, 0.0)
-    };
-
-    let live = session.is_live();
-
-    format!(
-        r#"{{"vi":{vi},"vc":{vc},"vbps":{vbps},"vbuf":{vbuf:.1},"ai":{ai},"ac":{ac},"abps":{abps},"abuf":{abuf:.1},"hc":{hc},"sc":{sc},"url":"{url_safe}","tms":{tms:.1},"tbps":{tbps:.0},"live":{live}}}"#
-    )
-}
+use dash_rs::session::{DashSession, MediaType};
+
+use bridge::JsBridge;
+use clock::BridgeClock;
+use driver::WasmPlaybackDriver;
+use fetcher::BridgeFetcher;
+use media_source::BridgeMediaSource;
+
+// ── WASM init ─────────────────────────────────────────────────────────────────
 
 /// Initialise WASM infrastructure (panic hook + tracing).
 ///
@@ -631,13 +90,15 @@ pub fn init() {
     tracing_wasm::set_as_global_default();
 }
 
+// ── play ──────────────────────────────────────────────────────────────────────
+
 /// Start MPEG-DASH playback.
 ///
 /// # Arguments
 ///
 /// * `mpd_url` — fully qualified URL to the `.mpd` manifest.
 /// * `bridge`  — JS object that implements every browser Web API that dash-rs
-///   needs.  See `index.html` for the full annotated implementation.
+///   needs.  See `player.js` for the full annotated implementation.
 ///
 /// # Usage from JavaScript
 ///
@@ -654,7 +115,7 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     // JS: new MediaSource() → URL.createObjectURL() → video.src= → sourceopen
     JsFuture::from(bridge.setup_media_source())
         .await
-        .map_err(|e| JsValue::from_str(&js_err(e)))?;
+        .map_err(|e| JsValue::from_str(&bridge::js_err(e)))?;
 
     // ── Build the DashSession ──────────────────────────────────────────────
 
@@ -662,9 +123,9 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         .map_err(|e| JsValue::from_str(&format!("invalid MPD URL: {e}")))?;
 
     // Each struct gets its own clone of the bridge (cheap JS reference copy).
-    let clock   = BridgeClock::new(bridge.clone().unchecked_into());
-    let fetcher = BridgeFetcher { bridge: bridge.clone().unchecked_into() };
-    let ms      = BridgeMediaSource::new(bridge.clone().unchecked_into());
+    let clock   = BridgeClock::new(JsValue::clone(bridge.as_ref()).unchecked_into());
+    let fetcher = BridgeFetcher::new(JsValue::clone(bridge.as_ref()).unchecked_into());
+    let ms      = BridgeMediaSource::new(JsValue::clone(bridge.as_ref()).unchecked_into());
 
     let mut session = DashSession::from_url_with_clock(&url, fetcher, ms, clock)
         .await
@@ -693,116 +154,26 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     if session.is_live() {
         bridge
             .set_duration(f64::INFINITY)
-            .map_err(|e| JsValue::from_str(&js_err(e)))?;
+            .map_err(|e| JsValue::from_str(&bridge::js_err(e)))?;
         session.apply_live_pts_remap();
         let seek_time = session.live_presentation_start_s();
         bridge.seek_to(seek_time);
         tracing::info!(seek_time, "live stream: PTS remapped; seeked video element to live edge");
     }
 
-    session.notify_playing();
-
     // ── Segment fetch loop ─────────────────────────────────────────────────
+    // `run()` handles video_done/audio_done tracking, buffer gate, gap
+    // controller, EOS detection, and end_of_stream teardown.  It also calls
+    // notify_playing() at startup.
+    let mut driver = WasmPlaybackDriver::new(
+        &bridge,
+        session.representation_count(&MediaType::Video) as u32,
+        session.representation_count(&MediaType::Audio) as u32,
+        session.is_live(),
+    );
 
-    let mut video_done = !session.has_video();
-    let mut audio_done = !session.has_audio();
-
-    // Use whichever track is present for the buffer gate.  If only audio
-    // was set up (e.g. video skipped because the browser doesn't support
-    // HEVC), gating on the absent video track would always return 0 ms and
-    // we'd spin-fetch audio with no back-pressure.
-    let gate_type = if session.has_video() {
-        MediaType::Video
-    } else {
-        MediaType::Audio
-    };
-
-    loop {
-        if video_done && audio_done {
-            break;
-        }
-
-        // Sync pause state so estimated_buffer_level_ms stays accurate.
-        let is_paused = bridge.is_paused();
-        session.sync_pause_state(is_paused);
-
-        // ── Gap controller tick ────────────────────────────────────────────
-        // Mirrors dash.js GapController.js setInterval at ~200 ms.
-        // Collects buffered ranges from the primary gate track and checks for
-        // stalls or small gaps.  If a seek is recommended, we perform it and
-        // restart the buffer clock.
-        {
-            let position_s = bridge.get_current_time();
-            let buffered   = session.buffered(gate_type.clone());
-            if let Some(target) = session.tick_gap(position_s, &buffered, is_paused) {
-                tracing::info!(
-                    position_s,
-                    seek_to = target.position_s,
-                    reason  = ?target.reason,
-                    "gap controller: seeking to recover from stall/gap"
-                );
-                bridge.seek_to(target.position_s);
-                session.seek_to(target.position_s);
-                session.notify_playing();
-            }
-        }
-
-        // Buffer gate + pause-state sync — dash.js ScheduleController pattern.
-        // Sleeps in 500 ms ticks (via Clock::set_timeout) until the buffer has
-        // drained below buffer_target_ms, calling sync_pause_state after each
-        // tick so a resume while sleeping unfreezes estimated_buffer_level_ms.
-        session
-            .wait_for_buffer_capacity(&gate_type, || bridge.is_paused())
-            .await;
-
-        if !video_done {
-            let position_s = bridge.get_current_time();
-            let metrics = session.current_metrics(MediaType::Video, position_s);
-            match session.fetch_next_segment(MediaType::Video, &metrics).await {
-                Ok(d) => tracing::debug!(
-                    quality_index = d.index,
-                    reason        = ?d.reason,
-                    "video segment fetched"
-                ),
-                Err(DashError::EndOfStream { .. }) => {
-                    tracing::info!("video: end of stream");
-                    video_done = true;
-                }
-                Err(e) => return Err(JsValue::from_str(&e.to_string())),
-            }
-        }
-
-        if !audio_done {
-            let position_s = bridge.get_current_time();
-            let metrics = session.current_metrics(MediaType::Audio, position_s);
-            match session.fetch_next_segment(MediaType::Audio, &metrics).await {
-                Ok(d) => tracing::debug!(
-                    quality_index = d.index,
-                    reason        = ?d.reason,
-                    "audio segment fetched"
-                ),
-                Err(DashError::EndOfStream { .. }) => {
-                    tracing::info!("audio: end of stream");
-                    audio_done = true;
-                }
-                Err(e) => return Err(JsValue::from_str(&e.to_string())),
-            }
-        }
-
-        // ── Debug panel status push ────────────────────────────────────────
-        // Build a compact JSON snapshot of current session state and push it
-        // to the JavaScript debug panel via the bridge.  The JS side stores
-        // the latest value and a setInterval updater reads it every 500 ms.
-        {
-            let pos = bridge.get_current_time();
-            bridge.report_status(&build_status_json(&session, pos));
-        }
-    }
-
-    // ── Signal end of stream ───────────────────────────────────────────────
-    // JS: mediaSource.endOfStream()
     session
-        .end_of_stream()
+        .run(&mut driver)
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
