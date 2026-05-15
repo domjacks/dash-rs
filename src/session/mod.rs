@@ -1357,6 +1357,86 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.schedule_while_paused = v;
     }
 
+    /// Synchronise the session's pause state from an external boolean signal.
+    ///
+    /// This is a convenience wrapper around [`Self::notify_paused`] and
+    /// [`Self::notify_playing`] that eliminates the `was_paused` tracking
+    /// variable callers would otherwise need.  It is safe to call on every
+    /// loop iteration — both `notify_paused` and `notify_playing` are
+    /// idempotent when the state has not changed.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// // At the top of each fetch-loop iteration:
+    /// session.sync_pause_state(renderer.is_paused());
+    /// ```
+    pub fn sync_pause_state(&mut self, is_paused: bool) {
+        if is_paused && !self.paused {
+            self.notify_paused();
+        } else if !is_paused && self.paused {
+            self.notify_playing();
+        }
+    }
+
+    /// Wait until the buffer for `media_type` has drained below
+    /// [`Self::buffer_target_ms`].
+    ///
+    /// This is the library-side implementation of the dash.js
+    /// `ScheduleController` buffer-gate loop.  It sleeps in
+    /// [`crate::clock::Clock::set_timeout`] increments of 500 ms (matching
+    /// `dash.js` `scheduleTimeout`) and calls [`Self::sync_pause_state`] after
+    /// each wake so that a resume while sleeping correctly unfreezes
+    /// [`Self::estimated_buffer_level_ms`].
+    ///
+    /// Returns immediately if the buffer is already below target.
+    ///
+    /// # Arguments
+    ///
+    /// * `media_type` — the track whose buffer level gates fetching.
+    /// * `is_paused`  — closure that returns the current renderer pause state.
+    ///   Queried after every sleep tick so that pause/resume transitions are
+    ///   handled without the caller needing a `was_paused` variable.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// session.wait_for_buffer_capacity(&MediaType::Video, || renderer.is_paused()).await;
+    /// session.fetch_next_segment(MediaType::Video, &metrics).await?;
+    /// ```
+    pub async fn wait_for_buffer_capacity(
+        &mut self,
+        media_type: &MediaType,
+        is_paused: impl Fn() -> bool,
+    ) {
+        // Clone the Arc so the await point on set_timeout does not hold a
+        // borrow on `self`, allowing sync_pause_state to take &mut self.
+        let clock = Arc::clone(&self.clock);
+        while self.estimated_buffer_level_ms(media_type) >= self.buffer_target_ms() {
+            clock.set_timeout(500.0).await;
+            self.sync_pause_state(is_paused());
+        }
+    }
+
+    /// Return a clone of the session's [`Arc`]`<dyn `[`Clock`]`>`.
+    ///
+    /// Useful when a caller needs to drive its own timed loop (e.g. a gate
+    /// with a non-standard threshold) using the same platform sleep primitive
+    /// as the library, without hardcoding `tokio::time::sleep` or any other
+    /// runtime-specific API.
+    ///
+    /// ```ignore
+    /// let clock = session.clock_arc();
+    /// loop {
+    ///     if buf < custom_target { break; }
+    ///     clock.set_timeout(500.0).await;
+    ///     session.sync_pause_state(renderer.is_paused());
+    /// }
+    /// ```
+    pub fn clock_arc(&self) -> Arc<dyn Clock> {
+        Arc::clone(&self.clock)
+    }
+
     /// Estimated buffer level ahead of the current playback position, in
     /// milliseconds.
     pub fn estimated_buffer_level_ms(&self, media_type: &MediaType) -> f64 {

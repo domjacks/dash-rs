@@ -70,21 +70,35 @@ tokio = { version = "1", features = ["full"] }
 ### Injecting a custom clock (WASM / embedded)
 
 `DashSession` accepts a pluggable [`Clock`] implementation for platforms where
-`std::time::Instant` is unavailable:
+`std::time::Instant` is unavailable.  The trait has three methods:
+
+| Method | Used for |
+|---|---|
+| `now_ms()` | Monotonic elapsed time; drives buffer-level estimation and pause accounting |
+| `unix_s()` | UTC wall-clock time; drives live-edge snapping and `UTCTiming` sync |
+| `set_timeout(ms)` | One-shot async timer; used by `wait_for_buffer_capacity` |
 
 ```rust
 use std::sync::Arc;
-use dash_rs::{clock::Clock, session::DashSession};
+use async_trait::async_trait;
+use dash_rs::clock::Clock;
 
 struct MyPlatformClock;
 
-// Clock must be Send + Sync; on WASM this is trivially satisfied.
+// Clock must be Send + Sync; on WASM this is satisfied via unsafe impl.
 unsafe impl Send for MyPlatformClock {}
 unsafe impl Sync for MyPlatformClock {}
 
+#[async_trait(?Send)]
 impl Clock for MyPlatformClock {
-    fn now_ms(&self) -> f64  { /* platform monotonic time */ 0.0 }
-    fn unix_s(&self) -> f64  { /* platform UTC time       */ 0.0 }
+    fn now_ms(&self) -> f64  { /* platform monotonic time in ms */ 0.0 }
+    fn unix_s(&self) -> f64  { /* platform UTC time in seconds  */ 0.0 }
+
+    async fn set_timeout(&self, ms: f64) {
+        // Platform sleep — e.g. futures_timer::Delay on native,
+        // JsFuture::from(bridge.sleep(ms)) on WASM.
+        futures_timer::Delay::new(std::time::Duration::from_millis(ms as u64)).await;
+    }
 }
 
 let session = DashSession::from_url_with_clock(
@@ -94,6 +108,9 @@ let session = DashSession::from_url_with_clock(
     Arc::new(MyPlatformClock),
 ).await?;
 ```
+
+`SystemClock` (the default) uses `std::time::Instant` and `futures_timer::Delay`
+and works with any async executor without requiring tokio.
 
 ### Minimal example
 
@@ -229,6 +246,276 @@ impl AbrRule for MyRule {
 
 let controller = AbrController::with_rules(vec![Box::new(MyRule)]);
 ```
+
+---
+
+## Building a complete playback app
+
+This section walks through the full lifecycle of a dash-rs application: opening
+the media sink, loading the manifest, driving the fetch loop with buffer-level
+gating and pause tracking, handling gaps and seeks, and tearing down cleanly.
+The code is intentionally generic — substitute your renderer's real pause/seek
+APIs for the `renderer.*` placeholders.
+
+### 1. Open the session
+
+```rust
+use dash_rs::{
+    abr::AbrMetrics,
+    error::DashError,
+    session::{DashSession, MediaType},
+};
+use url::Url;
+
+// `MyMediaSource` and `MyFetcher` are your concrete implementations of the
+// `MediaSource` and `SegmentFetcher` traits (see sections below).
+let mut media_source = MyMediaSource::new();
+media_source.open();
+
+let url = Url::parse("https://example.com/stream/manifest.mpd")?;
+let mut session = DashSession::from_url(&url, MyFetcher::new(), media_source).await?;
+```
+
+`from_url` fetches and parses the MPD, resolves any XLink references, syncs the
+UTC clock (if `UTCTiming` is present), and snaps to the live edge for dynamic
+streams.  For VOD it returns immediately.
+
+For platforms without `std::time::Instant` (e.g. WASM), use
+`from_url_with_clock` and pass your `Clock` implementation (see the Clock
+section above).
+
+### 2. Start playback
+
+```rust
+// Tell the media sink to start consuming data.
+session.media_source_mut().set_playing()?;
+
+// Start the wall-clock used by estimated_buffer_level_ms.
+// Call this immediately after set_playing — not before.
+session.notify_playing();
+```
+
+For **live streams only**, call `apply_live_pts_remap()` between `from_url` and
+`set_playing`.  This shifts decode timestamps so the first live-edge segment
+lands at presentation time ≈ 0, which is required for MSE/browser playback and
+for `seek_to` coordinates to be correct:
+
+```rust
+if session.is_live() {
+    session.apply_live_pts_remap().await?;
+    // For WASM/MSE players: seek the renderer to the live presentation start.
+    let start_s = session.live_presentation_start_s();
+    renderer.seek(start_s);
+}
+
+session.media_source_mut().set_playing()?;
+session.notify_playing();
+```
+
+GStreamer clients must **not** call `apply_live_pts_remap()` — use
+`GstMediaSource::set_live_mode(true)` instead.
+
+### 3. The fetch loop
+
+The fetch loop follows the same pattern as dash.js's `ScheduleController`:
+
+1. Keep pause state in sync so the buffer estimate stays accurate.
+2. Run the gap controller to detect and jump over stalls.
+3. Gate on buffer level — sleep until there is room below the target.
+4. Fetch the next segment for each active track.
+5. Repeat until all tracks signal `EndOfStream`.
+
+```rust
+// Use the track that is always present as the gate target.
+// If the stream has video, gate on video; otherwise gate on audio.
+let gate_type = if session.has_video() { MediaType::Video } else { MediaType::Audio };
+
+let mut video_done = !session.has_video();
+let mut audio_done = !session.has_audio();
+
+loop {
+    if video_done && audio_done { break; }
+
+    // --- Pause sync ---------------------------------------------------------
+    // Tell the session whether the renderer is currently paused so that
+    // estimated_buffer_level_ms stays accurate.  This is idempotent; call it
+    // every iteration regardless of whether the state changed.
+    session.sync_pause_state(renderer.is_paused());
+
+    // --- Gap controller -----------------------------------------------------
+    // Detect stalls and gap-jump; returns a seek target when action is needed.
+    let buffered = session.buffered(gate_type.clone());
+    if let Some(target) = session.tick_gap(renderer.position_s(), &buffered, renderer.is_paused()) {
+        renderer.seek(target.position_s);
+        // seek_to repositions the segment fetcher AND resets the gap controller.
+        session.seek_to(target.position_s);
+        // Restart the playing clock after the seek.
+        session.notify_playing();
+    }
+
+    // --- Buffer gate --------------------------------------------------------
+    // Sleep (in 500 ms increments) until the estimated buffer level is below
+    // buffer_target_ms, and handle pause/resume transitions automatically.
+    // Returns immediately if already below target or if the stream is paused.
+    session.wait_for_buffer_capacity(&gate_type, || renderer.is_paused()).await;
+
+    // --- Fetch segments -----------------------------------------------------
+    // Construct AbrMetrics from real measurements in a production app.
+    let metrics = AbrMetrics::new(
+        renderer.measured_throughput_bps(),
+        session.estimated_buffer_level_ms(&gate_type),
+    );
+
+    if !video_done {
+        match session.fetch_next_segment(MediaType::Video, &metrics).await {
+            Ok(decision) => {
+                tracing::debug!(index = decision.index, reason = ?decision.reason, "video quality");
+            }
+            Err(DashError::EndOfStream { .. }) => {
+                video_done = true;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    if !audio_done {
+        match session.fetch_next_segment(MediaType::Audio, &metrics).await {
+            Ok(_) => {}
+            Err(DashError::EndOfStream { .. }) => {
+                audio_done = true;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+```
+
+Key behaviours of `fetch_next_segment`:
+- **Multi-period**: transparently calls `try_advance_period` at period
+  boundaries — re-fetches init segments and continues without surfacing an error.
+- **Live manifest refresh**: calls `refresh_manifest_if_due` automatically on
+  every iteration.
+- **ABR**: calls `AbrController::select` then `record_switch` if the quality
+  changed.
+
+### 4. Tear down
+
+```rust
+// Signal EOS to the media sink after both tracks are exhausted.
+session.end_of_stream().await?;
+```
+
+For GStreamer, wait for the pipeline EOS event after this call before
+destroying the pipeline.
+
+### 5. Pause and resume
+
+Pause and resume are handled entirely through `sync_pause_state` and the
+renderer.  There is no separate dash-rs API call needed:
+
+```rust
+// When the user presses pause:
+renderer.pause();
+// sync_pause_state will pick this up on the next loop iteration.
+
+// When the user presses play:
+renderer.play();
+// sync_pause_state will call notify_playing() internally, restarting the clock.
+```
+
+`wait_for_buffer_capacity` returns immediately while paused and wakes up again
+automatically once `sync_pause_state` sees the renderer has resumed.
+
+### 6. Seeking
+
+```rust
+// When the user scrubs to a new position:
+renderer.seek(requested_s);
+
+// seek_to snaps to the nearest segment boundary and returns the snapped time.
+let snapped_s = session.seek_to(requested_s);
+
+// Optionally reposition the renderer to the exact snapped boundary.
+if (snapped_s - requested_s).abs() > 0.5 {
+    renderer.seek(snapped_s);
+}
+
+// Restart the playing clock after the seek.
+session.notify_playing();
+```
+
+`seek_to` automatically resets the gap controller, so `tick_gap` starts fresh
+from the new position.
+
+### 7. Live streams — additional considerations
+
+| Concern | API |
+|---|---|
+| Is the stream live? | `session.is_live()` |
+| PTS remapping (MSE/WASM only) | `session.apply_live_pts_remap().await?` |
+| First renderable position after remap | `session.live_presentation_start_s()` |
+| Force a manifest refresh now | `session.refresh_manifest().await?` |
+| Check if a refresh is due | `session.should_refresh_manifest()` |
+| Target latency (if `ServiceDescription` is present) | `session.target_latency_ms()` |
+| Playback rate range for latency catch-up | `session.playback_rate_range()` |
+
+For live streams, `fetch_next_segment` never returns `EndOfStream` unless
+`availabilityEndTime` is reached or a segment fetch fails after the stream has
+ended.  Drive the loop indefinitely and handle network errors with a retry or
+backoff strategy.
+
+### 8. Inspecting session state
+
+```rust
+// Available representations (sorted ascending by bandwidth).
+for (i, rep) in session.video_representations().iter().enumerate() {
+    println!("[{i}] {}kbps {}×{}", rep.bandwidth / 1000,
+        rep.width.unwrap_or(0), rep.height.unwrap_or(0));
+}
+
+// Currently selected representation.
+if let Some(rep) = session.current_representation(&MediaType::Video) {
+    println!("playing at {}kbps", rep.bandwidth / 1000);
+}
+
+// Buffer level estimate.
+let buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
+println!("video buffer: {:.1} s", buf_ms / 1000.0);
+
+// Cap quality (e.g. enforce a data-saver mode).
+session.set_max_bitrate(MediaType::Video, 2_000_000);
+
+// Remove the cap.
+session.clear_max_bitrate(MediaType::Video);
+
+// Current period index in a multi-period stream.
+println!("period {}/{}", session.current_period_index() + 1, session.period_count());
+```
+
+### 9. Subscribing to events
+
+```rust
+use dash_rs::session::DashEvent;
+
+let mut events = session.subscribe_events();
+tokio::spawn(async move {
+    while let Ok(event) = events.recv().await {
+        match event {
+            DashEvent::RepresentationSwitch { media_type, from_index, to_index, .. } => {
+                println!("{media_type:?} switched {from_index} → {to_index}");
+            }
+            DashEvent::InbandEvent { scheme_id_uri, value, data, .. } => {
+                // DASH emsg (e.g. splice cues, ID3 metadata).
+                println!("emsg {scheme_id_uri} {value:?}: {} bytes", data.len());
+            }
+            _ => {}
+        }
+    }
+});
+```
+
+`subscribe_events` returns a `broadcast::Receiver`; events are dispatched by
+`fetch_next_segment` from within the fetch loop.
 
 ---
 

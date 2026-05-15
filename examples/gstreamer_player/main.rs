@@ -236,22 +236,17 @@ async fn run_session(
     // This mirrors dash.js reading dashMetrics.getCurrentBufferLevel().
     session.notify_playing();
 
-    // Track the previous pause state so we call notify_paused/notify_playing
-    // at most once per transition.
-    let mut session_paused = false;
-
     // ── Segment fetch loop — dash.js ScheduleController pattern ──────────────
     //
     // After each append completes, check estimated buffer level against the
     // target (default 12 s, matching bufferTimeDefault in dash.js).
     //
     //   buffer_level < target  → fetch the next segment immediately
-    //   buffer_level ≥ target  → wait SCHEDULE_POLL_MS and re-check
+    //   buffer_level ≥ target  → wait via Clock::set_timeout and re-check
     //
     // This prevents pushing all segments at once (which would let EOS race
     // through the pipeline before any frames are rendered) while still
     // fetching eagerly whenever the buffer is not yet full.
-    const SCHEDULE_POLL_MS: u64 = 500; // dash.js scheduleTimeout default
 
     println!(
         "\n=== Fetching all segments (buffer target: {:.0} s) ===",
@@ -278,15 +273,7 @@ async fn run_session(
         seg += 1;
 
         // Sync pause state with the GLib bus watch's atomic flag.
-        let currently_paused = is_paused.load(Ordering::Relaxed);
-        if currently_paused != session_paused {
-            if currently_paused {
-                session.notify_paused();
-            } else {
-                session.notify_playing();
-            }
-            session_paused = currently_paused;
-        }
+        session.sync_pause_state(is_paused.load(Ordering::Relaxed));
 
         // Prune old buffer data to bound memory usage.
         // Use the wall-clock position estimate when a GStreamer query is not
@@ -299,18 +286,11 @@ async fn run_session(
         // ── Video: gate on buffer level, then fetch ──────────────────────────
         // (type alias avoids repeating the tuple annotation)
         let video_result: Option<(usize, String, u128)> = if !video_done {
-            loop {
-                let buf = session.estimated_buffer_level_ms(&MediaType::Video);
-                if buf < session.buffer_target_ms() {
-                    break;
-                }
-                tracing::debug!(
-                    buf_level_ms = buf as u64,
-                    target_ms = session.buffer_target_ms() as u64,
-                    "video buffer full — waiting"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
-            }
+            session
+                .wait_for_buffer_capacity(&MediaType::Video, || {
+                    is_paused.load(Ordering::Relaxed)
+                })
+                .await;
 
             let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));
             // Use current_metrics() so SwitchHistoryRule sees the real
@@ -342,6 +322,8 @@ async fn run_session(
         // buffer level + 1 s so that audio and video stay in lock-step.
         // For audio-only streams, gate on the audio buffer level directly
         // against buffer_target_ms (video buffer level would always be 0).
+        // The audio target is dynamic, so we use clock_arc() + sync_pause_state
+        // rather than wait_for_buffer_capacity (which uses buffer_target_ms).
         let audio_result: Option<(usize, String)> = if !audio_done {
             let audio_target_ms = if session.has_video() {
                 session
@@ -350,12 +332,19 @@ async fn run_session(
             } else {
                 session.buffer_target_ms()
             };
+            let clock = session.clock_arc();
             loop {
                 let buf = session.estimated_buffer_level_ms(&MediaType::Audio);
                 if buf < audio_target_ms + 1_000.0 {
                     break;
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(SCHEDULE_POLL_MS)).await;
+                tracing::debug!(
+                    buf_level_ms = buf as u64,
+                    target_ms = (audio_target_ms + 1_000.0) as u64,
+                    "audio buffer full — waiting"
+                );
+                clock.set_timeout(500.0).await;
+                session.sync_pause_state(is_paused.load(Ordering::Relaxed));
             }
 
             let throughput_bps = f64::from_bits(throughput_tracker.load(Ordering::Relaxed));

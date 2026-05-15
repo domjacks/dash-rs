@@ -2969,9 +2969,11 @@ async fn seek_to_remapped_live_snaps_to_correct_segment() {
 </MPD>"#;
 
     struct FixedClock1000 {}
+    #[async_trait(?Send)]
     impl dash_rs::clock::Clock for FixedClock1000 {
         fn now_ms(&self) -> f64 { 0.0 }
         fn unix_s(&self) -> f64 { 1000.0 }
+        async fn set_timeout(&self, _ms: f64) {}
     }
 
     let mpd = dash_rs::manifest::parse(LIVE_REMAP_MPD).unwrap();
@@ -3465,10 +3467,12 @@ async fn fetch_next_segment_eos_when_past_availability_end_time() {
     // A clock whose `unix_s` is fixed at a time far in the past so that any
     // reasonable `availabilityEndTime` will appear to have been passed.
     struct PastClock;
+    #[async_trait(?Send)]
     impl Clock for PastClock {
         fn now_ms(&self) -> f64 { 0.0 }
         // Return a very large Unix timestamp — the stream ended long ago.
         fn unix_s(&self) -> f64 { 9_999_999_999.0 }
+        async fn set_timeout(&self, _ms: f64) {}
     }
 
     // availabilityEndTime = 2000-01-01T00:00:00Z (well in the past for PastClock)
@@ -3805,9 +3809,11 @@ struct FixedClock {
     unix_s_val: f64,
 }
 
+#[async_trait::async_trait(?Send)]
 impl dash_rs::clock::Clock for FixedClock {
     fn now_ms(&self) -> f64 { self.now_ms_val }
     fn unix_s(&self) -> f64 { self.unix_s_val }
+    async fn set_timeout(&self, _ms: f64) {}
 }
 
 /// `availabilityTimeOffset` widens the live-edge window so that partially-
@@ -5493,9 +5499,11 @@ fn estimated_buffer_level_excludes_paused_time() {
 
     // A clock whose `now_ms` advances on demand.
     struct StepClock(Cell<f64>);
+    #[async_trait(?Send)]
     impl Clock for StepClock {
         fn now_ms(&self) -> f64 { self.0.get() }
         fn unix_s(&self) -> f64 { 0.0 }
+        async fn set_timeout(&self, _ms: f64) {}
     }
     // Safety: single-threaded test.
     unsafe impl Send for StepClock {}
@@ -5599,9 +5607,11 @@ fn estimated_playback_position_s_excludes_paused_time() {
     use dash_rs::clock::Clock;
 
     struct StepClock2(Cell<f64>);
+    #[async_trait(?Send)]
     impl Clock for StepClock2 {
         fn now_ms(&self) -> f64 { self.0.get() }
         fn unix_s(&self) -> f64 { 0.0 }
+        async fn set_timeout(&self, _ms: f64) {}
     }
     unsafe impl Send for StepClock2 {}
     unsafe impl Sync for StepClock2 {}
@@ -6128,4 +6138,134 @@ async fn metrics_ring_buffer_caps_at_100() {
         "buffer_level_samples must be capped at 100, got {}",
         session.metrics().buffer_level_samples.len()
     );
+}
+
+// ── sync_pause_state / wait_for_buffer_capacity tests ────────────────────────
+
+/// `sync_pause_state` is idempotent: calling it repeatedly with the same
+/// value must not reset `playback_started_at` (which would zero the elapsed
+/// time and corrupt the buffer-level estimate).
+#[tokio::test]
+async fn sync_pause_state_idempotent() {
+    use std::sync::Arc;
+    use dash_rs::clock::Clock;
+    use std::cell::Cell;
+
+    struct AdvancingClock(Cell<f64>);
+    #[async_trait(?Send)]
+    impl Clock for AdvancingClock {
+        fn now_ms(&self) -> f64 { self.0.get() }
+        fn unix_s(&self) -> f64 { 0.0 }
+        async fn set_timeout(&self, _ms: f64) {}
+    }
+    unsafe impl Send for AdvancingClock {}
+    unsafe impl Sync for AdvancingClock {}
+
+    let clock = Arc::new(AdvancingClock(Cell::new(0.0)));
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
+    let base = url::Url::parse("http://example.com/").unwrap();
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base, fetcher, open_stub_source(), clock.clone(),
+    ).unwrap();
+
+    session.notify_playing();
+
+    // Advance the clock 5 s (simulating 5 s of play).
+    clock.0.set(5_000.0);
+    let level_before = session.estimated_buffer_level_ms(&MediaType::Video);
+
+    // Call sync_pause_state(false) twice — must not change the level estimate.
+    session.sync_pause_state(false);
+    session.sync_pause_state(false);
+    let level_after = session.estimated_buffer_level_ms(&MediaType::Video);
+    assert_eq!(
+        level_before, level_after,
+        "repeated sync_pause_state(false) must not alter the buffer estimate"
+    );
+}
+
+/// `sync_pause_state` correctly transitions paused → playing:
+/// the buffer estimate must remain frozen while paused and resume
+/// draining when playing is signalled.
+#[tokio::test]
+async fn sync_pause_state_pause_resume_unfreezes_estimate() {
+    use std::sync::Arc;
+    use dash_rs::clock::Clock;
+    use std::cell::Cell;
+
+    struct SteppableClock(Cell<f64>);
+    #[async_trait(?Send)]
+    impl Clock for SteppableClock {
+        fn now_ms(&self) -> f64 { self.0.get() }
+        fn unix_s(&self) -> f64 { 0.0 }
+        async fn set_timeout(&self, _ms: f64) {}
+    }
+    unsafe impl Send for SteppableClock {}
+    unsafe impl Sync for SteppableClock {}
+
+    let clock = Arc::new(SteppableClock(Cell::new(0.0)));
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
+    let base = url::Url::parse("http://example.com/").unwrap();
+    let mut session = DashSession::from_mpd_with_clock(
+        mpd, base, fetcher, open_stub_source(), clock.clone(),
+    ).unwrap();
+
+    session.notify_playing();
+
+    // Advance 3 s, then pause.
+    clock.0.set(3_000.0);
+    session.sync_pause_state(true);
+    let level_at_pause = session.estimated_buffer_level_ms(&MediaType::Video);
+
+    // Advance another 10 s while paused — estimate must stay frozen.
+    clock.0.set(13_000.0);
+    let level_while_paused = session.estimated_buffer_level_ms(&MediaType::Video);
+    assert_eq!(
+        level_at_pause, level_while_paused,
+        "buffer estimate must be frozen while paused"
+    );
+
+    // Calling sync_pause_state(true) again (idempotent) must keep it frozen.
+    session.sync_pause_state(true);
+    assert_eq!(
+        level_at_pause,
+        session.estimated_buffer_level_ms(&MediaType::Video),
+        "repeated sync_pause_state(true) must not change the frozen estimate"
+    );
+
+    // Resume — clock continues from 13 s.  After another 2 s the estimate
+    // must have drained by 2 s relative to the frozen level.
+    session.sync_pause_state(false);
+    clock.0.set(15_000.0);
+    let level_after_resume = session.estimated_buffer_level_ms(&MediaType::Video);
+    let expected = (level_at_pause - 2_000.0_f64).max(0.0);
+    assert!(
+        (level_after_resume - expected).abs() < 1.0,
+        "after resume, estimate should be ~{expected:.1} ms, got {level_after_resume:.1} ms"
+    );
+}
+
+/// `wait_for_buffer_capacity` returns immediately when the buffer is below
+/// `buffer_target_ms` (no sleep required).
+#[tokio::test]
+async fn wait_for_buffer_capacity_returns_immediately_when_below_target() {
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
+    let base = url::Url::parse("http://example.com/").unwrap();
+    let mut session = DashSession::from_mpd(
+        mpd, base, fetcher, open_stub_source(),
+    ).unwrap();
+
+    session.notify_playing();
+
+    // Buffer is 0 ms — well below the 12 s target.  Must return without delay.
+    // (Using tokio::time::timeout to guard against a hang.)
+    tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        session.wait_for_buffer_capacity(&MediaType::Video, || false),
+    )
+    .await
+    .expect("wait_for_buffer_capacity must return immediately when buffer is below target");
 }

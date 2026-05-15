@@ -281,6 +281,7 @@ impl BridgeClock {
 unsafe impl Send for BridgeClock {}
 unsafe impl Sync for BridgeClock {}
 
+#[async_trait(?Send)]
 impl Clock for BridgeClock {
     /// Monotonic milliseconds elapsed since this clock was created.
     fn now_ms(&self) -> f64 {
@@ -290,6 +291,11 @@ impl Clock for BridgeClock {
     /// Seconds since the Unix epoch (`Date.now() / 1000`).
     fn unix_s(&self) -> f64 {
         self.bridge.unix_now_s()
+    }
+
+    /// Resolves after `ms` milliseconds via `bridge.sleep()` (`setTimeout`).
+    async fn set_timeout(&self, ms: f64) {
+        JsFuture::from(self.bridge.sleep(ms)).await.ok();
     }
 }
 
@@ -711,27 +717,14 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
         MediaType::Audio
     };
 
-    // Track the previous pause state so we can call notify_paused() /
-    // notify_playing() on transitions.  Without this the session's wall-clock
-    // keeps advancing while the user is paused, draining estimated_buffer_level_ms
-    // to zero and causing the loop to over-fetch into a full SourceBuffer.
-    let mut was_paused = false;
-
     loop {
         if video_done && audio_done {
             break;
         }
 
-        // ── Pause-state tracking ───────────────────────────────────────────
-        // Forward pause/resume transitions to the session so that
-        // estimated_buffer_level_ms stays correct while paused.
+        // Sync pause state so estimated_buffer_level_ms stays accurate.
         let is_paused = bridge.is_paused();
-        if is_paused && !was_paused {
-            session.notify_paused();
-        } else if !is_paused && was_paused {
-            session.notify_playing();
-        }
-        was_paused = is_paused;
+        session.sync_pause_state(is_paused);
 
         // ── Gap controller tick ────────────────────────────────────────────
         // Mirrors dash.js GapController.js setInterval at ~200 ms.
@@ -754,11 +747,13 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
             }
         }
 
-        // Buffer gate: mirrors dash.js ScheduleController.
-        // JS: new Promise(r => setTimeout(r, 500))
-        while session.estimated_buffer_level_ms(&gate_type) >= session.buffer_target_ms() {
-            JsFuture::from(bridge.sleep(500.0)).await.ok();
-        }
+        // Buffer gate + pause-state sync — dash.js ScheduleController pattern.
+        // Sleeps in 500 ms ticks (via Clock::set_timeout) until the buffer has
+        // drained below buffer_target_ms, calling sync_pause_state after each
+        // tick so a resume while sleeping unfreezes estimated_buffer_level_ms.
+        session
+            .wait_for_buffer_capacity(&gate_type, || bridge.is_paused())
+            .await;
 
         if !video_done {
             let position_s = bridge.get_current_time();
