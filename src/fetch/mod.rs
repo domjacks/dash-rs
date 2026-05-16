@@ -2,12 +2,7 @@ pub mod stub;
 
 use crate::Url;
 #[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{boxed::Box, string::String};
 use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;

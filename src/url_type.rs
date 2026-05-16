@@ -5,7 +5,7 @@
 //! by the rest of the library are implemented.
 
 use alloc::borrow::ToOwned;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use core::fmt;
 
 /// A minimal URL type for `no_std` environments.

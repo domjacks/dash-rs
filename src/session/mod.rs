@@ -42,7 +42,6 @@ use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
 use alloc::{
     borrow::ToOwned,
-    boxed::Box,
     string::{String, ToString},
     vec::Vec,
 };
@@ -51,6 +50,7 @@ use crate::manifest::mpd_types::{AdaptationSet, Period, Representation, MPD};
 use crate::Url;
 #[cfg(feature = "events")]
 use async_broadcast;
+#[cfg(feature = "events")]
 use bytes::Bytes;
 #[cfg(feature = "std")]
 use futures::future::{self as fut, Either};
@@ -3015,6 +3015,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         // exclusion is overridden and all candidates are retried (safety net to
         // prevent the session from permanently stalling).
         let fetcher = Arc::clone(&self.fetcher);
+        #[cfg(feature = "std")]
         let abandon_ms = self.abandon_timeout_ms;
         let mt_str = media_type.to_string();
 

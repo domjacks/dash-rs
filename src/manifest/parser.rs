@@ -14,7 +14,6 @@ use crate::util::{parse_iso_duration, parse_xs_datetime};
 use alloc::{
     borrow::ToOwned,
     string::{String, ToString},
-    vec::Vec,
 };
 
 // ── xlink namespace ───────────────────────────────────────────────────────────
@@ -85,17 +84,18 @@ fn attr_xlink_actuate(node: roxmltree::Node<'_, '_>) -> Option<String> {
 // ── Element parsers ───────────────────────────────────────────────────────────
 
 fn parse_mpd(node: roxmltree::Node<'_, '_>) -> MPD {
-    let mut mpd = MPD::default();
-
-    mpd.mpdtype = attr_str(node, "type").map(ToOwned::to_owned);
-    mpd.profiles = attr_str(node, "profiles").map(ToOwned::to_owned);
-    mpd.mediaPresentationDuration = attr_duration(node, "mediaPresentationDuration");
-    mpd.minimumUpdatePeriod = attr_duration(node, "minimumUpdatePeriod");
-    mpd.minBufferTime = attr_duration(node, "minBufferTime");
-    mpd.availabilityStartTime = attr_xs_datetime(node, "availabilityStartTime");
-    mpd.availabilityEndTime = attr_xs_datetime(node, "availabilityEndTime");
-    mpd.suggestedPresentationDelay = attr_duration(node, "suggestedPresentationDelay");
-    mpd.timeShiftBufferDepth = attr_duration(node, "timeShiftBufferDepth");
+    let mut mpd = MPD {
+        mpdtype: attr_str(node, "type").map(ToOwned::to_owned),
+        profiles: attr_str(node, "profiles").map(ToOwned::to_owned),
+        mediaPresentationDuration: attr_duration(node, "mediaPresentationDuration"),
+        minimumUpdatePeriod: attr_duration(node, "minimumUpdatePeriod"),
+        minBufferTime: attr_duration(node, "minBufferTime"),
+        availabilityStartTime: attr_xs_datetime(node, "availabilityStartTime"),
+        availabilityEndTime: attr_xs_datetime(node, "availabilityEndTime"),
+        suggestedPresentationDelay: attr_duration(node, "suggestedPresentationDelay"),
+        timeShiftBufferDepth: attr_duration(node, "timeShiftBufferDepth"),
+        ..MPD::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
@@ -114,13 +114,14 @@ fn parse_mpd(node: roxmltree::Node<'_, '_>) -> MPD {
 }
 
 fn parse_period(node: roxmltree::Node<'_, '_>) -> Period {
-    let mut p = Period::default();
-
-    p.id = attr_str(node, "id").map(ToOwned::to_owned);
-    p.start = attr_duration(node, "start");
-    p.duration = attr_duration(node, "duration");
-    p.href = attr_xlink_href(node);
-    p.actuate = attr_xlink_actuate(node);
+    let mut p = Period {
+        id: attr_str(node, "id").map(ToOwned::to_owned),
+        start: attr_duration(node, "start"),
+        duration: attr_duration(node, "duration"),
+        href: attr_xlink_href(node),
+        actuate: attr_xlink_actuate(node),
+        ..Period::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
@@ -137,15 +138,16 @@ fn parse_period(node: roxmltree::Node<'_, '_>) -> Period {
 }
 
 fn parse_adaptation_set(node: roxmltree::Node<'_, '_>) -> AdaptationSet {
-    let mut a = AdaptationSet::default();
-
-    a.id = attr_str(node, "id").map(ToOwned::to_owned);
-    a.contentType = attr_str(node, "contentType").map(ToOwned::to_owned);
-    a.mimeType = attr_str(node, "mimeType").map(ToOwned::to_owned);
-    a.lang = attr_str(node, "lang").map(ToOwned::to_owned);
-    a.codecs = attr_str(node, "codecs").map(ToOwned::to_owned);
-    a.href = attr_xlink_href(node);
-    a.actuate = attr_xlink_actuate(node);
+    let mut a = AdaptationSet {
+        id: attr_str(node, "id").map(ToOwned::to_owned),
+        contentType: attr_str(node, "contentType").map(ToOwned::to_owned),
+        mimeType: attr_str(node, "mimeType").map(ToOwned::to_owned),
+        lang: attr_str(node, "lang").map(ToOwned::to_owned),
+        codecs: attr_str(node, "codecs").map(ToOwned::to_owned),
+        href: attr_xlink_href(node),
+        actuate: attr_xlink_actuate(node),
+        ..AdaptationSet::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
@@ -162,14 +164,15 @@ fn parse_adaptation_set(node: roxmltree::Node<'_, '_>) -> AdaptationSet {
 }
 
 fn parse_representation(node: roxmltree::Node<'_, '_>) -> Representation {
-    let mut r = Representation::default();
-
-    r.id = attr_str(node, "id").map(ToOwned::to_owned);
-    r.bandwidth = attr(node, "bandwidth");
-    r.mimeType = attr_str(node, "mimeType").map(ToOwned::to_owned);
-    r.codecs = attr_str(node, "codecs").map(ToOwned::to_owned);
-    r.width = attr(node, "width");
-    r.height = attr(node, "height");
+    let mut r = Representation {
+        id: attr_str(node, "id").map(ToOwned::to_owned),
+        bandwidth: attr(node, "bandwidth"),
+        mimeType: attr_str(node, "mimeType").map(ToOwned::to_owned),
+        codecs: attr_str(node, "codecs").map(ToOwned::to_owned),
+        width: attr(node, "width"),
+        height: attr(node, "height"),
+        ..Representation::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
@@ -185,18 +188,19 @@ fn parse_representation(node: roxmltree::Node<'_, '_>) -> Representation {
 }
 
 fn parse_segment_template(node: roxmltree::Node<'_, '_>) -> SegmentTemplate {
-    let mut st = SegmentTemplate::default();
-
-    st.media = attr_str(node, "media").map(ToOwned::to_owned);
-    st.initialization = attr_str(node, "initialization").map(ToOwned::to_owned);
-    st.startNumber = attr(node, "startNumber");
-    st.duration = attr(node, "duration");
-    st.timescale = attr(node, "timescale");
-    st.presentationTimeOffset = attr(node, "presentationTimeOffset");
-    st.availabilityTimeOffset = attr(node, "availabilityTimeOffset");
-    st.availabilityTimeComplete = node
-        .attribute("availabilityTimeComplete")
-        .map(|v| v.eq_ignore_ascii_case("true"));
+    let mut st = SegmentTemplate {
+        media: attr_str(node, "media").map(ToOwned::to_owned),
+        initialization: attr_str(node, "initialization").map(ToOwned::to_owned),
+        startNumber: attr(node, "startNumber"),
+        duration: attr(node, "duration"),
+        timescale: attr(node, "timescale"),
+        presentationTimeOffset: attr(node, "presentationTimeOffset"),
+        availabilityTimeOffset: attr(node, "availabilityTimeOffset"),
+        availabilityTimeComplete: node
+            .attribute("availabilityTimeComplete")
+            .map(|v| v.eq_ignore_ascii_case("true")),
+        ..SegmentTemplate::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
@@ -210,12 +214,13 @@ fn parse_segment_template(node: roxmltree::Node<'_, '_>) -> SegmentTemplate {
 }
 
 fn parse_segment_list(node: roxmltree::Node<'_, '_>) -> SegmentList {
-    let mut sl = SegmentList::default();
-
-    sl.duration = attr(node, "duration");
-    sl.timescale = attr(node, "timescale");
-    sl.startNumber = attr(node, "startNumber");
-    sl.presentationTimeOffset = attr(node, "presentationTimeOffset");
+    let mut sl = SegmentList {
+        duration: attr(node, "duration"),
+        timescale: attr(node, "timescale"),
+        startNumber: attr(node, "startNumber"),
+        presentationTimeOffset: attr(node, "presentationTimeOffset"),
+        ..SegmentList::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         match child.tag_name().name() {
@@ -237,11 +242,12 @@ fn parse_segment_url(node: roxmltree::Node<'_, '_>) -> SegmentURL {
 }
 
 fn parse_segment_base(node: roxmltree::Node<'_, '_>) -> SegmentBase {
-    let mut sb = SegmentBase::default();
-
-    sb.timescale = attr(node, "timescale");
-    sb.presentationTimeOffset = attr(node, "presentationTimeOffset");
-    sb.indexRange = attr_str(node, "indexRange").map(ToOwned::to_owned);
+    let mut sb = SegmentBase {
+        timescale: attr(node, "timescale"),
+        presentationTimeOffset: attr(node, "presentationTimeOffset"),
+        indexRange: attr_str(node, "indexRange").map(ToOwned::to_owned),
+        ..SegmentBase::default()
+    };
 
     for child in node.children().filter(|n| n.is_element()) {
         if child.tag_name().name() == "Initialization" {

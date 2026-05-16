@@ -25,7 +25,7 @@
 use alloc::collections::VecDeque;
 
 #[cfg(not(feature = "std"))]
-use alloc::{string::String, vec::Vec};
+use alloc::string::String;
 
 use crate::{abr::AbrDecisionReason, session::MediaType};
 

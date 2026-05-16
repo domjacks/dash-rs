@@ -19,7 +19,7 @@ use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
 use alloc::{
     borrow::ToOwned,
-    string::{String, ToString},
+    string::String,
     vec::Vec,
 };
 
@@ -520,7 +520,7 @@ mod tests {
 mod extended_tests {
     use super::*;
     use crate::manifest::mpd_types::{
-        AdaptationSet, BaseURL, Initialization, Period, Representation, SegmentBase, SegmentList,
+        AdaptationSet, BaseURL, Period, Representation, SegmentBase, SegmentList,
         SegmentTemplate, SegmentTimeline, SegmentURL, S,
     };
     use crate::session::MediaType;

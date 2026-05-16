@@ -1,7 +1,7 @@
 use thiserror::Error;
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, string::String};
+use alloc::string::String;
 
 /// The top-level error type for dash-rs.
 #[derive(Debug, Error)]

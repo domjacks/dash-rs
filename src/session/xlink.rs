@@ -20,8 +20,7 @@ use crate::Url;
 #[cfg(not(feature = "std"))]
 use alloc::{
     borrow::ToOwned,
-    boxed::Box,
-    string::{String, ToString},
+    string::String,
     vec::Vec,
 };
 

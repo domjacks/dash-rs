@@ -1,12 +1,7 @@
 use crate::abr::metrics::AbrMetrics;
 
 #[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::string::String;
 
 /// A minimal representation of a DASH `Representation` for ABR decisions.
 ///

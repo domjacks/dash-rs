@@ -7,6 +7,7 @@
 /// The trait is only defined (and needs importing) for `no_std` builds; `std`
 /// builds use the inherent `f64` methods directly.
 #[cfg(not(feature = "std"))]
+#[allow(dead_code)]
 pub(crate) trait FloatExt {
     fn floor(self) -> Self;
     fn ceil(self) -> Self;
@@ -21,6 +22,7 @@ pub(crate) trait FloatExt {
 }
 
 #[cfg(not(feature = "std"))]
+#[allow(dead_code)]
 impl FloatExt for f64 {
     #[inline]
     fn floor(self) -> f64 {

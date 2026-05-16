@@ -4,12 +4,7 @@ pub mod parser;
 use alloc::sync::Arc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    boxed::Box,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::string::String;
 
 use crate::Url;
 

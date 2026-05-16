@@ -25,6 +25,7 @@
 //! or [`crate::session::DashSession::from_url_with_clock`].
 
 use alloc::boxed::Box;
+#[cfg(feature = "std")]
 use alloc::sync::Arc;
 #[cfg(feature = "std")]
 use std::time::Duration;

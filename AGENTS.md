@@ -39,6 +39,9 @@ wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player
 #   python3 -m http.server 8080
 # and open http://localhost:8080
 
+# no_std build (no std or events features)
+cargo check --no-default-features
+
 # Lint
 cargo clippy -- -D warnings
 
@@ -134,10 +137,10 @@ that returns `true` for all types (preserving existing GStreamer / stub behaviou
   The session continues as audio-only.
 - Audio track: a `warn!` is emitted and `audio_track` is set to `None`.
 
-The `BridgeMediaSource` in `examples/wasm_player/src/lib.rs` overrides this
-method to delegate to `MediaSource.isTypeSupported()` in the browser, so HEVC
-streams on Chrome/Firefox fall back to audio-only rather than crashing with a
-`NotSupportedError` from `addSourceBuffer`.
+The `BridgeMediaSource` in `examples/wasm_player/src/media_source.rs` overrides
+this method to delegate to `MediaSource.isTypeSupported()` in the browser, so
+HEVC streams on Chrome/Firefox fall back to audio-only rather than crashing
+with a `NotSupportedError` from `addSourceBuffer`.
 
 Per-representation filtering (within a single `AdaptationSet` that mixes
 supported and unsupported codecs) is tracked as P2-14 in `COMPLIANCE.md`.
@@ -161,29 +164,98 @@ There is no explicit queue struct.  Concurrent callers must not interleave
 `await` points across two `append` calls on the same sink.  Use a single
 `async` task or a mutex if multiple producers exist.
 
-### `DashSession` buffer scheduling API
+### `PlaybackDriver` — primary integration pattern
 
-`DashSession` exposes a dash.js `ScheduleController`-style buffer-level gate:
+`DashSession::run()` owns the entire fetch loop.  Callers implement the
+`PlaybackDriver` trait to plug in platform-specific renderer behaviour.
+
+```rust
+use async_trait::async_trait;
+use dash_rs::session::driver::{IterationSummary, PlaybackDriver};
+use dash_rs::session::GapSeekTarget;
+
+struct MyDriver {
+    position_s: f64,
+}
+
+#[async_trait(?Send)]
+impl PlaybackDriver for MyDriver {
+    // Required: current renderer position in seconds.
+    fn position_s(&self) -> f64 { self.position_s }
+
+    // Optional: cache the session's estimated position at iteration start.
+    fn on_iteration_start(&mut self, session_position_s: f64) {
+        self.position_s = session_position_s;
+    }
+
+    // Optional: called when the gap controller recommends a seek.
+    // The session's fetch position has already been reset; seek the renderer.
+    async fn on_gap_seek(&mut self, target: GapSeekTarget) {
+        self.renderer.seek(target.position_s);
+    }
+
+    // Optional: supply measured transfer bandwidth to the ABR controller.
+    fn throughput_override_bps(&self) -> Option<f64> {
+        Some(self.fetcher.last_throughput_bps())
+    }
+
+    // Optional: slave audio buffering to the video level (GStreamer pattern).
+    fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {
+        video_buffer_ms.min(default_ms) + 1_000.0
+    }
+
+    // Optional: enable buffer pruning for native renderers.
+    fn enable_pruning(&self) -> bool { true }
+
+    // Optional: exit early (e.g. bounded test or preview).
+    fn should_continue(&self) -> bool {
+        self.segments_fetched < MAX_SEGMENTS
+    }
+
+    // Optional: progress reporting after every fetch pair.
+    fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+        println!(
+            "video {}kbps  audio {}kbps  buffer {:.1}s",
+            s.video_bandwidth / 1000,
+            s.audio_bandwidth / 1000,
+            s.video_buffer_ms / 1000.0,
+        );
+    }
+}
+```
+
+Then drive the session:
+
+```rust
+session.media_source_mut().open()?;
+// For live streams with MSE (WASM only):
+//   session.apply_live_pts_remap();
+session.run(&mut MyDriver { position_s: 0.0 }).await?;
+```
+
+`run()` calls `notify_playing()`, manages the buffer gate for both tracks, ticks
+the gap controller, calls `fetch_next_segment`, signals `end_of_stream` on
+completion, and calls `prune_all_tracks` when `enable_pruning()` returns `true`.
+You do not call any of these directly when using `run()`.
+
+**Every method except `position_s` has a sensible default** — override only
+what your platform actually requires.  A headless test driver needs only:
+
+```rust
+fn position_s(&self) -> f64 { 0.0 }
+```
+
+### `DashSession` buffer scheduling internals
+
+`run()` uses these `DashSession` methods internally.  They are documented here
+for contributors and for callers who build a custom fetch loop without `run()`:
 
 | Method | Description |
 |---|---|
-| `notify_playing()` | Call immediately after `media_source.set_playing()`. Starts the wall-clock used by `estimated_buffer_level_ms`. |
+| `notify_playing()` | Starts the wall-clock used by `estimated_buffer_level_ms`. Called automatically by `run()`. |
 | `estimated_buffer_level_ms(media_type)` | Returns `(segments_fetched × segment_duration_ms) − elapsed_playing_ms`, clamped to 0. |
 | `buffer_target_ms()` | Default 12 000 ms (matches `bufferTimeDefault` in dash.js `ScheduleController`). |
 | `set_buffer_target_ms(ms)` | Override the target. |
-
-The fetch loop pattern mirrors dash.js:
-
-```rust
-session.notify_playing();
-
-loop {
-    while session.estimated_buffer_level_ms(&MediaType::Video) >= session.buffer_target_ms() {
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-    session.fetch_next_segment(MediaType::Video, &metrics).await?;
-}
-```
 
 `estimated_buffer_level_ms` is a wall-clock approximation — it assumes real-time
 playback speed.  It is meaningless before `notify_playing()` is called (returns 0).
@@ -391,6 +463,15 @@ directly; they use `DashSession::tick_gap`.  `DashSession::seek_to` calls
 (`on_track_switch_started/ended`) fires automatically at period boundaries
 inside `try_advance_period`.
 
+**When using `DashSession::run()`**, gap seek handling is delegated to
+`PlaybackDriver::on_gap_seek`.  `run()` calls `tick_gap` on every iteration,
+and if a seek is recommended it calls `session.seek_to()` then
+`driver.on_gap_seek(target)`.  You do not need to call `tick_gap` or
+`seek_to` directly.
+
+**When building a custom fetch loop** (without `run()`), drive the gap
+controller manually:
+
 ```rust
 session.media_source_mut().set_playing()?;
 session.notify_playing();
@@ -543,7 +624,13 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
-| WASM player example (`JsBridge`, `BridgeClock`, `BridgeFetcher`, `BridgeMediaSource`, `BridgeSourceBuffer`, `play`) | `examples/wasm_player/src/lib.rs` |
+| WASM player bridge types (`JsBridge` extern, `js_err`) | `examples/wasm_player/src/bridge.rs` |
+| WASM player clock (`BridgeClock`) | `examples/wasm_player/src/clock.rs` |
+| WASM player source buffer (`BridgeSourceBuffer`) | `examples/wasm_player/src/source_buffer.rs` |
+| WASM player media source (`BridgeMediaSource`) | `examples/wasm_player/src/media_source.rs` |
+| WASM player fetcher (`FetchResult` extern, `BridgeFetcher`) | `examples/wasm_player/src/fetcher.rs` |
+| WASM player driver (`WasmPlaybackDriver`) | `examples/wasm_player/src/driver.rs` |
+| WASM player entry points (`init`, `play`) | `examples/wasm_player/src/lib.rs` |
 | WASM player MSE bridge (`createBridge`) — all browser Web API calls | `examples/wasm_player/player.js` |
 | WASM player UI wiring — on-screen logger, WASM init, form handler | `examples/wasm_player/app.js` |
 
@@ -569,8 +656,9 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `ManifestUpdater.js` | `session::DashSession::refresh_manifest_if_due` (called automatically inside `fetch_next_segment`) |
 | `LocationSelector.js` | `DashSession::location_urls()` + `manifest_url()`; fallback logic inside `refresh_manifest` |
 | `MediaPlayer.js` + `StreamProcessor.js` | `session::DashSession` |
+| `MediaPlayer.js` event loop | `session::driver::PlaybackDriver` + `DashSession::run()` |
 | `StreamController.js` / `Stream.js` | `session::DashSession::try_advance_period` (called automatically inside `fetch_next_segment`) |
-| `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` |
+| `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` (all managed internally by `DashSession::run()`) |
 | `EventController.js` | `session::DashEvent` + `DashSession::subscribe_events` (broadcast channel; events dispatched by `fetch_next_segment`) |
 | `ServiceDescriptionController.js` | `DashSession::target_latency_ms()` + `playback_rate_range()` |
 | `AbrController.setMaxAllowedBitrateFor()` | `DashSession::set_max_bitrate(media_type, bps)` / `clear_max_bitrate` / `max_bitrate` |

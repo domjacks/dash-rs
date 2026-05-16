@@ -23,11 +23,7 @@
 use alloc::sync::Arc;
 
 #[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    string::{String, ToString},
-    vec::Vec,
-};
+use alloc::{borrow::ToOwned, vec::Vec};
 
 use crate::manifest::mpd_types::MPD;
 use crate::Url;
