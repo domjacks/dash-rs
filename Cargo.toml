@@ -42,7 +42,7 @@ libm             = { version = "0.2", default-features = false }
 gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
 gstreamer-app    = { version = "0.24", optional = true }
 
-[target.'cfg(all(target_arch = "wasm32", feature = "std"))'.dependencies]
+[target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys        = "0.3"
 futures-timer = { version = "3", features = ["wasm-bindgen"] }
 
