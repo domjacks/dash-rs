@@ -1,8 +1,7 @@
 # AGENTS.md
 
 dash-rs — a Rust implementation of MPEG-DASH playback logic.
-Pure Rust (edition 2021), async via `async-trait` (`?Send` everywhere);
-WASM-compatible (`wasm32-unknown-unknown`).
+Pure Rust (edition 2021), WASM-compatible (`wasm32-unknown-unknown`) and targetting no_std environments.
 
 ---
 
