@@ -19,6 +19,52 @@ use alloc::{boxed::Box, string::String};
 
 use crate::{abr::QualityDecision, session::GapSeekTarget};
 
+// ── PlaybackState ─────────────────────────────────────────────────────────────
+
+/// Current renderer playback state, reported to the session each iteration via
+/// [`PlaybackDriver::playback_state`].
+///
+/// The session uses this to decide:
+/// - Whether to **freeze the wall-clock** used by
+///   [`DashSession::estimated_buffer_level_ms`] — both `Paused` and `Buffering`
+///   freeze it, so the estimated buffer level does not appear to drain while the
+///   renderer is not consuming data.
+/// - Whether to **suppress gap-jump seeks** issued by the
+///   [`GapController`][super::GapController] — suppressed for `Paused` and
+///   `Buffering`, since jumping away from a stall would discard data already
+///   being fetched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PlaybackState {
+    /// The renderer is actively consuming data.  The session's wall-clock runs.
+    #[default]
+    Playing,
+    /// The renderer has been paused by the user.  The wall-clock is frozen and
+    /// gap-jump seeks are suppressed.
+    Paused,
+    /// The renderer is stalled waiting for data (not a user action).  Treated
+    /// identically to `Paused` for clock-freezing and gap-jump purposes, but
+    /// distinguished so that callers can log or react differently.
+    Buffering,
+}
+
+impl PlaybackState {
+    /// Returns `true` when the renderer is not actively consuming data and the
+    /// session wall-clock should be frozen.
+    pub fn freezes_clock(self) -> bool {
+        !matches!(self, Self::Playing)
+    }
+
+    /// Returns `true` when gap-jump seeks should be suppressed.
+    pub fn suppresses_gap_jump(self) -> bool {
+        !matches!(self, Self::Playing)
+    }
+
+    /// Returns `true` when the renderer is playing (neither paused nor stalled).
+    pub fn is_playing(self) -> bool {
+        matches!(self, Self::Playing)
+    }
+}
+
 // ── IterationSummary ──────────────────────────────────────────────────────────
 
 /// Per-iteration snapshot passed to [`PlaybackDriver::on_iteration`].
@@ -125,14 +171,18 @@ pub trait PlaybackDriver {
 
     // ── Optional ─────────────────────────────────────────────────────────────
 
-    /// Whether the renderer is currently paused.
+    /// Current renderer playback state.
     ///
-    /// Called every loop iteration so that the session's buffer-level estimate
-    /// stays accurate while the renderer is paused.
+    /// Called every loop iteration so that the session's wall-clock and
+    /// gap-controller behave correctly while the renderer is paused or stalled.
     ///
-    /// Default: `false` (always playing).
-    fn is_paused(&self) -> bool {
-        false
+    /// - [`PlaybackState::Paused`] and [`PlaybackState::Buffering`] both freeze
+    ///   [`DashSession::estimated_buffer_level_ms`] and suppress gap-jump seeks.
+    /// - [`PlaybackState::Playing`] (the default) lets the clock run freely.
+    ///
+    /// Default: [`PlaybackState::Playing`] — always playing.
+    fn playback_state(&self) -> PlaybackState {
+        PlaybackState::Playing
     }
 
     /// Called when the gap controller recommends a seek.

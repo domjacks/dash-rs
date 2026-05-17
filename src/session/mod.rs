@@ -87,6 +87,7 @@ use self::{
     timeline::{find_timeline_segment, snap_to_timeline_grid},
 };
 use blacklist::CdnBlacklist;
+use driver::PlaybackState;
 
 // ── MediaType ─────────────────────────────────────────────────────────────────
 
@@ -588,11 +589,13 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// Clock reading (`clock.now_ms()`) when the pipeline transitioned to Playing.
     /// `None` until [`Self::notify_playing`] is called.
     playback_started_at: Option<f64>,
-    /// True while the pipeline is in the Paused state.
-    paused: bool,
-    /// Clock reading (`clock.now_ms()`) when the pipeline entered Paused.
+    /// Current renderer playback state, synced from [`PlaybackDriver::playback_state`]
+    /// at the start of each loop iteration.
+    playback_state: PlaybackState,
+    /// Clock reading (`clock.now_ms()`) when the renderer entered a frozen state
+    /// (`Paused` or `Buffering`).
     paused_at: Option<f64>,
-    /// Cumulative milliseconds spent in the Paused state since playback started.
+    /// Cumulative milliseconds spent in a frozen state since playback started.
     total_paused_ms: f64,
     /// When `true`, the fetch loop continues even while the pipeline is paused.
     schedule_while_paused: bool,
@@ -1098,7 +1101,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             buffer_target_ms,
             clock,
             playback_started_at: None,
-            paused: false,
+            playback_state: PlaybackState::Playing,
             paused_at: None,
             total_paused_ms: 0.0,
             schedule_while_paused: false,
@@ -1201,9 +1204,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         &mut self,
         position_s: f64,
         buffered: &[crate::media_source::TimeRange],
-        is_paused: bool,
+        state: PlaybackState,
     ) -> Option<GapSeekTarget> {
-        self.gap_controller.tick(position_s, buffered, is_paused)
+        self.gap_controller.tick(position_s, buffered, state.suppresses_gap_jump())
     }
 
     /// Read-only access to the gap controller settings.
@@ -1394,11 +1397,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Record that the pipeline has entered Playing state.
     pub fn notify_playing(&mut self) {
-        if self.paused {
-            if let Some(paused_at) = self.paused_at.take() {
-                self.total_paused_ms += self.clock.now_ms() - paused_at;
+        if self.playback_state.freezes_clock() {
+            if let Some(frozen_at) = self.paused_at.take() {
+                self.total_paused_ms += self.clock.now_ms() - frozen_at;
             }
-            self.paused = false;
+            self.playback_state = PlaybackState::Playing;
         } else {
             self.playback_started_at = Some(self.clock.now_ms());
             self.total_paused_ms = 0.0;
@@ -1407,15 +1410,37 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
     /// Record that the pipeline has entered Paused state.
     pub fn notify_paused(&mut self) {
-        if !self.paused {
-            self.paused = true;
+        if self.playback_state.is_playing() {
+            self.playback_state = PlaybackState::Paused;
+            self.paused_at = Some(self.clock.now_ms());
+        }
+    }
+
+    /// Record that the renderer has entered a Buffering (stalled) state.
+    ///
+    /// Treated identically to [`Self::notify_paused`] for clock-freezing and
+    /// gap-jump purposes — the wall-clock is frozen until [`Self::notify_playing`]
+    /// is called again.
+    pub fn notify_buffering(&mut self) {
+        if self.playback_state.is_playing() {
+            self.playback_state = PlaybackState::Buffering;
             self.paused_at = Some(self.clock.now_ms());
         }
     }
 
     /// Whether the session is currently tracking a paused pipeline.
     pub fn is_paused(&self) -> bool {
-        self.paused
+        self.playback_state == PlaybackState::Paused
+    }
+
+    /// Whether the session is currently tracking a buffering (stalled) renderer.
+    pub fn is_buffering(&self) -> bool {
+        self.playback_state == PlaybackState::Buffering
+    }
+
+    /// The current playback state tracked by this session.
+    pub fn playback_state(&self) -> PlaybackState {
+        self.playback_state
     }
 
     /// Whether the fetch loop should continue to run while the pipeline is paused.
@@ -1428,25 +1453,37 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.schedule_while_paused = v;
     }
 
-    /// Synchronise the session's pause state from an external boolean signal.
+    /// Synchronise the session's playback state from the driver's reported value.
     ///
-    /// This is a convenience wrapper around [`Self::notify_paused`] and
-    /// [`Self::notify_playing`] that eliminates the `was_paused` tracking
-    /// variable callers would otherwise need.  It is safe to call on every
-    /// loop iteration — both `notify_paused` and `notify_playing` are
+    /// This is a convenience wrapper around [`Self::notify_playing`],
+    /// [`Self::notify_paused`], and [`Self::notify_buffering`] that eliminates
+    /// the `was_paused` tracking variable callers would otherwise need.  It is
+    /// safe to call on every loop iteration — all three notify methods are
     /// idempotent when the state has not changed.
     ///
     /// # Example
     ///
     /// ```ignore
     /// // At the top of each fetch-loop iteration:
-    /// session.sync_pause_state(renderer.is_paused());
+    /// session.sync_playback_state(driver.playback_state());
     /// ```
-    pub fn sync_pause_state(&mut self, is_paused: bool) {
-        if is_paused && !self.paused {
-            self.notify_paused();
-        } else if !is_paused && self.paused {
-            self.notify_playing();
+    pub fn sync_playback_state(&mut self, state: PlaybackState) {
+        match state {
+            PlaybackState::Playing => {
+                if self.playback_state.freezes_clock() {
+                    self.notify_playing();
+                }
+            }
+            PlaybackState::Paused => {
+                if self.playback_state.is_playing() {
+                    self.notify_paused();
+                }
+            }
+            PlaybackState::Buffering => {
+                if self.playback_state.is_playing() {
+                    self.notify_buffering();
+                }
+            }
         }
     }
 
@@ -1456,7 +1493,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// This is the library-side implementation of the dash.js
     /// `ScheduleController` buffer-gate loop.  It sleeps in
     /// [`crate::clock::Clock::set_timeout`] increments of 500 ms (matching
-    /// `dash.js` `scheduleTimeout`) and calls [`Self::sync_pause_state`] after
+    /// `dash.js` `scheduleTimeout`) and calls [`Self::sync_playback_state`] after
     /// each wake so that a resume while sleeping correctly unfreezes
     /// [`Self::estimated_buffer_level_ms`].
     ///
@@ -1465,27 +1502,33 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// # Arguments
     ///
     /// * `media_type` — the track whose buffer level gates fetching.
-    /// * `is_paused`  — closure that returns the current renderer pause state.
-    ///   Queried after every sleep tick so that pause/resume transitions are
-    ///   handled without the caller needing a `was_paused` variable.
+    /// * `frozen`  — closure that returns `true` while the renderer's clock is
+    ///   frozen (paused or buffering).  Queried after every sleep tick so that
+    ///   pause/resume transitions are handled without the caller needing a
+    ///   `was_paused` variable.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// session.wait_for_buffer_capacity(&MediaType::Video, || renderer.is_paused()).await;
+    /// session.wait_for_buffer_capacity(&MediaType::Video,
+    ///     || driver.playback_state().freezes_clock()).await;
     /// session.fetch_next_segment(MediaType::Video, &metrics).await?;
     /// ```
     pub async fn wait_for_buffer_capacity(
         &mut self,
         media_type: &MediaType,
-        is_paused: impl Fn() -> bool,
+        frozen: impl Fn() -> bool,
     ) {
         // Clone the Arc so the await point on set_timeout does not hold a
-        // borrow on `self`, allowing sync_pause_state to take &mut self.
+        // borrow on `self`, allowing sync_playback_state to take &mut self.
         let clock = Arc::clone(&self.clock);
         while self.estimated_buffer_level_ms(media_type) >= self.buffer_target_ms() {
             clock.set_timeout(500.0).await;
-            self.sync_pause_state(is_paused());
+            self.sync_playback_state(if frozen() {
+                PlaybackState::Paused
+            } else {
+                PlaybackState::Playing
+            });
         }
     }
 
@@ -1500,8 +1543,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// let clock = session.clock_arc();
     /// loop {
     ///     if buf < custom_target { break; }
-    ///     clock.set_timeout(500.0).await;
-    ///     session.sync_pause_state(renderer.is_paused());
+     ///     clock.set_timeout(500.0).await;
+    ///     session.sync_playback_state(driver.playback_state());
     /// }
     /// ```
     pub fn clock_arc(&self) -> Arc<dyn Clock> {
@@ -1521,8 +1564,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// # What `run` does each iteration
     ///
-    /// 1. Calls [`PlaybackDriver::sync_pause_state`][Self::sync_pause_state]
-    ///    so buffer-level estimates stay accurate during pauses.
+    /// 1. Calls [`PlaybackDriver::playback_state`] via
+    ///    [`sync_playback_state`][Self::sync_playback_state]
+    ///    so buffer-level estimates stay accurate during pauses and stalls.
     /// 2. Calls [`PlaybackDriver::on_iteration_start`] with the session's
     ///    current estimated playback position.
     /// 3. Optionally calls [`prune_all_tracks`][Self::prune_all_tracks] when
@@ -1615,7 +1659,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
 
             // ── 1. Pause sync ────────────────────────────────────────────────
-            self.sync_pause_state(drv.is_paused());
+            self.sync_playback_state(drv.playback_state());
 
             // ── 2. Iteration start ───────────────────────────────────────────
             let session_pos = self.estimated_playback_position_s();
@@ -1631,7 +1675,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             {
                 let pos = drv.position_s();
                 let buffered = self.buffered(gate.clone());
-                if let Some(target) = self.tick_gap(pos, &buffered, drv.is_paused()) {
+                if let Some(target) = self.tick_gap(pos, &buffered, drv.playback_state()) {
                     tracing::info!(
                         pos,
                         seek_to = target.position_s,
@@ -1645,7 +1689,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
 
             // ── 5. Video buffer gate ─────────────────────────────────────────
-            self.wait_for_buffer_capacity(&gate, || drv.is_paused())
+            self.wait_for_buffer_capacity(&gate, || drv.playback_state().freezes_clock())
                 .await;
 
             // ── 6. Video fetch ───────────────────────────────────────────────
@@ -1683,7 +1727,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                         "audio buffer gate: waiting"
                     );
                     clock.set_timeout(500.0).await;
-                    self.sync_pause_state(drv.is_paused());
+                    self.sync_playback_state(drv.playback_state());
                 }
             }
 
@@ -1771,7 +1815,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             .playback_started_at
             .map(|started_ms| {
                 let total_elapsed = self.clock.now_ms() - started_ms;
-                let current_pause_ms = if self.paused {
+                let current_pause_ms = if self.playback_state.freezes_clock() {
                     self.paused_at
                         .map(|pa_ms| self.clock.now_ms() - pa_ms)
                         .unwrap_or(0.0)
@@ -1790,7 +1834,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.playback_started_at
             .map(|started_ms| {
                 let total_elapsed = self.clock.now_ms() - started_ms;
-                let current_pause_ms = if self.paused {
+                let current_pause_ms = if self.playback_state.freezes_clock() {
                     self.paused_at
                         .map(|pa_ms| self.clock.now_ms() - pa_ms)
                         .unwrap_or(0.0)

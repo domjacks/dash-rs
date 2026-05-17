@@ -49,6 +49,10 @@ extern "C" {
     #[wasm_bindgen(method, js_name = isPaused)]
     pub(crate) fn is_paused(this: &JsBridge) -> bool;
 
+    // !video.paused && video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA
+    #[wasm_bindgen(method, js_name = isBuffering)]
+    pub(crate) fn is_buffering(this: &JsBridge) -> bool;
+
     // ── MediaSource lifecycle ─────────────────────────────────────────────
     // new MediaSource() + URL.createObjectURL() + video.src= + sourceopen
     #[wasm_bindgen(method, js_name = setupMediaSource)]

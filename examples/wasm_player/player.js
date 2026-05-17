@@ -71,6 +71,17 @@ export function createBridge(video, log) {
       return video.paused;
     },
 
+    // True when the renderer is stalled waiting for data (not a user pause).
+    // Checked every iteration alongside isPaused() to report PlaybackState::Buffering
+    // to dash-rs so the session wall-clock is frozen and gap jumps are suppressed
+    // until the video element has enough data to continue.
+    // HAVE_FUTURE_DATA = 3 — the element has data for the current and next frame;
+    // below that it cannot advance playback.
+    isBuffering() {
+      return !video.paused &&
+             video.readyState < HTMLMediaElement.HAVE_FUTURE_DATA;
+    },
+
     // ── MediaSource lifecycle ──────────────────────────────────────────────────
 
     // MediaSource.isTypeSupported(mimeType) — static capability check.

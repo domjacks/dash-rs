@@ -15,7 +15,7 @@ use std::sync::{
 };
 
 use async_trait::async_trait;
-use dash_rs::session::driver::{IterationSummary, PlaybackDriver};
+use dash_rs::session::driver::{IterationSummary, PlaybackDriver, PlaybackState};
 use gst::prelude::*;
 use gstreamer as gst;
 
@@ -23,6 +23,7 @@ use gstreamer as gst;
 
 pub(crate) struct GstPlaybackDriver {
     pub(crate) is_paused: Arc<AtomicBool>,
+    pub(crate) is_buffering: Arc<AtomicBool>,
     pub(crate) throughput_tracker: Arc<AtomicU64>,
     /// Cloned pipeline handle — used to call `set_state(Playing)` in
     /// `on_session_started` after init segments have been pushed.
@@ -35,11 +36,13 @@ pub(crate) struct GstPlaybackDriver {
 impl GstPlaybackDriver {
     pub(crate) fn new(
         is_paused: Arc<AtomicBool>,
+        is_buffering: Arc<AtomicBool>,
         throughput_tracker: Arc<AtomicU64>,
         pipeline: gst::Pipeline,
     ) -> Self {
         Self {
             is_paused,
+            is_buffering,
             throughput_tracker,
             pipeline,
             cached_pos_s: 0.0,
@@ -54,8 +57,15 @@ impl PlaybackDriver for GstPlaybackDriver {
         self.cached_pos_s
     }
 
-    fn is_paused(&self) -> bool {
-        self.is_paused.load(Ordering::Relaxed)
+    fn playback_state(&self) -> PlaybackState {
+        // Buffering takes priority — a stalled renderer is not user-paused.
+        if self.is_buffering.load(Ordering::Relaxed) {
+            PlaybackState::Buffering
+        } else if self.is_paused.load(Ordering::Relaxed) {
+            PlaybackState::Paused
+        } else {
+            PlaybackState::Playing
+        }
     }
 
     fn throughput_override_bps(&self) -> Option<f64> {

@@ -17,7 +17,7 @@ use dash_rs::{
     error::DashError,
     fetch::{FetchError, FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     media_source::{stub::StubMediaSource, MediaSource, ReadyState, SourceBuffer, TimeRange},
-    session::{DashSession, MediaType},
+    session::{driver::PlaybackState, DashSession, MediaType},
     DashMetrics, GapSeekReason,
 };
 
@@ -2979,7 +2979,7 @@ fn gap_buffered() -> Vec<TimeRange> {
 fn tick_gap_returns_none_when_position_in_buffer() {
     let mut session = session_from_xml(SEEK_MPD);
     // Position 2.0 is inside [0, 5] — no gap, no stall.
-    let result = session.tick_gap(2.0, &gap_buffered(), false);
+    let result = session.tick_gap(2.0, &gap_buffered(), PlaybackState::Playing);
     assert!(
         result.is_none(),
         "no seek needed when inside buffered range"
@@ -2993,7 +2993,7 @@ fn tick_gap_recommends_seek_for_gap() {
     let mut session = session_from_xml(SEEK_MPD);
     // Position 5.1 s is past the end of [0, 5] and inside the gap before [6, 10].
     // The gap is 1.0 s which is > small_gap_limit_s (0.8 s) but jump_large_gaps=true.
-    let result = session.tick_gap(5.1, &gap_buffered(), false);
+    let result = session.tick_gap(5.1, &gap_buffered(), PlaybackState::Playing);
     assert!(result.is_some(), "gap should trigger a seek recommendation");
     let target = result.unwrap();
     // Should seek to the start of the next range (6.0) plus seek_offset_s (0.1).
@@ -3017,14 +3017,14 @@ fn seek_to_resets_gap_controller_automatically() {
 
     // First tick detects the gap and returns a seek target.
     let target = session
-        .tick_gap(5.1, &buffered, false)
+        .tick_gap(5.1, &buffered, PlaybackState::Playing)
         .expect("should recommend a gap seek");
 
     // Caller honours the seek recommendation — seek_to resets the controller.
     session.seek_to(target.position_s);
 
     // Second tick at the same position must not re-fire (dedup guard).
-    let again = session.tick_gap(target.position_s, &buffered, false);
+    let again = session.tick_gap(target.position_s, &buffered, PlaybackState::Playing);
     assert!(
         again.is_none(),
         "gap controller should not re-fire immediately after seek_to"
@@ -3232,7 +3232,7 @@ fn gap_settings_round_trip() {
     );
 
     // Large gap (> small_gap_limit_s=0.8 s) should now return None.
-    let result = session.tick_gap(5.1, &gap_buffered(), false);
+    let result = session.tick_gap(5.1, &gap_buffered(), PlaybackState::Playing);
     assert!(
         result.is_none(),
         "large gap jump should be suppressed when jump_large_gaps=false"
@@ -5575,7 +5575,7 @@ fn tick_gap_stall_recovery_fires_after_threshold_ticks() {
     // Ticks 1–3: stall counter accumulates; should return None.
     // (First tick initialises last_position_s; stall counter starts on tick 2.)
     for i in 1..=3 {
-        let result = session.tick_gap(position_s, &buffered, false);
+        let result = session.tick_gap(position_s, &buffered, PlaybackState::Playing);
         assert!(
             result.is_none(),
             "tick {i}: should not fire yet (threshold not reached); got {result:?}"
@@ -5583,7 +5583,7 @@ fn tick_gap_stall_recovery_fires_after_threshold_ticks() {
     }
 
     // Tick 4: stall_ticks reaches threshold → StallRecovery fires.
-    let result = session.tick_gap(position_s, &buffered, false);
+    let result = session.tick_gap(position_s, &buffered, PlaybackState::Playing);
     assert!(
         result.is_some(),
         "tick 4: stall recovery should fire after threshold is reached"
@@ -5617,7 +5617,7 @@ fn tick_gap_small_gap_jumped_regardless_of_jump_large_gaps_setting() {
     // Gap of 0.4 s between [0.0, 5.0] and [5.4, 10.0] — below the 0.8 s limit.
     let buffered = vec![TimeRange::new(0.0, 5.0), TimeRange::new(5.4, 10.0)];
     // Position just past the end of the first range.
-    let result = session.tick_gap(5.05, &buffered, false);
+    let result = session.tick_gap(5.05, &buffered, PlaybackState::Playing);
 
     assert!(
         result.is_some(),
@@ -5647,7 +5647,7 @@ fn tick_gap_large_gap_not_jumped_when_disabled() {
     session.set_gap_settings(settings);
 
     // Gap of 0.9 s > 0.8 s limit → large gap, disabled → None.
-    let result = session.tick_gap(5.1, &gap_buffered(), false);
+    let result = session.tick_gap(5.1, &gap_buffered(), PlaybackState::Playing);
     assert!(
         result.is_none(),
         "large gap (0.9 s) must not be jumped when jump_large_gaps=false; got {result:?}"
@@ -6526,13 +6526,13 @@ async fn metrics_ring_buffer_caps_at_100() {
     );
 }
 
-// ── sync_pause_state / wait_for_buffer_capacity tests ────────────────────────
+// ── sync_playback_state / wait_for_buffer_capacity tests ─────────────────────
 
-/// `sync_pause_state` is idempotent: calling it repeatedly with the same
+/// `sync_playback_state` is idempotent: calling it repeatedly with the same
 /// value must not reset `playback_started_at` (which would zero the elapsed
 /// time and corrupt the buffer-level estimate).
 #[tokio::test]
-async fn sync_pause_state_idempotent() {
+async fn sync_playback_state_idempotent() {
     use dash_rs::clock::Clock;
     use std::cell::Cell;
     use std::sync::Arc;
@@ -6565,21 +6565,21 @@ async fn sync_pause_state_idempotent() {
     clock.0.set(5_000.0);
     let level_before = session.estimated_buffer_level_ms(&MediaType::Video);
 
-    // Call sync_pause_state(false) twice — must not change the level estimate.
-    session.sync_pause_state(false);
-    session.sync_pause_state(false);
+    // Call sync_playback_state(Playing) twice — must not change the level estimate.
+    session.sync_playback_state(PlaybackState::Playing);
+    session.sync_playback_state(PlaybackState::Playing);
     let level_after = session.estimated_buffer_level_ms(&MediaType::Video);
     assert_eq!(
         level_before, level_after,
-        "repeated sync_pause_state(false) must not alter the buffer estimate"
+        "repeated sync_playback_state(Playing) must not alter the buffer estimate"
     );
 }
 
-/// `sync_pause_state` correctly transitions paused → playing:
+/// `sync_playback_state` correctly transitions paused → playing:
 /// the buffer estimate must remain frozen while paused and resume
 /// draining when playing is signalled.
 #[tokio::test]
-async fn sync_pause_state_pause_resume_unfreezes_estimate() {
+async fn sync_playback_state_pause_resume_unfreezes_estimate() {
     use dash_rs::clock::Clock;
     use std::cell::Cell;
     use std::sync::Arc;
@@ -6610,7 +6610,7 @@ async fn sync_pause_state_pause_resume_unfreezes_estimate() {
 
     // Advance 3 s, then pause.
     clock.0.set(3_000.0);
-    session.sync_pause_state(true);
+    session.sync_playback_state(PlaybackState::Paused);
     let level_at_pause = session.estimated_buffer_level_ms(&MediaType::Video);
 
     // Advance another 10 s while paused — estimate must stay frozen.
@@ -6621,17 +6621,17 @@ async fn sync_pause_state_pause_resume_unfreezes_estimate() {
         "buffer estimate must be frozen while paused"
     );
 
-    // Calling sync_pause_state(true) again (idempotent) must keep it frozen.
-    session.sync_pause_state(true);
+    // Calling sync_playback_state(Paused) again (idempotent) must keep it frozen.
+    session.sync_playback_state(PlaybackState::Paused);
     assert_eq!(
         level_at_pause,
         session.estimated_buffer_level_ms(&MediaType::Video),
-        "repeated sync_pause_state(true) must not change the frozen estimate"
+        "repeated sync_playback_state(Paused) must not change the frozen estimate"
     );
 
     // Resume — clock continues from 13 s.  After another 2 s the estimate
     // must have drained by 2 s relative to the frozen level.
-    session.sync_pause_state(false);
+    session.sync_playback_state(PlaybackState::Playing);
     clock.0.set(15_000.0);
     let level_after_resume = session.estimated_buffer_level_ms(&MediaType::Video);
     let expected = (level_at_pause - 2_000.0_f64).max(0.0);

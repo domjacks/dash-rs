@@ -42,7 +42,7 @@
 //!   │               └─ glib::timeout_add  (fetch-error detection)
 //!   │
 //!   └─ OS thread ← tokio multi-thread runtime
-//!                   ├─ DashSession::from_url  (manifest fetch + parse)
+//!                   ├─ Player::from_url  (manifest fetch + parse)
 //!                   ├─ fetch_init_segment x2  (video + audio)
 //!                   ├─ set_playing()           (pipeline → Playing)
 //!                   └─ segment fetch loop      (ABR + push bytes)
@@ -57,7 +57,7 @@ use std::sync::{
     mpsc, Arc,
 };
 
-use dash_rs::{session::DashSession, DashError, Player};
+use dash_rs::{DashError, Player};
 use driver::GstPlaybackDriver;
 use fetcher::HttpSegmentFetcher;
 use gst::prelude::*;
@@ -75,22 +75,23 @@ async fn run_session(
     media_source: GstMediaSource,
     throughput_tracker: Arc<AtomicU64>,
     is_paused: Arc<AtomicBool>,
+    is_buffering: Arc<AtomicBool>,
 ) -> Result<(), DashError> {
     let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
 
-    // Grab the pipeline handle before media_source is moved into the session.
+    // Grab the pipeline handle before media_source is moved into Player::from_url.
     let pipeline = media_source.pipeline();
+    let driver = GstPlaybackDriver::new(is_paused, is_buffering, throughput_tracker, pipeline);
 
-    // Build session — fetches + parses the MPD, creates source buffers.
-    // `GstMediaSource::open()` default is a no-op (pipeline is already Open
-    // at construction time).
-    let session: DashSession<HttpSegmentFetcher, GstMediaSource> =
-        DashSession::from_url(&manifest_url, fetcher, media_source).await?;
+    // Player::from_url fetches + parses the MPD, opens the media source, and
+    // creates the source buffers.  GstMediaSource::open() is a no-op (the
+    // pipeline is already Open at construction time).
+    let mut player = Player::from_url(&manifest_url, fetcher, media_source, driver).await?;
 
     // Print available representations.
-    if session.has_video() {
+    if player.session().has_video() {
         println!("\n=== Video representations ===");
-        for (i, rep) in session.video_representations().iter().enumerate() {
+        for (i, rep) in player.session().video_representations().iter().enumerate() {
             println!(
                 "  [{i}] id={:<12} {:>6} kbps  {}x{}",
                 rep.id,
@@ -102,9 +103,9 @@ async fn run_session(
     } else {
         println!("\n=== Video representations ===  (none — audio-only stream)");
     }
-    if session.has_audio() {
+    if player.session().has_audio() {
         println!("=== Audio representations ===");
-        for (i, rep) in session.audio_representations().iter().enumerate() {
+        for (i, rep) in player.session().audio_representations().iter().enumerate() {
             println!(
                 "  [{i}] id={:<12} {:>6} kbps",
                 rep.id,
@@ -118,15 +119,14 @@ async fn run_session(
 
     println!(
         "\n=== Fetching all segments (buffer target: {:.0} s) ===",
-        session.buffer_target_ms() / 1_000.0
+        player.session().buffer_target_ms() / 1_000.0
     );
     println!(
         "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:<10}  {}",
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
     );
 
-    let driver = GstPlaybackDriver::new(is_paused, throughput_tracker, pipeline.clone());
-    Player::new(session, driver).run().await?;
+    player.run().await?;
 
     println!("\nAll segments fetched — waiting for pipeline EOS…");
 
@@ -188,6 +188,9 @@ fn run() {
     // thread and read by the background fetch loop.
     let is_paused = Arc::new(AtomicBool::new(false));
 
+    // Shared buffering-state flag: true while GStreamer reports < 100 % buffer.
+    let is_buffering = Arc::new(AtomicBool::new(false));
+
     // Channel used to receive the fetch result from the background thread.
     let (done_tx, done_rx) = mpsc::channel::<Result<(), DashError>>();
 
@@ -196,6 +199,7 @@ fn run() {
     // (required for macOS video-sink rendering).
     let throughput_tracker_bg = Arc::clone(&throughput_tracker);
     let is_paused_bg = Arc::clone(&is_paused);
+    let is_buffering_bg = Arc::clone(&is_buffering);
     std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
@@ -207,6 +211,7 @@ fn run() {
             media_source,
             throughput_tracker_bg,
             is_paused_bg,
+            is_buffering_bg,
         ));
 
         done_tx.send(result).ok();
@@ -228,6 +233,7 @@ fn run() {
     let main_loop_w = main_loop.clone();
     let pipeline_w = pipeline.clone();
     let is_paused_w = Arc::clone(&is_paused);
+    let is_buffering_w = Arc::clone(&is_buffering);
     let _watch = bus
         .add_watch(move |_bus, msg| {
             use gst::MessageView;
@@ -259,12 +265,27 @@ fn run() {
                         warn.debug().unwrap_or_else(|| "<no debug>".into()),
                     );
                 }
+                MessageView::Buffering(b) => {
+                    let pct = b.percent();
+                    let stalled = pct < 100;
+                    is_buffering_w.store(stalled, Ordering::Relaxed);
+                    if stalled {
+                        tracing::debug!(percent = pct, "GStreamer buffering");
+                    } else {
+                        tracing::debug!("GStreamer buffering complete");
+                    }
+                }
                 MessageView::StateChanged(sc) => {
                     // Only log top-level pipeline state changes.
                     if msg.src().map(|s| *s == pipeline_w).unwrap_or(false) {
                         let new_state = sc.current();
                         // Propagate pause/resume to the fetch loop.
                         is_paused_w.store(new_state == gst::State::Paused, Ordering::Relaxed);
+                        // A state transition to Playing clears any buffering flag
+                        // set while the pipeline was pre-rolling.
+                        if new_state == gst::State::Playing {
+                            is_buffering_w.store(false, Ordering::Relaxed);
+                        }
                         tracing::info!(
                             old = ?sc.old(),
                             new = ?new_state,

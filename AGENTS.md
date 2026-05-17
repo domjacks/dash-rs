@@ -541,7 +541,7 @@ session.notify_playing();
 let target = session.tick_gap(
     renderer_position_s,    // from GStreamer query_position or equivalent
     &source_buffer_ranges,  // union of SourceBuffer::buffered() across tracks
-    is_paused,
+    driver.playback_state(),
 );
 if let Some(t) = target {
     // 1. Seek the renderer.
@@ -667,6 +667,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Manifest loading | `src/manifest/mod.rs` |
  | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
  | `PlaybackDriver` trait + `IterationSummary` (`DashSession::run`) | `src/session/driver.rs` |
+ | `PlaybackState` enum (`Playing`, `Paused`, `Buffering`) | `src/session/driver.rs` |
  | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
 | Epoch-scale PTS remapping (`apply_live_pts_remap`, `live_pts_remap_offset_s`) | `src/session/mod.rs` |
 | Formal metrics (`DashMetrics`, `HttpRequestRecord`, `RepresentationSwitchRecord`, `BufferLevelSample`) | `src/session/metrics.rs` |
@@ -727,7 +728,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | `ServiceDescriptionController.js` | `DashSession::target_latency_ms()` + `playback_rate_range()` |
 | `AbrController.setMaxAllowedBitrateFor()` | `DashSession::set_max_bitrate(media_type, bps)` / `clear_max_bitrate` / `max_bitrate` |
 | `BlacklistController.js` | `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`; blacklist logic in `src/session/blacklist.rs` |
-| `GapController.js` | `session::GapController` (`src/session/gap.rs`); owned by `DashSession`; caller drives via `DashSession::tick_gap(position_s, buffered, is_paused)`; `DashSession::seek_to` automatically resets the controller via `on_seek()`; track-switch guard fires automatically at period boundaries |
+| `GapController.js` | `session::GapController` (`src/session/gap.rs`); owned by `DashSession`; caller drives via `DashSession::tick_gap(position_s, buffered, PlaybackState)`; `DashSession::seek_to` automatically resets the controller via `on_seek()`; track-switch guard fires automatically at period boundaries |
 
 ---
 

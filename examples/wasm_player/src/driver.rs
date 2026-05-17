@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use dash_rs::{
-    session::driver::{IterationSummary, PlaybackDriver},
+    session::driver::{IterationSummary, PlaybackDriver, PlaybackState},
     GapSeekTarget,
 };
 use wasm_bindgen::JsCast;
@@ -36,8 +36,15 @@ impl PlaybackDriver for WasmPlaybackDriver {
         self.bridge.get_current_time()
     }
 
-    fn is_paused(&self) -> bool {
-        self.bridge.is_paused()
+    fn playback_state(&self) -> PlaybackState {
+        // Buffering is checked first — a stalled renderer is not user-paused.
+        if self.bridge.is_buffering() {
+            PlaybackState::Buffering
+        } else if self.bridge.is_paused() {
+            PlaybackState::Paused
+        } else {
+            PlaybackState::Playing
+        }
     }
 
     async fn on_gap_seek(&mut self, target: GapSeekTarget) {
