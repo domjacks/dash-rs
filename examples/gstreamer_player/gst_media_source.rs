@@ -294,41 +294,6 @@ impl GstMediaSource {
         self.pipeline.clone()
     }
 
-    /// Transition the pipeline to `Playing` state.
-    ///
-    /// Call this after all source buffers have been created (i.e. after
-    /// `DashSession::from_url` has returned) and before the first
-    /// `DashSession::fetch_next_segment` call.
-    pub fn set_playing(&self) -> Result<(), DashError> {
-        self.pipeline
-            .set_state(gst::State::Playing)
-            .map_err(|e| DashError::AppendFailed(format!("set_state(Playing) failed: {e}")))?;
-        tracing::info!("GstMediaSource: pipeline set to Playing");
-        Ok(())
-    }
-
-    /// Enable live-stream mode.
-    ///
-    /// When set to `true`, a buffer pad probe is installed on each converter's
-    /// sink pad by the `pad-added` callback.  The probe remaps the absolute
-    /// Unix-epoch PTS/DTS carried by CMAF live segments (e.g. BBC Two HD:
-    /// PTS ≈ 1.778 × 10¹⁸ ns) to values starting from zero, so that
-    /// `autovideosink` renders frames immediately at the correct frame rate
-    /// instead of scheduling them ~56 years in the future.
-    ///
-    /// The sink's `sync` property is left at its default (`true`), which keeps
-    /// GStreamer's frame-pacing mechanism intact and avoids the burst-then-gap
-    /// stutter that `sync=false` would cause.
-    ///
-    /// Call this **after** [`DashSession::from_url`] (which calls
-    /// `add_source_buffer`) but **before** [`Self::set_playing`].  The
-    /// `pad-added` callback reads the flag lazily when it fires during preroll,
-    /// so the ordering is correct as long as `set_live_mode` is called before
-    /// the pipeline transitions to Playing.
-    pub fn set_live_mode(&mut self, live: bool) {
-        self.live_mode.store(live, Ordering::Relaxed);
-        tracing::info!(live, "GstMediaSource: live_mode updated");
-    }
 }
 
 #[async_trait(?Send)]
@@ -344,6 +309,16 @@ impl MediaSource for GstMediaSource {
     fn set_duration(&mut self, duration: f64) -> Result<(), DashError> {
         self.duration = Some(duration);
         Ok(())
+    }
+
+    /// Called automatically by [`DashSession::run`] before the fetch loop.
+    ///
+    /// Stores the live-mode flag so that the PTS-remapping probe is installed
+    /// on the converter pads before the pipeline transitions to Playing (which
+    /// happens in `GstPlaybackDriver::on_session_started`).
+    fn set_live_mode(&mut self, live: bool) {
+        self.live_mode.store(live, Ordering::Relaxed);
+        tracing::info!(live, "GstMediaSource: live_mode set");
     }
 
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {

@@ -14,6 +14,7 @@ use dash_rs::{
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
+use wasm_bindgen_futures::JsFuture;
 
 use crate::bridge::{js_err, JsBridge};
 use crate::source_buffer::BridgeSourceBuffer;
@@ -36,6 +37,18 @@ impl BridgeMediaSource {
 
 #[async_trait(?Send)]
 impl MediaSource for BridgeMediaSource {
+    /// Attach the `MediaSource` to the `<video>` element and wait for the
+    /// `sourceopen` event.  Called automatically by
+    /// `DashSession::from_url_with_clock` before `add_source_buffer`.
+    async fn open(&mut self) -> Result<(), DashError> {
+        tracing::debug!("BridgeMediaSource: open — awaiting sourceopen");
+        JsFuture::from(self.bridge.setup_media_source())
+            .await
+            .map_err(|e| DashError::AppendFailed(js_err(e)))?;
+        tracing::info!("BridgeMediaSource: sourceopen received — MediaSource is Open");
+        Ok(())
+    }
+
     fn ready_state(&self) -> ReadyState {
         match self.bridge.get_ready_state().as_str() {
             "open" => ReadyState::Open,

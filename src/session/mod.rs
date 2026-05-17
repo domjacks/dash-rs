@@ -724,7 +724,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     pub async fn from_url_with_clock(
         url: &Url,
         fetcher: F,
-        media_source: M,
+        mut media_source: M,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
         let fetcher = Arc::new(fetcher);
@@ -739,6 +739,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         // live-edge snapping inside `from_mpd` can use the corrected time.
         let client_now_s = clock.unix_s();
         let utc_offset = utc::resolve_utc_timing(&mpd, &fetcher, client_now_s).await;
+
+        // Open the media source before adding source buffers.  For browser MSE
+        // this awaits the `sourceopen` event; for other implementations the
+        // default is a no-op.
+        media_source.open().await?;
 
         let mut session =
             Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, utc_offset, clock)?;
@@ -1537,7 +1542,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// [`IterationSummary`]: driver::IterationSummary
     /// [`PlaybackDriver`]: driver::PlaybackDriver
-    pub async fn run<D: driver::PlaybackDriver>(&mut self, drv: &mut D) -> Result<(), DashError> {
+     pub async fn run<D: driver::PlaybackDriver>(&mut self, drv: &mut D) -> Result<(), DashError> {
         use driver::IterationSummary;
 
         let gate = if self.has_video() {
@@ -1547,6 +1552,57 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         };
         let mut video_done = !self.has_video();
         let mut audio_done = !self.has_audio();
+
+        // ── Startup sequence ─────────────────────────────────────────────────
+        // 1. Notify the media source whether the stream is live so it can
+        //    apply any platform-specific live-mode behaviour (e.g. GStreamer
+        //    PTS probe) before the pipeline transitions to Playing.
+        let is_live = self.is_live();
+        self.media_source.set_live_mode(is_live);
+
+        // 2. For live streams, set the presentation duration to +∞ so that the
+        //    browser's <video> element does not believe the stream has ended.
+        if is_live {
+            // Ignore errors — not all implementations enforce duration (e.g.
+            // GStreamer just stores the value; a Closed browser source would
+            // error but that case cannot arise here because open() was already
+            // called by from_url_with_clock).
+            let _ = self.media_source.set_duration(f64::INFINITY);
+        }
+
+        // 3. Fetch init segments if the caller has not already done so.
+        //    `init_segment_sent` is set to `true` by `fetch_init_segment` and
+        //    reset to `false` at period boundaries by `apply_track_reinit`.
+        if self.has_video()
+            && self
+                .video_track
+                .as_ref()
+                .is_some_and(|t| !t.init_segment_sent)
+        {
+            self.fetch_init_segment(MediaType::Video).await?;
+        }
+        if self.has_audio()
+            && self
+                .audio_track
+                .as_ref()
+                .is_some_and(|t| !t.init_segment_sent)
+        {
+            self.fetch_init_segment(MediaType::Audio).await?;
+        }
+
+        // 4. Optionally remap epoch-scale PTS so that the first live-edge
+        //    segment lands at presentation time ≈ 0 in the browser.
+        //    GStreamer clients must NOT request this (they use probe-based
+        //    subtraction via set_live_mode(true)).
+        if is_live && drv.wants_pts_remap() {
+            self.apply_live_pts_remap();
+        }
+
+        // 5. Notify the driver that startup is complete.  Drivers use this to:
+        //    - Seek the renderer to `start_s` (WASM pattern).
+        //    - Transition the pipeline to Playing (GStreamer pattern).
+        let start_s = self.live_presentation_start_s();
+        drv.on_session_started(start_s).await;
 
         self.notify_playing();
 
@@ -1690,6 +1746,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 last_transfer_url: last_url,
                 last_transfer_ms: last_tms,
                 last_throughput_bps: last_tbps,
+                video_rep_count: self.video_representations().len() as u32,
+                audio_rep_count: self.audio_representations().len() as u32,
+                is_live,
             });
         }
 

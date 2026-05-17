@@ -15,8 +15,11 @@ use dash_rs::{
 #[test]
 fn stub_media_source_open_close() {
     let mut ms = StubMediaSource::new();
-    assert_eq!(ms.ready_state(), ReadyState::Closed);
+    // StubMediaSource starts Open — it is a test helper with no real browser
+    // lifecycle, so there is no need to enforce the Closed → Open transition.
+    assert_eq!(ms.ready_state(), ReadyState::Open);
 
+    // open() is idempotent: calling it on an already-open source is a no-op.
     ms.open();
     assert_eq!(ms.ready_state(), ReadyState::Open);
 
@@ -27,7 +30,8 @@ fn stub_media_source_open_close() {
 #[test]
 fn stub_media_source_add_source_buffer_requires_open() {
     let mut ms = StubMediaSource::new();
-    // Not open yet — should error.
+    // Force Closed state to verify the guard.
+    ms.close();
     let result = ms.add_source_buffer("video/mp4");
     assert!(matches!(result, Err(DashError::MediaSourceNotOpen { .. })));
 }

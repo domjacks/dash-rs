@@ -71,6 +71,17 @@ pub struct IterationSummary<'a> {
     /// Measured throughput of the most recently completed HTTP request (bps),
     /// or `0.0` if no request has completed yet.
     pub last_throughput_bps: f64,
+
+    /// Total number of video representations available in the current period,
+    /// or `0` if the video track is absent.
+    pub video_rep_count: u32,
+
+    /// Total number of audio representations available in the current period,
+    /// or `0` if the audio track is absent.
+    pub audio_rep_count: u32,
+
+    /// Whether the session is a live stream (`MPD@type="dynamic"`).
+    pub is_live: bool,
 }
 
 // ── PlaybackDriver ────────────────────────────────────────────────────────────
@@ -215,4 +226,41 @@ pub trait PlaybackDriver {
     ///
     /// Default: no-op.
     fn on_iteration(&mut self, _summary: &IterationSummary<'_>) {}
+
+    /// Whether `run()` should apply live-stream PTS remapping before starting
+    /// the fetch loop.
+    ///
+    /// When `true`, `run()` calls
+    /// [`DashSession::apply_live_pts_remap`][super::DashSession::apply_live_pts_remap]
+    /// on live streams so that epoch-scale fMP4 timestamps are shifted to ≈ 0.
+    /// This is the correct behaviour for browser MSE players (WASM).
+    ///
+    /// **GStreamer clients must return `false`** (the default) because GStreamer
+    /// applies its own probe-based PTS subtraction via `set_live_mode(true)`.
+    /// Double-applying would corrupt timestamps.
+    ///
+    /// Default: `false`.
+    fn wants_pts_remap(&self) -> bool {
+        false
+    }
+
+    /// Called by `run()` after the startup sequence completes and immediately
+    /// before the fetch loop begins.
+    ///
+    /// `start_s` is the presentation-timeline position at which playback will
+    /// start:
+    /// - VOD: `0.0`.
+    /// - Live with PTS remap (`wants_pts_remap() == true`): ≈ `0.0` (the
+    ///   remapped live-edge presentation time).
+    /// - Live without remap (`wants_pts_remap() == false`): the raw
+    ///   `live_presentation_start_s()` value (may be epoch-scale for CMAF
+    ///   streams).
+    ///
+    /// Use this to:
+    /// - Seek the renderer to `start_s` before playback begins (WASM pattern).
+    /// - Transition the pipeline to Playing after init segments have been
+    ///   appended (GStreamer pattern).
+    ///
+    /// Default: no-op.
+    async fn on_session_started(&mut self, _start_s: f64) {}
 }

@@ -48,119 +48,25 @@
 //!                   └─ segment fetch loop      (ABR + push bytes)
 //! ```
 
+mod driver;
+mod fetcher;
 mod gst_media_source;
 
-use std::{
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc, Arc,
-    },
-    time::Instant,
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    mpsc, Arc,
 };
 
-use async_trait::async_trait;
-use bytes::Bytes;
-use dash_rs::{
-    fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
-    session::{
-        driver::{IterationSummary, PlaybackDriver},
-        DashSession, MediaType,
-    },
-    DashError,
-};
+use dash_rs::{session::DashSession, DashError, Player};
+use driver::GstPlaybackDriver;
+use fetcher::HttpSegmentFetcher;
 use gst::prelude::*;
 use gst_media_source::GstMediaSource;
 use gstreamer as gst;
 use url::Url;
 
-// ── HttpSegmentFetcher ────────────────────────────────────────────────────────
-// (same design as examples/http_fetch.rs — duplicated here until the
-//  fetch-http feature promotes it into the library)
-
-struct HttpSegmentFetcher {
-    client: reqwest::Client,
-    last_throughput_bps: Arc<AtomicU64>,
-}
-
-impl HttpSegmentFetcher {
-    fn new(throughput_tracker: Arc<AtomicU64>) -> Self {
-        let client = reqwest::Client::builder()
-            .user_agent("dash-rs-gstreamer-example/0.1")
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("failed to build HTTP client");
-        Self {
-            client,
-            last_throughput_bps: throughput_tracker,
-        }
-    }
-}
-
-#[async_trait(?Send)]
-impl SegmentFetcher for HttpSegmentFetcher {
-    async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
-        let mut builder = self.client.get(request.url.as_str());
-        if let Some((start, end)) = request.byte_range {
-            builder = builder.header("Range", format!("bytes={}-{}", start, end));
-        }
-
-        let t0 = Instant::now();
-        let resp = builder.send().await.map_err(|e| FetchError::Network {
-            url: request.url.clone(),
-            message: e.to_string(),
-        })?;
-
-        let status = resp.status().as_u16();
-        let final_url = Url::parse(resp.url().as_str()).unwrap_or_else(|_| request.url.clone());
-
-        if !resp.status().is_success() {
-            return Err(FetchError::Http {
-                status,
-                url: request.url,
-            });
-        }
-
-        let body: Bytes = resp.bytes().await.map_err(|e| FetchError::Network {
-            url: final_url.clone(),
-            message: e.to_string(),
-        })?;
-
-        let transfer_duration_ms = t0.elapsed().as_millis() as u64;
-        let bytes_received = body.len() as u64;
-
-        if transfer_duration_ms > 0 {
-            let bps = (bytes_received as f64 * 8.0) / (transfer_duration_ms as f64 / 1_000.0);
-            self.last_throughput_bps
-                .store(bps.to_bits(), Ordering::Relaxed);
-        }
-
-        Ok(FetchResponse {
-            final_url,
-            data: body,
-            transfer_duration_ms,
-            bytes_received,
-        })
-    }
-
-    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let resp =
-            self.client
-                .head(url.as_str())
-                .send()
-                .await
-                .map_err(|e| FetchError::Network {
-                    url: url.clone(),
-                    message: e.to_string(),
-                })?;
-        Ok(resp.status().is_success())
-    }
-
-    fn abort(&self) {}
-}
-
 // ── Fetch / session task ──────────────────────────────────────────────────────
 
-/// BBC R&D Big Buck Bunny MPEG-DASH test stream (common-init variant).
 const DEFAULT_MPD_URL: &str = "https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd";
 
 /// Runs inside the tokio runtime on the background OS thread.
@@ -172,8 +78,13 @@ async fn run_session(
 ) -> Result<(), DashError> {
     let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
 
+    // Grab the pipeline handle before media_source is moved into the session.
+    let pipeline = media_source.pipeline();
+
     // Build session — fetches + parses the MPD, creates source buffers.
-    let mut session: DashSession<HttpSegmentFetcher, GstMediaSource> =
+    // `GstMediaSource::open()` default is a no-op (pipeline is already Open
+    // at construction time).
+    let session: DashSession<HttpSegmentFetcher, GstMediaSource> =
         DashSession::from_url(&manifest_url, fetcher, media_source).await?;
 
     // Print available representations.
@@ -205,136 +116,6 @@ async fn run_session(
     }
     println!();
 
-    // Fetch init segments (codec parameters for the decoder).
-    println!("=== Init segments ===");
-    if session.has_video() {
-        match session.fetch_init_segment(MediaType::Video).await {
-            Ok(n) => println!("  video  init: {n} bytes"),
-            Err(e) => println!("  video  init skipped: {e}"),
-        }
-    }
-    if session.has_audio() {
-        match session.fetch_init_segment(MediaType::Audio).await {
-            Ok(n) => println!("  audio  init: {n} bytes"),
-            Err(e) => println!("  audio  init skipped: {e}"),
-        }
-    }
-
-    // For live CMAF streams (e.g. BBC Two HD), the fMP4 `tfdt` box carries
-    // absolute Unix-epoch timestamps.  GStreamer's monotonic pipeline clock
-    // starts from zero (boot time), so with `sync=true` the sinks would
-    // schedule frames ~56 years in the future and the pipeline would stall.
-    // Setting live_mode=true disables sink sync so frames render immediately.
-    if session.is_live() {
-        tracing::info!("live stream — enabling live_mode (sink sync disabled)");
-        session.media_source_mut().set_live_mode(true);
-    }
-
-    // Now that source buffers have received the init segments, transition the
-    // pipeline to Playing so decoding and rendering begin.
-    session.media_source_mut().set_playing()?;
-
-    // ── GstPlaybackDriver ────────────────────────────────────────────────────
-
-    /// [`PlaybackDriver`] for the GStreamer player.
-    ///
-    /// - Uses the session's own estimated position (no external renderer query).
-    /// - Slaves the audio gate to the video buffer level + 1 s so that audio
-    ///   and video stay in lock-step (mirrors dash.js ScheduleController).
-    /// - Enables buffer pruning so old data is evicted from GStreamer's appsrc.
-    /// - Pushes a console progress row after every segment pair.
-    struct GstPlaybackDriver {
-        is_paused: Arc<AtomicBool>,
-        throughput_tracker: Arc<AtomicU64>,
-        /// Session's estimated playback position — updated at iteration start.
-        cached_pos_s: f64,
-        seg: u32,
-    }
-
-    impl GstPlaybackDriver {
-        fn new(is_paused: Arc<AtomicBool>, throughput_tracker: Arc<AtomicU64>) -> Self {
-            Self {
-                is_paused,
-                throughput_tracker,
-                cached_pos_s: 0.0,
-                seg: 0,
-            }
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl PlaybackDriver for GstPlaybackDriver {
-        fn position_s(&self) -> f64 {
-            self.cached_pos_s
-        }
-
-        fn is_paused(&self) -> bool {
-            self.is_paused.load(Ordering::Relaxed)
-        }
-
-        fn throughput_override_bps(&self) -> Option<f64> {
-            Some(f64::from_bits(
-                self.throughput_tracker.load(Ordering::Relaxed),
-            ))
-        }
-
-        fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {
-            // Slave audio target to video level so audio never races ahead.
-            // For audio-only streams video_buffer_ms is 0, so we fall back
-            // to the session default.
-            if video_buffer_ms > 0.0 {
-                video_buffer_ms.min(default_ms) + 1_000.0
-            } else {
-                default_ms
-            }
-        }
-
-        fn enable_pruning(&self) -> bool {
-            true
-        }
-
-        fn on_iteration_start(&mut self, session_position_s: f64) {
-            self.cached_pos_s = session_position_s;
-            self.seg += 1;
-        }
-
-        fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-            let measured_bps = f64::from_bits(self.throughput_tracker.load(Ordering::Relaxed));
-            let buf_ms = if s.video_buffer_ms > 0.0 {
-                s.video_buffer_ms
-            } else {
-                s.audio_buffer_ms
-            };
-
-            let (vid_idx, vid_reason, video_ms) = s
-                .video_decision
-                .map(|d| {
-                    (
-                        d.index.to_string(),
-                        format!("{:?}", d.reason),
-                        s.last_transfer_ms as u128,
-                    )
-                })
-                .unwrap_or_else(|| ("done".into(), "-".into(), 0));
-            let (aud_idx, aud_reason) = s
-                .audio_decision
-                .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
-                .unwrap_or_else(|| ("done".into(), "-".into()));
-
-            println!(
-                "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
-                self.seg,
-                vid_idx,
-                vid_reason,
-                aud_idx,
-                aud_reason,
-                buf_ms / 1_000.0,
-                video_ms,
-                measured_bps / 1_000.0,
-            );
-        }
-    }
-
     println!(
         "\n=== Fetching all segments (buffer target: {:.0} s) ===",
         session.buffer_target_ms() / 1_000.0
@@ -344,8 +125,8 @@ async fn run_session(
         "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
     );
 
-    let mut driver = GstPlaybackDriver::new(is_paused, throughput_tracker);
-    session.run(&mut driver).await?;
+    let driver = GstPlaybackDriver::new(is_paused, throughput_tracker, pipeline.clone());
+    Player::new(session, driver).run().await?;
 
     println!("\nAll segments fetched — waiting for pipeline EOS…");
 

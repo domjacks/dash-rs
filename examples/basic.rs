@@ -14,11 +14,8 @@ use dash_rs::{
     fetch::stub::StubSegmentFetcher,
     manifest::MPD,
     media_source::stub::StubMediaSource,
-    session::{
-        driver::{IterationSummary, PlaybackDriver},
-        DashSession,
-    },
-    DashError,
+    session::{driver::{IterationSummary, PlaybackDriver}, DashSession},
+    DashError, Player,
 };
 use url::Url;
 
@@ -57,9 +54,10 @@ async fn main() -> Result<(), DashError> {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    // 1. Open a stub media source (replaces the browser's MediaSource API).
-    let mut media_source = StubMediaSource::new();
-    media_source.open();
+    // 1. Create a stub media source (replaces the browser's MediaSource API).
+    //    `StubMediaSource` starts as Open by default — no explicit `open()`
+    //    call is needed.
+    let media_source = StubMediaSource::new();
 
     // 2. Parse the MPD and construct a session directly from the parsed MPD.
     //    In a real application you would call `DashSession::from_url` instead.
@@ -67,7 +65,7 @@ async fn main() -> Result<(), DashError> {
     let mpd: MPD = dash_rs::manifest::parse(EXAMPLE_MPD).map_err(DashError::ManifestParse)?;
 
     let fetcher = Arc::new(StubSegmentFetcher);
-    let mut session = DashSession::from_mpd(mpd, base_url, fetcher, media_source)?;
+    let session = DashSession::from_mpd(mpd, base_url, fetcher, media_source)?;
 
     // 3. Inspect available representations.
     println!("=== Video representations ===");
@@ -143,8 +141,8 @@ async fn main() -> Result<(), DashError> {
         }
     }
 
-    let mut driver = BasicPlaybackDriver { seg: 0 };
-    session.run(&mut driver).await?;
+    let mut player = Player::new(session, BasicPlaybackDriver { seg: 0 });
+    player.run().await?;
 
     println!("\nEnd of stream signalled. Done.");
 

@@ -20,26 +20,12 @@ use crate::bridge::JsBridge;
 
 pub(crate) struct WasmPlaybackDriver {
     bridge: JsBridge,
-    /// Cached video representation count (for the status JSON).
-    video_rep_count: u32,
-    /// Cached audio representation count (for the status JSON).
-    audio_rep_count: u32,
-    /// Whether the session is a live stream (for the status JSON).
-    is_live: bool,
 }
 
 impl WasmPlaybackDriver {
-    pub(crate) fn new(
-        bridge: &JsBridge,
-        video_rep_count: u32,
-        audio_rep_count: u32,
-        is_live: bool,
-    ) -> Self {
+    pub(crate) fn new(bridge: &JsBridge) -> Self {
         Self {
             bridge: JsValue::clone(bridge.as_ref()).unchecked_into(),
-            video_rep_count,
-            audio_rep_count,
-            is_live,
         }
     }
 }
@@ -58,6 +44,19 @@ impl PlaybackDriver for WasmPlaybackDriver {
         self.bridge.seek_to(target.position_s);
     }
 
+    /// Request PTS remapping so that epoch-scale live timestamps (e.g. BBC
+    /// IPTV: ~1.778 × 10⁹ s) are shifted to ≈ 0 for browser MSE.
+    fn wants_pts_remap(&self) -> bool {
+        true
+    }
+
+    /// Seek the `<video>` element to `start_s` (the remapped live-edge
+    /// presentation time, ≈ 0 after PTS remap) before the fetch loop starts.
+    async fn on_session_started(&mut self, start_s: f64) {
+        tracing::info!(start_s, "WasmPlaybackDriver: seeking to session start");
+        self.bridge.seek_to(start_s);
+    }
+
     fn on_iteration(&mut self, s: &IterationSummary<'_>) {
         // Build a compact JSON status string and push it to the JS debug panel.
         // All values are primitive scalars — no serde dependency needed.
@@ -71,15 +70,15 @@ impl PlaybackDriver for WasmPlaybackDriver {
 
         let json = format!(
             r#"{{"vi":{vi},"vc":{vc},"vbps":{vbps},"vbuf":{vbuf:.1},"ai":{ai},"ac":{ac},"abps":{abps},"abuf":{abuf:.1},"hc":{hc},"sc":{sc},"url":"{url_safe}","tms":{tms:.1},"tbps":{tbps:.0},"live":{live}}}"#,
-            vc = self.video_rep_count,
+            vc = s.video_rep_count,
             vbuf = s.video_buffer_ms,
-            ac = self.audio_rep_count,
+            ac = s.audio_rep_count,
             abuf = s.audio_buffer_ms,
             hc = s.http_request_count,
             sc = s.switch_count,
             tms = s.last_transfer_ms,
             tbps = s.last_throughput_bps,
-            live = self.is_live,
+            live = s.is_live,
         );
         self.bridge.report_status(&json);
     }

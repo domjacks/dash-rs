@@ -211,7 +211,7 @@ impl Default for StubMediaSource {
 impl StubMediaSource {
     pub fn new() -> Self {
         Self {
-            ready_state: ReadyState::Closed,
+            ready_state: ReadyState::Open,
             duration: None,
             source_buffers: HashMap::new(),
         }
@@ -219,6 +219,9 @@ impl StubMediaSource {
 
     /// Open the media source (equivalent to attaching to a `<video>` element
     /// and receiving the `sourceopen` event).
+    ///
+    /// `StubMediaSource` starts as `Open` by default, so this is a no-op in
+    /// most cases.  Call it after [`Self::close`] to reopen the source.
     pub fn open(&mut self) {
         self.ready_state = ReadyState::Open;
         tracing::debug!("StubMediaSource: open");

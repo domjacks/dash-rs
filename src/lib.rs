@@ -55,6 +55,7 @@ pub mod manifest;
 pub(crate) mod math;
 pub mod media_source;
 pub mod mp4;
+pub mod player;
 pub mod session;
 mod time;
 pub mod util;
@@ -78,6 +79,7 @@ pub use manifest::MPD;
 #[cfg(feature = "events")]
 pub use mp4::parse_all_emsg;
 pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
+pub use player::Player;
 pub use session::driver::{IterationSummary, PlaybackDriver};
 #[cfg(feature = "events")]
 pub use session::DashEvent;

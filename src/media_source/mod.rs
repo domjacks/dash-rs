@@ -107,16 +107,6 @@ pub trait SourceBuffer {
     fn timestamp_offset(&self) -> f64;
     fn set_timestamp_offset(&mut self, offset: f64);
 
-    /// The lower bound of the append window (seconds).
-    /// Mirrors `SourceBuffer.appendWindowStart`.
-    fn append_window_start(&self) -> f64;
-    fn set_append_window_start(&mut self, start: f64);
-
-    /// The upper bound of the append window (seconds).
-    /// Mirrors `SourceBuffer.appendWindowEnd`.
-    fn append_window_end(&self) -> f64;
-    fn set_append_window_end(&mut self, end: f64);
-
     /// Append a chunk of media data to the buffer.
     ///
     /// Resolves once the append is complete (equivalent to waiting for the
@@ -129,13 +119,51 @@ pub trait SourceBuffer {
     /// Resolves once the removal is complete.
     async fn remove(&mut self, start: f64, end: f64) -> Result<(), DashError>;
 
+    /// The lower bound of the append window (seconds).
+    /// Mirrors `SourceBuffer.appendWindowStart`.
+    ///
+    /// Default: `0.0`.  Override only when your implementation actually tracks
+    /// the window (e.g. browser `SourceBuffer`).
+    fn append_window_start(&self) -> f64 {
+        0.0
+    }
+
+    /// Set the lower bound of the append window (seconds).
+    ///
+    /// Default: no-op.  Override when your implementation needs to store the
+    /// value (e.g. browser `SourceBuffer` or a buffered-range tracker).
+    fn set_append_window_start(&mut self, _start: f64) {}
+
+    /// The upper bound of the append window (seconds).
+    /// Mirrors `SourceBuffer.appendWindowEnd`.
+    ///
+    /// Default: `f64::INFINITY`.
+    fn append_window_end(&self) -> f64 {
+        f64::INFINITY
+    }
+
+    /// Set the upper bound of the append window (seconds).
+    ///
+    /// Default: no-op.
+    fn set_append_window_end(&mut self, _end: f64) {}
+
     /// Abort any in-progress append. Resets the parser state.
     /// Mirrors `SourceBuffer.abort()`.
-    async fn abort(&mut self) -> Result<(), DashError>;
+    ///
+    /// Default: no-op `Ok(())`.  Override when your implementation has parser
+    /// state to reset or an in-flight write to cancel.
+    async fn abort(&mut self) -> Result<(), DashError> {
+        Ok(())
+    }
 
     /// Switch the MIME type of this source buffer without removing buffered
     /// data. Mirrors the `SourceBuffer.changeType()` extension.
-    async fn change_type(&mut self, mime_type: &str) -> Result<(), DashError>;
+    ///
+    /// Default: no-op `Ok(())`.  Override when your implementation supports
+    /// mid-stream codec changes.
+    async fn change_type(&mut self, _mime_type: &str) -> Result<(), DashError> {
+        Ok(())
+    }
 }
 
 // ── MediaSource trait ─────────────────────────────────────────────────────────
@@ -158,6 +186,33 @@ pub trait MediaSource {
     /// Set the total presentation duration. Only valid while `Open`.
     fn set_duration(&mut self, duration: f64) -> Result<(), DashError>;
 
+    /// Open the media source and prepare it to accept source buffers.
+    ///
+    /// For browser MSE this means creating the `MediaSource` object, creating
+    /// an object URL, assigning it to the `<video>` element, and awaiting the
+    /// `sourceopen` event — as implemented by `BridgeMediaSource`.
+    ///
+    /// Default: no-op `Ok(())`.  Implementations that are opened synchronously
+    /// at construction time (GStreamer, stub) do not need to override this.
+    ///
+    /// Called automatically by [`DashSession::from_url_with_clock`] before
+    /// adding source buffers.  Callers of [`DashSession::from_mpd`] that use
+    /// a synchronous media source (e.g. `StubMediaSource`) do not need to call
+    /// this explicitly.
+    async fn open(&mut self) -> Result<(), DashError> {
+        Ok(())
+    }
+
+    /// Notify the media source whether the current stream is live.
+    ///
+    /// Called automatically by [`DashSession::run`] before the fetch loop
+    /// starts, passing `true` for dynamic (`type="dynamic"`) manifests.
+    ///
+    /// Default: no-op.  Override for implementations that need to adjust their
+    /// behaviour for live streams (e.g. GStreamer PTS remapping via
+    /// `GstMediaSource::set_live_mode`).
+    fn set_live_mode(&mut self, _live: bool) {}
+
     /// Return whether this `MediaSource` can decode the given MIME type.
     ///
     /// Mirrors `MediaSource.isTypeSupported(mimeType)`.  The default
@@ -175,12 +230,20 @@ pub trait MediaSource {
     fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError>;
 
     /// Detach and discard the source buffer for the given MIME type.
-    fn remove_source_buffer(&mut self, mime_type: &str) -> Result<(), DashError>;
+    ///
+    /// Default: no-op `Ok(())`.  Override when the implementation tracks
+    /// source buffers and needs to clean up resources on removal.
+    fn remove_source_buffer(&mut self, _mime_type: &str) -> Result<(), DashError> {
+        Ok(())
+    }
 
     /// Signal that no more data will be appended.
     /// Transitions the ready state to `Ended`.
     async fn end_of_stream(&mut self) -> Result<(), DashError>;
 
     /// Close the media source, releasing all resources.
-    fn close(&mut self);
+    ///
+    /// Default: no-op.  Override when the implementation holds resources that
+    /// need explicit teardown (e.g. browser object URLs).
+    fn close(&mut self) {}
 }

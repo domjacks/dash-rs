@@ -27,9 +27,9 @@ use dash_rs::{
     media_source::stub::StubMediaSource,
     session::{
         driver::{IterationSummary, PlaybackDriver},
-        DashSession, MediaType,
+        DashSession,
     },
-    DashError,
+    DashError, Player,
 };
 use url::Url;
 
@@ -161,12 +161,13 @@ async fn main() -> Result<(), DashError> {
 
     // 2. Open a stub media source.  No real decoder is attached; bytes are
     //    appended through the full MSE abstraction and then discarded.
-    let mut media_source = StubMediaSource::new();
-    media_source.open();
+    //    `StubMediaSource` starts as Open by default — no explicit `open()`
+    //    call is needed.
+    let media_source = StubMediaSource::new();
 
     // 3. Build the session.  This issues a real HTTP GET for the MPD.
     let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
-    let mut session = DashSession::from_url(&manifest_url, fetcher, media_source).await?;
+    let session = DashSession::from_url(&manifest_url, fetcher, media_source).await?;
 
     // 4. Print available representations.
     if session.has_video() {
@@ -197,24 +198,9 @@ async fn main() -> Result<(), DashError> {
     }
     println!();
 
-    // 5. Fetch initialisation segments — required before media segments so
-    //    that a real decoder can read codec parameters from the moov box.
-    println!("=== Init segments ===");
-    if session.has_video() {
-        match session.fetch_init_segment(MediaType::Video).await {
-            Ok(n) => println!("  video  init: {n} bytes"),
-            Err(e) => println!("  video  init skipped: {e}"),
-        }
-    }
-    if session.has_audio() {
-        match session.fetch_init_segment(MediaType::Audio).await {
-            Ok(n) => println!("  audio  init: {n} bytes"),
-            Err(e) => println!("  audio  init skipped: {e}"),
-        }
-    }
-    println!();
-
-    // 6. Segment fetch loop via PlaybackDriver.
+    // 5. Segment fetch loop via PlaybackDriver.
+    //    `run()` automatically fetches init segments before starting the loop,
+    //    so no explicit `fetch_init_segment` call is needed here.
     //    Real throughput from the fetcher feeds the ABR controller each
     //    iteration; `should_continue` exits after SEGMENTS_TO_FETCH pairs.
     println!("=== Fetching {SEGMENTS_TO_FETCH} segments ===");
@@ -281,14 +267,14 @@ async fn main() -> Result<(), DashError> {
         }
     }
 
-    // 7. run() fetches until should_continue() returns false, then calls
+    // 6. run() fetches until should_continue() returns false, then calls
     //    end_of_stream() and returns.
-    let mut driver = HttpPlaybackDriver {
+    let driver = HttpPlaybackDriver {
         throughput_tracker: Arc::clone(&throughput_tracker),
         segments_fetched: 0,
         last_transfer_ms: 0.0,
     };
-    session.run(&mut driver).await?;
+    Player::new(session, driver).run().await?;
 
     println!("\nEnd of stream. Done.");
 
