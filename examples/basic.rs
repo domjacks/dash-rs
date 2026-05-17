@@ -14,7 +14,7 @@ use dash_rs::{
     fetch::stub::StubSegmentFetcher,
     manifest::MPD,
     media_source::stub::StubMediaSource,
-    session::{driver::{IterationSummary, PlaybackDriver}, DashSession},
+    session::driver::{IterationSummary, PlaybackDriver},
     DashError, Player,
 };
 use url::Url;
@@ -59,38 +59,14 @@ async fn main() -> Result<(), DashError> {
     //    call is needed.
     let media_source = StubMediaSource::new();
 
-    // 2. Parse the MPD and construct a session directly from the parsed MPD.
-    //    In a real application you would call `DashSession::from_url` instead.
+    // 2. Parse the MPD.  In a real application you would call
+    //    `Player::from_url` instead.
     let base_url = Url::parse("https://example.com/").unwrap();
     let mpd: MPD = dash_rs::manifest::parse(EXAMPLE_MPD).map_err(DashError::ManifestParse)?;
 
-    let fetcher = Arc::new(StubSegmentFetcher);
-    let session = DashSession::from_mpd(mpd, base_url, fetcher, media_source)?;
-
-    // 3. Inspect available representations.
-    println!("=== Video representations ===");
-    for (i, rep) in session.video_representations().iter().enumerate() {
-        println!(
-            "  [{i}] id={} bandwidth={}kbps {}x{}",
-            rep.id,
-            rep.bandwidth / 1000,
-            rep.width.unwrap_or(0),
-            rep.height.unwrap_or(0),
-        );
-    }
-    println!("=== Audio representations ===");
-    for (i, rep) in session.audio_representations().iter().enumerate() {
-        println!(
-            "  [{i}] id={} bandwidth={}kbps",
-            rep.id,
-            rep.bandwidth / 1000
-        );
-    }
-
-    // 4. Simulate a short fetch loop — 5 segments per track — via PlaybackDriver.
+    // 3. Simulate a short fetch loop — 5 segments per track — via PlaybackDriver.
     //    Throughput escalates each iteration so the ABR controller should step
     //    up quality over time.
-    println!("\n=== Fetching segments ===");
 
     /// [`PlaybackDriver`] for the basic stub example.
     ///
@@ -141,7 +117,30 @@ async fn main() -> Result<(), DashError> {
         }
     }
 
-    let mut player = Player::new(session, BasicPlaybackDriver { seg: 0 });
+    let fetcher = Arc::new(StubSegmentFetcher);
+    let mut player = Player::from_mpd(mpd, base_url, fetcher, media_source, BasicPlaybackDriver { seg: 0 })?;
+
+    // 4. Inspect available representations before starting the loop.
+    println!("=== Video representations ===");
+    for (i, rep) in player.session().video_representations().iter().enumerate() {
+        println!(
+            "  [{i}] id={} bandwidth={}kbps {}x{}",
+            rep.id,
+            rep.bandwidth / 1000,
+            rep.width.unwrap_or(0),
+            rep.height.unwrap_or(0),
+        );
+    }
+    println!("=== Audio representations ===");
+    for (i, rep) in player.session().audio_representations().iter().enumerate() {
+        println!(
+            "  [{i}] id={} bandwidth={}kbps",
+            rep.id,
+            rep.bandwidth / 1000
+        );
+    }
+
+    println!("\n=== Fetching segments ===");
     player.run().await?;
 
     println!("\nEnd of stream signalled. Done.");

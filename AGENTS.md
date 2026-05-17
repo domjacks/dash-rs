@@ -273,20 +273,28 @@ fn position_s(&self) -> f64 { 0.0 }
 ### `Player` — single-type convenience wrapper
 
 `Player<F, M, D>` in `src/player.rs` owns both a `DashSession<F, M>` and a
-`D: PlaybackDriver`, providing a simpler call site for the common case where
-the driver can be constructed without session state:
+`D: PlaybackDriver`, providing a simpler call site for every construction path:
 
 ```rust
 // From a URL (most common path):
 Player::from_url(&url, fetcher, media_source, MyDriver::new()).await?.run().await?;
 
-// Or with a custom clock (WASM):
+// With a custom clock (WASM / no-std):
 Player::from_url_with_clock(&url, fetcher, ms, driver, clock).await?.run().await?;
 
-// When the session must exist first (rare):
-let session = DashSession::from_mpd(mpd, base_url, fetcher, ms)?;
-let driver  = MyDriver::new_from_session(&session);
-Player::new(session, driver).run().await?;
+// From an already-parsed MPD (tests / offline scenarios):
+Player::from_mpd(mpd, base_url, Arc::new(fetcher), ms, MyDriver::new())?.run().await?;
+
+// From an already-parsed MPD with a custom clock:
+Player::from_mpd_with_clock(mpd, base_url, Arc::new(fetcher), ms, driver, clock)?.run().await?;
+```
+
+To inspect representations before starting the loop, use `player.session()`:
+
+```rust
+let mut player = Player::from_url(&url, fetcher, ms, driver).await?;
+for rep in player.session().video_representations() { … }
+player.run().await?;
 ```
 
 After `run()` returns, both halves remain accessible:

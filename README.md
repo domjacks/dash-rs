@@ -67,7 +67,7 @@ end-of-stream signalling.
 | Segment fetcher | `SegmentFetcher` | Downloads manifests and media segments |
 | Media buffer | `SourceBuffer` | Receives raw fMP4/WebM bytes; `append_buffer` feeds them to your decoder |
 | Media container | `MediaSource` | Creates `SourceBuffer` instances and signals end-of-stream |
-| Playback driver | `PlaybackDriver` | Supplies the renderer's position and pause state to the fetch loop |
+| Playback driver | `PlaybackDriver` | Supplies the renderer's position and `PlaybackState` (`Playing` / `Paused` / `Buffering`) to the fetch loop |
 
 ### 1. Add the dependency
 
@@ -252,7 +252,7 @@ the only required method — every other method has a sensible default.
 
 ```rust
 use async_trait::async_trait;
-use dash_rs::session::driver::PlaybackDriver;
+use dash_rs::session::driver::{PlaybackDriver, PlaybackState};
 
 struct MyDriver {
     // Your renderer handle, or nothing for a headless setup.
@@ -266,10 +266,15 @@ impl PlaybackDriver for MyDriver {
         0.0 // replace with: self.renderer.current_position_s()
     }
 
-    /// Whether the renderer is currently paused.
-    /// Keeps the buffer-level estimate accurate while paused.
-    fn is_paused(&self) -> bool {
-        false // replace with: self.renderer.is_paused()
+    /// Current renderer state.
+    ///
+    /// - `Paused`    — user-paused; freezes the buffer-level wall-clock and
+    ///                 suppresses gap-jump seeks.
+    /// - `Buffering` — renderer stalled waiting for data (not a user action);
+    ///                 same effect as `Paused` for clock and gap purposes.
+    /// - `Playing`   — default; clock runs freely.
+    fn playback_state(&self) -> PlaybackState {
+        PlaybackState::Playing // replace with your renderer's actual state
     }
 }
 ```
@@ -278,6 +283,7 @@ Override additional methods as needed:
 
 | Method | Default | When to override |
 |---|---|---|
+| `playback_state()` | `Playing` | Report `Paused` or `Buffering` to freeze the clock and suppress gap jumps |
 | `on_gap_seek(target)` | no-op | Seek the renderer when the gap controller fills a stall |
 | `throughput_override_bps()` | `None` (internal tracker) | Feed externally measured bandwidth to the ABR controller |
 | `audio_gate_target_ms(vbuf, default)` | `default` | Slave audio buffering to video level (e.g. GStreamer) |
@@ -288,34 +294,63 @@ Override additional methods as needed:
 
 ### 5. Start playback
 
+The simplest path uses the `Player` convenience wrapper, which owns both the
+session and the driver:
+
 ```rust
 use url::Url;
-use dash_rs::session::DashSession;
+use dash_rs::Player;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = Url::parse("https://example.com/stream.mpd")?;
-    let mut session = DashSession::from_url(
+
+    // from_url fetches + parses the MPD, opens the media source, and returns
+    // a Player ready to run.
+    let mut player = Player::from_url(
         &url,
         HttpFetcher::new(),
         MyMediaSource::new(),
+        MyDriver::new(),
     ).await?;
 
-    // Live streams only: shift large epoch-scale decode timestamps to ≈ 0
-    // so the first segment lands at a predictable position in the renderer.
-    // Do NOT call this for GStreamer — use GstMediaSource::set_live_mode(true) instead.
-    if session.is_live() {
-        session.apply_live_pts_remap().await?;
+    // Inspect representations before starting the loop if needed.
+    for rep in player.session().video_representations() {
+        println!("{} kbps", rep.bandwidth / 1_000);
     }
 
     // run() handles ABR, buffer gating, gap detection, live manifest refresh,
-    // multi-period transitions, and end-of-stream. It calls notify_playing()
-    // internally — do not call it before run().
-    session.run(&mut MyDriver {}).await?;
+    // multi-period transitions, and end-of-stream.
+    player.run().await?;
 
     Ok(())
 }
 ```
+
+When the manifest is already in memory (e.g. in tests or offline scenarios),
+use `Player::from_mpd` instead:
+
+```rust
+use std::sync::Arc;
+use dash_rs::{manifest, Player};
+
+let mpd = manifest::parse(mpd_xml)?;
+let mut player = Player::from_mpd(
+    mpd,
+    base_url,
+    Arc::new(MyFetcher::new()),
+    MyMediaSource::new(),
+    MyDriver::new(),
+)?;
+player.run().await?;
+```
+
+| Constructor | When to use |
+|---|---|
+| `Player::from_url` | URL known at startup; uses `SystemClock` (requires `std`) |
+| `Player::from_url_with_clock` | URL known at startup; custom clock (WASM / no `std`) |
+| `Player::from_mpd` | Manifest already parsed; uses `SystemClock` (requires `std`) |
+| `Player::from_mpd_with_clock` | Manifest already parsed; custom clock (WASM / no `std`) |
 
 `from_url` fetches and parses the MPD, resolves XLink references, syncs the UTC
 clock for live streams, and snaps to the live edge.  `run()` returns `Ok(())`
@@ -679,7 +714,7 @@ DashSession
                                  └── (your implementation)
 
 GapController  (owned by DashSession; caller drives via session.tick_gap())
-└── tick_gap(position_s, buffered, is_paused) → Option<GapSeekTarget>
+└── tick_gap(position_s, buffered, PlaybackState) → Option<GapSeekTarget>
     └── on gap/stall: caller seeks renderer, then calls session.seek_to()
         └── seek_to() automatically resets the gap controller (on_seek())
 ```

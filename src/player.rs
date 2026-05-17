@@ -24,18 +24,16 @@
 //! Player::from_url(&url, fetcher, media_source, MyDriver::new()).await?.run().await?;
 //! ```
 //!
-//! # When to use `Player::new` vs `Player::from_url`
+//! # Choosing a constructor
 //!
-//! Use [`Player::from_url`] when the driver can be constructed independently
-//! of the session (the common case — most drivers depend only on the renderer,
-//! not on session internals like representation counts).
+//! | Situation | Constructor |
+//! |---|---|
+//! | URL is known at construction time | [`Self::from_url`] (or `from_url_with_clock` on WASM) |
+//! | Manifest already parsed (e.g. stub / unit test) | [`Self::from_mpd`] (or `from_mpd_with_clock` without `std`) |
 //!
-//! Use [`Player::new`] when the session must exist first.  This is only
-//! necessary if the driver constructor needs live session state (e.g. the
-//! number of available representations).  After migrating to reading those
-//! values from [`crate::session::driver::IterationSummary`] (where they are
-//! now provided as `video_rep_count`, `audio_rep_count`, `is_live`), most
-//! drivers can use [`Player::from_url`] directly.
+//! All constructors accept the driver as the final argument.  If you need to
+//! inspect session state (e.g. available representations) before starting the
+//! loop, use the [`session`][Self::session] accessor after construction.
 //!
 //! # Accessing session or driver state after `run()`
 //!
@@ -52,6 +50,7 @@ use crate::{
     clock::Clock,
     error::DashError,
     fetch::SegmentFetcher,
+    manifest::MPD,
     media_source::MediaSource,
     session::{driver::PlaybackDriver, DashSession},
     Url,
@@ -71,20 +70,8 @@ pub struct Player<F: SegmentFetcher, M: MediaSource, D> {
 impl<F: SegmentFetcher, M: MediaSource, D: PlaybackDriver> Player<F, M, D> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    /// Wrap an already-constructed session and driver into a `Player`.
-    ///
-    /// Use this when the driver must be built from session state (e.g. when it
-    /// needs to inspect `session.video_representations()` at construction
-    /// time).  In most cases [`Self::from_url`] is more convenient.
-    pub fn new(session: DashSession<F, M>, driver: D) -> Self {
-        Self { session, driver }
-    }
-
     /// Fetch and parse the manifest at `url`, open the media source, and return
     /// a `Player` ready to [`run`][Self::run].
-    ///
-    /// This is a thin convenience wrapper around
-    /// [`DashSession::from_url`] + [`Player::new`].
     ///
     /// Uses a [`SystemClock`][crate::clock::SystemClock] for time measurements.
     /// Call [`Self::from_url_with_clock`] to inject a custom clock (e.g. on
@@ -97,7 +84,7 @@ impl<F: SegmentFetcher, M: MediaSource, D: PlaybackDriver> Player<F, M, D> {
         driver: D,
     ) -> Result<Self, DashError> {
         let session = DashSession::from_url(url, fetcher, media_source).await?;
-        Ok(Self::new(session, driver))
+        Ok(Self { session, driver })
     }
 
     /// Like [`Self::from_url`] but accepts a custom [`Clock`] implementation.
@@ -113,7 +100,46 @@ impl<F: SegmentFetcher, M: MediaSource, D: PlaybackDriver> Player<F, M, D> {
     ) -> Result<Self, DashError> {
         let session =
             DashSession::from_url_with_clock(url, fetcher, media_source, clock).await?;
-        Ok(Self::new(session, driver))
+        Ok(Self { session, driver })
+    }
+
+    /// Wrap an already-parsed `mpd` into a `Player` ready to
+    /// [`run`][Self::run].
+    ///
+    /// This is the preferred entry point when the manifest is already in
+    /// memory (e.g. stub / unit-test scenarios where no network fetch is
+    /// needed).  For URL-based construction use [`Self::from_url`].
+    ///
+    /// Uses a [`SystemClock`][crate::clock::SystemClock] for time measurements.
+    /// Call [`Self::from_mpd_with_clock`] to inject a custom clock.
+    #[cfg(feature = "std")]
+    pub fn from_mpd(
+        mpd: MPD,
+        base_url: Url,
+        fetcher: Arc<F>,
+        media_source: M,
+        driver: D,
+    ) -> Result<Self, DashError> {
+        let session = DashSession::from_mpd(mpd, base_url, fetcher, media_source)?;
+        Ok(Self { session, driver })
+    }
+
+    /// Like [`Self::from_mpd`] but accepts a custom [`Clock`] implementation.
+    ///
+    /// Use this on platforms where `std::time::Instant` / `SystemTime::now()`
+    /// are unavailable (e.g. `wasm32-unknown-unknown` without the `std`
+    /// feature).
+    pub fn from_mpd_with_clock(
+        mpd: MPD,
+        base_url: Url,
+        fetcher: Arc<F>,
+        media_source: M,
+        driver: D,
+        clock: Arc<dyn Clock>,
+    ) -> Result<Self, DashError> {
+        let session =
+            DashSession::from_mpd_with_clock(mpd, base_url, fetcher, media_source, clock)?;
+        Ok(Self { session, driver })
     }
 
     // ── Playback ──────────────────────────────────────────────────────────────
@@ -133,8 +159,8 @@ impl<F: SegmentFetcher, M: MediaSource, D: PlaybackDriver> Player<F, M, D> {
 
     /// Immutable reference to the inner [`DashSession`].
     ///
-    /// Use this after [`run()`][Self::run] to inspect metrics, representation
-    /// lists, and other session state.
+    /// Use this after construction to inspect available representations before
+    /// calling [`run()`][Self::run], or after `run()` to read metrics.
     pub fn session(&self) -> &DashSession<F, M> {
         &self.session
     }
