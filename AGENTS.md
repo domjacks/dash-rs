@@ -158,7 +158,16 @@ Init segments (`Chunk { start: None, end: None }`) are accepted without error
 but are not reflected in `buffered()`.  This matches the MSE spec — init
 segments do not advance the buffered range.
 
-### `SourceBufferSink::append` serialises by `await`
+### `StubMediaSource` starts as `ReadyState::Open`
+
+`StubMediaSource::new()` initialises the ready state to `Open` so that tests
+and stub-based examples do not require an explicit `media_source.open()` call.
+`open()` is still available — calling it on an already-open stub is a no-op.
+`DashSession::from_url` / `from_url_with_clock` call `media_source.open()`
+themselves, so production callers using `BridgeMediaSource` or
+`GstMediaSource` also require no manual `open()` call.
+
+### `MediaSource` trait — default method behaviour
 
 There is no explicit queue struct.  Concurrent callers must not interleave
 `await` points across two `append` calls on the same sink.  Use a single
@@ -212,6 +221,19 @@ impl PlaybackDriver for MyDriver {
         self.segments_fetched < MAX_SEGMENTS
     }
 
+    // Optional: opt-in to epoch-scale PTS remapping (WASM / MSE only).
+    // Default false — GStreamer must NOT set this (it uses probe-based
+    // subtraction via set_live_mode instead).
+    fn wants_pts_remap(&self) -> bool { true }
+
+    // Optional: called once after session startup (open, init segments, live
+    // PTS remap) and before the first fetch iteration.  For live streams,
+    // `start_s` is the live-edge presentation time after remapping (≈ 0 when
+    // wants_pts_remap returns true).  Seek the renderer here if needed.
+    async fn on_session_started(&mut self, start_s: f64) {
+        self.renderer.seek(start_s);
+    }
+
     // Optional: progress reporting after every fetch pair.
     fn on_iteration(&mut self, s: &IterationSummary<'_>) {
         println!(
@@ -227,15 +249,18 @@ impl PlaybackDriver for MyDriver {
 Then drive the session:
 
 ```rust
-session.media_source_mut().open()?;
-// For live streams with MSE (WASM only):
-//   session.apply_live_pts_remap();
 session.run(&mut MyDriver { position_s: 0.0 }).await?;
 ```
 
-`run()` calls `notify_playing()`, manages the buffer gate for both tracks, ticks
-the gap controller, calls `fetch_next_segment`, signals `end_of_stream` on
-completion, and calls `prune_all_tracks` when `enable_pruning()` returns `true`.
+`run()` performs the full startup sequence before entering the fetch loop:
+`media_source.open()` → `set_live_mode(true)` (live only) →
+`set_duration(INFINITY)` (live only) → `fetch_init_segment` for each track →
+`apply_live_pts_remap()` (live + `wants_pts_remap()`) →
+`on_session_started(live_presentation_start_s)` → `notify_playing()`.
+
+It then manages the buffer gate for both tracks, ticks the gap controller,
+calls `fetch_next_segment`, signals `end_of_stream` on completion, and calls
+`prune_all_tracks` when `enable_pruning()` returns `true`.
 You do not call any of these directly when using `run()`.
 
 **Every method except `position_s` has a sensible default** — override only
@@ -244,6 +269,42 @@ what your platform actually requires.  A headless test driver needs only:
 ```rust
 fn position_s(&self) -> f64 { 0.0 }
 ```
+
+### `Player` — single-type convenience wrapper
+
+`Player<F, M, D>` in `src/player.rs` owns both a `DashSession<F, M>` and a
+`D: PlaybackDriver`, providing a simpler call site for the common case where
+the driver can be constructed without session state:
+
+```rust
+// From a URL (most common path):
+Player::from_url(&url, fetcher, media_source, MyDriver::new()).await?.run().await?;
+
+// Or with a custom clock (WASM):
+Player::from_url_with_clock(&url, fetcher, ms, driver, clock).await?.run().await?;
+
+// When the session must exist first (rare):
+let session = DashSession::from_mpd(mpd, base_url, fetcher, ms)?;
+let driver  = MyDriver::new_from_session(&session);
+Player::new(session, driver).run().await?;
+```
+
+After `run()` returns, both halves remain accessible:
+
+```rust
+let metrics = player.session().metrics();
+let last_ms = player.driver().last_transfer_ms;
+// Or take ownership of both:
+let (session, driver) = player.into_parts();
+```
+
+**`IterationSummary` carries session context the driver might need** so that
+most drivers do not have to query the session at construction time:
+`video_rep_count`, `audio_rep_count`, and `is_live` are all populated by
+`run()` from the session and passed to `on_iteration` every iteration.
+
+`DashSession::run(&mut driver)` remains available for callers who need more
+control (e.g. polling `session.tick_gap` from a custom loop).
 
 ### `DashSession` buffer scheduling internals
 
@@ -569,7 +630,7 @@ MSE spec requires a new method.
 
 Concrete fetcher implementations that are only needed by a specific example
 belong **alongside that example** (see `examples/http_fetch.rs` and
-`examples/gstreamer_player/main.rs` for the established pattern).
+`examples/gstreamer_player/fetcher.rs` for the established pattern).
 
 Only promote a fetcher into `src/fetch/` if it is intended to be reusable by
 downstream crates.  Gate it behind a Cargo feature if it adds heavy
@@ -593,6 +654,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 |---|---|
 | Public API surface | `src/lib.rs` |
 | Error types | `src/error.rs` |
+| `Player` convenience wrapper | `src/player.rs` |
 | Platform-agnostic monotonic clock helper | `src/time.rs` |
 | ABR rule trait | `src/abr/rule.rs` |
 | ABR controller | `src/abr/mod.rs` |
@@ -624,6 +686,8 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
+| GStreamer HTTP fetcher (`HttpSegmentFetcher`) | `examples/gstreamer_player/fetcher.rs` |
+| GStreamer playback driver (`GstPlaybackDriver`) | `examples/gstreamer_player/driver.rs` |
 | WASM player bridge types (`JsBridge` extern, `js_err`) | `examples/wasm_player/src/bridge.rs` |
 | WASM player clock (`BridgeClock`) | `examples/wasm_player/src/clock.rs` |
 | WASM player source buffer (`BridgeSourceBuffer`) | `examples/wasm_player/src/source_buffer.rs` |
