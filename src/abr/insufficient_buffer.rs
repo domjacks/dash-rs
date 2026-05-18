@@ -37,6 +37,12 @@ impl AbrRule for InsufficientBufferRule {
             return None;
         }
 
+        // Immediately after a seek the buffer is transiently empty; abstain
+        // so that quality is retained rather than forced to the lowest index.
+        if metrics.is_post_seek {
+            return None;
+        }
+
         if metrics.buffer_level_ms <= self.critical_threshold_ms {
             tracing::warn!(
                 rule = self.name(),

@@ -2881,6 +2881,94 @@ fn seek_to_repositions_both_tracks() {
     );
 }
 
+/// After seek_to, current_metrics reports is_post_seek=true; after the first
+/// fetch the flag is cleared.
+#[test]
+fn seek_to_sets_post_seek_in_metrics() {
+    let mut session = session_from_xml(SEEK_MPD);
+    // Before any seek: post_seek is false.
+    let m = session.current_metrics(MediaType::Video, 0.0, &NullBuffer);
+    assert!(!m.is_post_seek, "should not be post-seek before any seek");
+
+    // After seek_to: post_seek flag is set.
+    session.seek_to(20.0);
+    let m = session.current_metrics(MediaType::Video, 0.0, &NullBuffer);
+    assert!(
+        m.is_post_seek,
+        "current_metrics must report is_post_seek=true immediately after seek_to"
+    );
+}
+
+/// After a seek, the first fetch retains the pre-seek quality index even when
+/// the buffer is empty — buffer-occupancy ABR rules are suppressed post-seek.
+#[tokio::test]
+async fn post_seek_quality_retained_after_seek() {
+    const MULTI_REP_SEEK_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"
+     type="static"
+     mediaPresentationDuration="PT60S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="4" timescale="1"/>
+      <Representation id="low"  bandwidth="500000"/>
+      <Representation id="mid"  bandwidth="1000000"/>
+      <Representation id="high" bandwidth="3000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    let mut buf = NullBuffer;
+    let mut session = session_from_xml(MULTI_REP_SEEK_MPD);
+
+    // Drive quality to the highest index by calling update_metrics with very
+    // high throughput and a healthy buffer.
+    let rich = AbrMetrics::new(100_000_000.0, 30_000.0);
+    session.update_metrics(&MediaType::Video, rich);
+
+    let pre_seek_index = session
+        .current_metrics(MediaType::Video, 0.0, &buf)
+        .current_index
+        .expect("index must be Some after update_metrics");
+    assert_eq!(pre_seek_index, 2, "pre-seek quality should be index 2 (high)");
+
+    // Seek to the middle of the stream.
+    session.seek_to(20.0);
+
+    // Build metrics as run() would: use current_metrics (which sets is_post_seek
+    // = true) then inject the measured (unchanged) throughput.
+    let mut post_seek_metrics = session.current_metrics(MediaType::Video, 0.0, &buf);
+    assert!(
+        post_seek_metrics.is_post_seek,
+        "metrics must carry is_post_seek=true right after seek"
+    );
+    // Simulate the good throughput measured before the seek.
+    post_seek_metrics.throughput_bps = 100_000_000.0;
+
+    // First post-seek fetch: buffer-occupancy rules are suppressed, so
+    // ThroughputRule drives the decision → quality is retained at index 2.
+    let outcome = session
+        .fetch_next_segment(MediaType::Video, &post_seek_metrics, &mut buf)
+        .await
+        .expect("first post-seek fetch must succeed");
+    let decision = match outcome {
+        dash_rs::session::FetchOutcome::Fetched(d) => d,
+        other => panic!("expected Fetched, got {other:?}"),
+    };
+    assert_eq!(
+        decision.index, 2,
+        "quality must be retained at index 2 on the first post-seek fetch"
+    );
+
+    // After that fetch the flag is cleared: a second metrics snapshot shows
+    // is_post_seek=false.
+    let after_metrics = session.current_metrics(MediaType::Video, 0.0, &buf);
+    assert!(
+        !after_metrics.is_post_seek,
+        "is_post_seek must be cleared after the first post-seek fetch"
+    );
+}
+
 /// seek_to is clamped to start_number even when given a negative position.
 #[test]
 fn seek_to_clamps_below_start() {

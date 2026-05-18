@@ -557,6 +557,15 @@ struct TrackState {
     /// Callers can read this via [`DashSession::last_producer_reference_time`]
     /// to compute end-to-end latency for low-latency live streams.
     last_prft: Option<ProducerReferenceTime>,
+    /// Set to `true` by [`DashSession::seek_to`] and cleared on the first
+    /// [`DashSession::fetch_next_segment`] call after a seek.
+    ///
+    /// When `true`, buffer-occupancy-based ABR rules ([`InsufficientBufferRule`]
+    /// and [`BufferOccupancyRule`]) abstain so that quality selection is driven
+    /// purely by measured throughput rather than the transiently-empty post-seek
+    /// buffer.  This prevents a quality drop to index 0 on the first segment
+    /// fetched after a seek.
+    post_seek: bool,
 }
 
 impl TrackState {
@@ -597,6 +606,7 @@ impl TrackState {
             timescale,
             availability_time_offset_s,
             last_prft: None,
+            post_seek: false,
         }
     }
 }
@@ -1403,7 +1413,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             MediaType::Audio => self.audio_track.as_ref(),
         };
 
-        let (buffer_level_ms, current_index, throughput_bps, latency_ms) = if let Some(t) = track {
+        let (buffer_level_ms, current_index, throughput_bps, latency_ms, is_post_seek) = if let Some(t) = track {
             let buffered = buf.buffered(media_type);
             let level = buffered
                 .last()
@@ -1414,9 +1424,10 @@ impl<F: SegmentFetcher> DashSession<F> {
                 Some(t.current_index),
                 t.throughput_tracker.estimate(),
                 t.last_transfer_ms,
+                t.post_seek,
             )
         } else {
-            (0.0, None, 0.0, 0.0)
+            (0.0, None, 0.0, 0.0, false)
         };
 
         AbrMetrics {
@@ -1427,6 +1438,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             dropped_frames: None,
             total_decoded_frames: None,
             effective_download_ratio: None,
+            is_post_seek,
         }
     }
 
@@ -2221,6 +2233,9 @@ impl<F: SegmentFetcher> DashSession<F> {
             // Reset the buffer-level baseline so estimates count from zero at
             // the new position.
             track.initial_segment_number = new_seg;
+            // Signal that the first post-seek ABR decision should ignore
+            // buffer-occupancy rules (the buffer is transiently empty).
+            track.post_seek = true;
 
             // Return the snapped position in the same coordinate space that
             // position_s was given in (remapped if remap was applied, un-remapped
@@ -3067,6 +3082,11 @@ impl<F: SegmentFetcher> DashSession<F> {
             }
         };
         let quality_switched = switched_from.is_some();
+
+        // Clear post-seek flag now that ABR has made its first post-seek decision.
+        // The flag is consumed once per track per seek, so buffer-occupancy rules
+        // resume normal operation from the next fetch onwards.
+        self.track_mut(&media_type)?.post_seek = false;
 
         // Record a representation-switch metric when a quality change occurred.
         if let Some(from_index) = switched_from {

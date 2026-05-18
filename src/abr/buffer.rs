@@ -59,6 +59,12 @@ impl AbrRule for BufferOccupancyRule {
             return None;
         }
 
+        // Immediately after a seek the buffer is transiently empty; abstain
+        // so that throughput-based rules retain the current quality level.
+        if metrics.is_post_seek {
+            return None;
+        }
+
         // If we have not built up any buffer yet, abstain so ThroughputRule
         // makes the first few decisions.
         if metrics.buffer_level_ms < 1.0 {

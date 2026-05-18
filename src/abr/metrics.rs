@@ -37,6 +37,15 @@ pub struct AbrMetrics {
     ///
     /// [`AbandonRequestsRule`]: crate::abr::abandon_requests::AbandonRequestsRule
     pub effective_download_ratio: Option<f64>,
+
+    /// `true` on the first [`DashSession::fetch_next_segment`] call after a
+    /// seek.  When set, buffer-occupancy-based rules ([`InsufficientBufferRule`]
+    /// and [`BufferOccupancyRule`]) abstain so that quality selection is driven
+    /// purely by throughput rather than the transiently-empty post-seek buffer.
+    ///
+    /// Set automatically by [`DashSession::current_metrics`] from
+    /// [`TrackState::post_seek`]; callers do not need to set this manually.
+    pub is_post_seek: bool,
 }
 
 impl AbrMetrics {
@@ -49,6 +58,7 @@ impl AbrMetrics {
             dropped_frames: None,
             total_decoded_frames: None,
             effective_download_ratio: None,
+            is_post_seek: false,
         }
     }
 }

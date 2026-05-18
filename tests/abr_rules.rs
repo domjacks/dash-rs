@@ -84,6 +84,22 @@ fn buffer_rule_returns_some_when_buffer_present() {
     assert!(rule.max_index(&reps, &metrics).is_some());
 }
 
+#[test]
+fn buffer_occupancy_abstains_when_post_seek() {
+    let rule = BufferOccupancyRule::default();
+    let reps = reps();
+
+    // Non-zero buffer that would normally yield a BOLA decision, but
+    // is_post_seek suppresses the rule so quality is retained post-seek.
+    let mut metrics = AbrMetrics::new(5_000_000.0, 10_000.0);
+    metrics.is_post_seek = true;
+    assert_eq!(
+        rule.max_index(&reps, &metrics),
+        None,
+        "BufferOccupancyRule must abstain on the first post-seek fetch"
+    );
+}
+
 // ── InsufficientBufferRule ────────────────────────────────────────────────────
 
 #[test]
@@ -98,6 +114,22 @@ fn insufficient_buffer_fires_below_threshold() {
     // Just below threshold.
     let metrics = AbrMetrics::new(10_000_000.0, 500.0);
     assert_eq!(rule.max_index(&reps, &metrics), Some(0));
+}
+
+#[test]
+fn insufficient_buffer_abstains_when_post_seek() {
+    let rule = InsufficientBufferRule::default();
+    let reps = reps();
+
+    // Buffer is well below threshold (would normally force index 0), but
+    // is_post_seek suppresses the rule so quality is retained.
+    let mut metrics = AbrMetrics::new(10_000_000.0, 0.0);
+    metrics.is_post_seek = true;
+    assert_eq!(
+        rule.max_index(&reps, &metrics),
+        None,
+        "InsufficientBufferRule must abstain on the first post-seek fetch"
+    );
 }
 
 #[test]
