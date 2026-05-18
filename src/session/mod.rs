@@ -2236,6 +2236,11 @@ impl<F: SegmentFetcher> DashSession<F> {
             // Signal that the first post-seek ABR decision should ignore
             // buffer-occupancy rules (the buffer is transiently empty).
             track.post_seek = true;
+            // Codec initialisation must be re-sent to the renderer after a
+            // seek: GStreamer's qtdemux resets its parser state on flush and
+            // requires the init segment (ftyp + moov) before any moof boxes.
+            // For MSE SourceBuffers, re-appending the init segment is a no-op.
+            track.init_segment_sent = false;
 
             // Return the snapped position in the same coordinate space that
             // position_s was given in (remapped if remap was applied, un-remapped
