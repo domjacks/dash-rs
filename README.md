@@ -187,6 +187,7 @@ impl MediaBuffer for MyBuffer {
         vec![]
     }
 }
+```
 
 ### 4. Implement `PlaybackDriver`
 
