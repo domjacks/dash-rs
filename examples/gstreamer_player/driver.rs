@@ -69,9 +69,14 @@ impl PlaybackDriver for GstPlaybackDriver {
     }
 
     fn throughput_override_bps(&self) -> Option<f64> {
-        Some(f64::from_bits(
-            self.throughput_tracker.load(Ordering::Relaxed),
-        ))
+        let raw = self.throughput_tracker.load(Ordering::Relaxed);
+        if raw == 0 {
+            // No fetch has completed yet — let the ABR controller use its own
+            // throughput estimate rather than treating bandwidth as 0 bps.
+            return None;
+        }
+        let bps = f64::from_bits(raw);
+        if bps > 0.0 { Some(bps) } else { None }
     }
 
     fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {

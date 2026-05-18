@@ -50,7 +50,7 @@
 
 mod driver;
 mod fetcher;
-mod gst_media_source;
+mod gst_media_buffer;
 
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -61,7 +61,7 @@ use dash_rs::{DashError, Player};
 use driver::GstPlaybackDriver;
 use fetcher::HttpSegmentFetcher;
 use gst::prelude::*;
-use gst_media_source::GstMediaSource;
+use gst_media_buffer::GstMediaBuffer;
 use gstreamer as gst;
 use url::Url;
 
@@ -72,21 +72,21 @@ const DEFAULT_MPD_URL: &str = "https://dash.akamaized.net/akamai/bbb_30fps/bbb_3
 /// Runs inside the tokio runtime on the background OS thread.
 async fn run_session(
     manifest_url: Url,
-    media_source: GstMediaSource,
+    buf: GstMediaBuffer,
     throughput_tracker: Arc<AtomicU64>,
     is_paused: Arc<AtomicBool>,
     is_buffering: Arc<AtomicBool>,
 ) -> Result<(), DashError> {
     let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
 
-    // Grab the pipeline handle before media_source is moved into Player::from_url.
-    let pipeline = media_source.pipeline();
+    // Grab the pipeline handle before buf is moved into Player::from_url.
+    let pipeline = buf.pipeline();
     let driver = GstPlaybackDriver::new(is_paused, is_buffering, throughput_tracker, pipeline);
 
-    // Player::from_url fetches + parses the MPD, opens the media source, and
-    // creates the source buffers.  GstMediaSource::open() is a no-op (the
-    // pipeline is already Open at construction time).
-    let mut player = Player::from_url(&manifest_url, fetcher, media_source, driver).await?;
+    // Player::from_url fetches + parses the MPD, opens the media buffer, and
+    // sets up the GStreamer appsrc chains.  GstMediaBuffer::open() is a no-op
+    // (the pipeline is already ready at construction time).
+    let mut player = Player::from_url(&manifest_url, fetcher, buf, driver).await?;
 
     // Print available representations.
     if player.session().has_video() {
@@ -173,13 +173,13 @@ fn run() {
     println!("dash-rs GStreamer player");
     println!("Manifest: {manifest_url}");
 
-    // Create the GstMediaSource and grab a pipeline handle *before* moving
-    // media_source into the session (which happens on the background thread).
-    let media_source = GstMediaSource::new().unwrap_or_else(|e| {
+    // Create the GstMediaBuffer and grab a pipeline handle *before* moving
+    // buf into the session (which happens on the background thread).
+    let buf = GstMediaBuffer::new().unwrap_or_else(|e| {
         eprintln!("fatal: {e}");
         std::process::exit(1);
     });
-    let pipeline = media_source.pipeline();
+    let pipeline = buf.pipeline();
 
     // Shared throughput tracker.
     let throughput_tracker = Arc::new(AtomicU64::new(0u64));
@@ -208,7 +208,7 @@ fn run() {
 
         let result = rt.block_on(run_session(
             manifest_url,
-            media_source,
+            buf,
             throughput_tracker_bg,
             is_paused_bg,
             is_buffering_bg,

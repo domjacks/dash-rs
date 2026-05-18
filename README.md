@@ -10,14 +10,6 @@ streaming session from native Rust code.
 
 ## What's included
 
-| Module | Responsibility | dash.js equivalent |
-|---|---|---|
-| `abr` | Adaptive bitrate rules and controller | `src/streaming/rules/` |
-| `media_source` | MSE-style `MediaSource` / `SourceBuffer` traits + in-memory stub | `ExternalMediaSource.js`, `ExternalSourceBuffer.js`, `SourceBufferSink.js` |
-| `fetch` | `SegmentFetcher` trait + stub | `FragmentLoader.js`, `URLLoader.js` |
-| `manifest` | Manifest loading via [`dash-mpd`](https://crates.io/crates/dash-mpd) | `ManifestLoader.js` |
-| `session` | Top-level `DashSession` coordinator | `MediaPlayer.js`, `StreamProcessor.js` |
-
 ### ABR rules
 
 | Rule | Algorithm | dash.js equivalent |
@@ -31,20 +23,6 @@ streaming session from native Rust code.
 
 The `AbrController` runs all six rules and takes the most conservative result.
 
-### MSE abstraction
-
-Where dash.js calls browser MSE APIs (`appendBuffer`, `remove`, `addSourceBuffer`, `endOfStream`, …), dash-rs exposes equivalent async Rust traits:
-
-- **`MediaSource`** — mirrors the browser `MediaSource` object.
-- **`SourceBuffer`** — mirrors the browser `SourceBuffer` object.
-- **`SourceBufferSink`** — a queuing wrapper around `SourceBuffer`, mirrors `SourceBufferSink.js`.
-
-The `stub` module ships a fully in-memory implementation (`StubMediaSource` /
-`StubSourceBuffer`) that resolves every call immediately. Plug in your own
-implementation (GStreamer `appsrc`, a custom demuxer, etc.) by implementing the
-two traits.
-
----
 
 ## Prerequisites
 
@@ -65,8 +43,7 @@ end-of-stream signalling.
 | What to implement | Trait | Role |
 |---|---|---|
 | Segment fetcher | `SegmentFetcher` | Downloads manifests and media segments |
-| Media buffer | `SourceBuffer` | Receives raw fMP4/WebM bytes; `append_buffer` feeds them to your decoder |
-| Media container | `MediaSource` | Creates `SourceBuffer` instances and signals end-of-stream |
+| Media buffer | `MediaBuffer` | Receives raw fMP4/WebM bytes for both tracks and signals end-of-stream |
 | Playback driver | `PlaybackDriver` | Supplies the renderer's position and `PlaybackState` (`Playing` / `Paused` / `Buffering`) to the fetch loop |
 
 ### 1. Add the dependency
@@ -127,7 +104,7 @@ impl SegmentFetcher for HttpFetcher {
             .await
             .map_err(|e| FetchError::Network { url: req.url.clone(), message: e.to_string() })?;
         Ok(FetchResponse {
-            final_url:            req.url,
+            final_url:            resp.url().clone(),
             transfer_duration_ms: t0.elapsed().as_millis() as u64,
             bytes_received:       data.len() as u64,
             data,
@@ -147,103 +124,69 @@ impl SegmentFetcher for HttpFetcher {
 }
 ```
 
-### 3. Implement `SourceBuffer` and `MediaSource`
+### 3. Implement `MediaBuffer`
 
-`SourceBuffer` is where your decoder integration lives.  Implement
-`append_buffer` to forward `chunk.data` to your pipeline — every other method
-is bookkeeping used by the session.
-
-`MediaSource` creates `SourceBuffer` instances (one per track) and signals
-end-of-stream to the renderer.
+`MediaBuffer` is the single integration point where your decoder receives media
+bytes for both the video and audio tracks.  Override `append` to forward bytes
+to your pipeline — every other method has a sensible default and can be
+overridden as your platform requires.
 
 ```rust
 use async_trait::async_trait;
+use bytes::Bytes;
 use dash_rs::{
     error::DashError,
-    media_source::{Chunk, MediaSource, ReadyState, SourceBuffer, TimeRange},
+    media_buffer::{MediaBuffer, TimeRange},
+    session::MediaType,
 };
 
-// ── SourceBuffer ──────────────────────────────────────────────────────────────
-
-struct MySourceBuffer {
-    mime:      String,
-    ts_offset: f64,
-    win_start: f64,
-    win_end:   f64,
-}
-
-impl MySourceBuffer {
-    fn new(mime: &str) -> Self {
-        Self {
-            mime:      mime.to_string(),
-            ts_offset: 0.0,
-            win_start: 0.0,
-            win_end:   f64::INFINITY,
-        }
-    }
+struct MyBuffer {
+    // Your decoder handle, pipeline reference, etc.
 }
 
 #[async_trait(?Send)]
-impl SourceBuffer for MySourceBuffer {
-    fn mime_type(&self)           -> &str           { &self.mime }
-    fn is_updating(&self)         -> bool           { false }
-    fn buffered(&self)            -> Vec<TimeRange> { vec![] }
-    fn timestamp_offset(&self)    -> f64            { self.ts_offset }
-    fn set_timestamp_offset(&mut self, v: f64)      { self.ts_offset = v; }
-    fn append_window_start(&self) -> f64            { self.win_start }
-    fn set_append_window_start(&mut self, v: f64)   { self.win_start = v; }
-    fn append_window_end(&self)   -> f64            { self.win_end }
-    fn set_append_window_end(&mut self, v: f64)     { self.win_end = v; }
-
-    async fn append_buffer(&mut self, chunk: Chunk) -> Result<(), DashError> {
-        // Send chunk.data to your decoder here.
-        // chunk.label identifies the track, e.g. "video/init" or "audio/seg-3".
-        let _ = chunk;
+impl MediaBuffer for MyBuffer {
+    async fn open(&mut self) -> Result<(), DashError> {
+        // For browser MSE: create MediaSource, attach to <video>, await sourceopen.
+        // For native sinks: usually a no-op.
         Ok(())
     }
 
-    async fn remove(&mut self, _: f64, _: f64) -> Result<(), DashError> { Ok(()) }
-    async fn abort(&mut self)                   -> Result<(), DashError> { Ok(()) }
-    async fn change_type(&mut self, mime: &str) -> Result<(), DashError> {
-        self.mime = mime.to_string();
+    fn set_duration(&mut self, _secs: f64) {
+        // Inform your renderer of the total presentation duration (VOD only).
+    }
+
+    fn set_live_mode(&mut self, _live: bool) {
+        // For GStreamer: install a PTS-subtraction pad probe.
+        // For most sinks: no-op.
+    }
+
+    /// Called once per track before fetching starts.  Return `false` to
+    /// skip the track (e.g. the browser doesn't support the codec).
+    fn add_track(&mut self, mt: MediaType, mime_type: &str) -> bool {
+        // Allocate a decoder pipeline or SourceBuffer for `mt`.
+        let _ = (mt, mime_type);
+        true
+    }
+
+    /// Receive a media chunk.  `is_init` is `true` for the fMP4 `moov` box.
+    async fn append(&mut self, mt: MediaType, data: Bytes, is_init: bool) -> Result<(), DashError> {
+        // Forward `data` to your decoder or MSE SourceBuffer here.
+        let _ = (mt, data, is_init);
         Ok(())
     }
-}
-
-// ── MediaSource ───────────────────────────────────────────────────────────────
-
-struct MyMediaSource {
-    duration: Option<f64>,
-}
-
-impl MyMediaSource {
-    fn new() -> Self { Self { duration: None } }
-}
-
-#[async_trait(?Send)]
-impl MediaSource for MyMediaSource {
-    fn ready_state(&self) -> ReadyState  { ReadyState::Open }
-    fn duration(&self)    -> Option<f64> { self.duration }
-
-    fn set_duration(&mut self, d: f64) -> Result<(), DashError> {
-        self.duration = Some(d);
-        Ok(())
-    }
-
-    fn add_source_buffer(&mut self, mime_type: &str) -> Result<Box<dyn SourceBuffer>, DashError> {
-        Ok(Box::new(MySourceBuffer::new(mime_type)))
-    }
-
-    fn remove_source_buffer(&mut self, _: &str) -> Result<(), DashError> { Ok(()) }
 
     async fn end_of_stream(&mut self) -> Result<(), DashError> {
         // Signal your renderer that all media has been delivered.
         Ok(())
     }
 
-    fn close(&mut self) {}
+    fn buffered(&self, _mt: MediaType) -> Vec<TimeRange> {
+        // Return the currently buffered time ranges so the ABR controller
+        // can compute buffer level.  Return `vec![]` if not applicable.
+        vec![]
+    }
 }
-```
 
 ### 4. Implement `PlaybackDriver`
 
@@ -305,12 +248,12 @@ use dash_rs::Player;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let url = Url::parse("https://example.com/stream.mpd")?;
 
-    // from_url fetches + parses the MPD, opens the media source, and returns
+    // from_url fetches + parses the MPD, opens the media buffer, and returns
     // a Player ready to run.
     let mut player = Player::from_url(
         &url,
         HttpFetcher::new(),
-        MyMediaSource::new(),
+        MyBuffer::new(),
         MyDriver::new(),
     ).await?;
 
@@ -339,7 +282,7 @@ let mut player = Player::from_mpd(
     mpd,
     base_url,
     Arc::new(MyFetcher::new()),
-    MyMediaSource::new(),
+    MyBuffer::new(),
     MyDriver::new(),
 )?;
 player.run().await?;
@@ -354,7 +297,7 @@ player.run().await?;
 
 `from_url` fetches and parses the MPD, resolves XLink references, syncs the UTC
 clock for live streams, and snaps to the live edge.  `run()` returns `Ok(())`
-once `end_of_stream()` has been called on your `MediaSource`.
+once `end_of_stream()` has been called on your `MediaBuffer`.
 
 For platforms without `std::time::Instant` (e.g. WASM), use
 `from_url_with_clock` and pass a [`Clock`] implementation — see
@@ -422,7 +365,6 @@ impl Clock for MyPlatformClock {
 let session = DashSession::from_url_with_clock(
     &url,
     fetcher,
-    media_source,
     Arc::new(MyPlatformClock),
 ).await?;
 ```
@@ -537,8 +479,8 @@ cargo test
 # Run only ABR rule tests
 cargo test --test abr_rules
 
-# Run only MSE abstraction tests
-cargo test --test media_source
+# Run only media buffer abstraction tests
+cargo test --test media_buffer
 
 # Run only doc-tests
 cargo test --doc
@@ -707,11 +649,11 @@ DashSession
 │   ├── BufferOccupancyRule
 │   ├── InsufficientBufferRule
 │   └── SwitchHistoryRule
-└── SourceBufferSink (per track)
-        └── SourceBuffer (trait) ←── StubSourceBuffer
-                                 └── BridgeSourceBuffer  (wasm_player)
-                                 └── GstSourceBuffer     (sink-gstreamer feature)
-                                 └── (your implementation)
+└── MediaBuffer (trait) ←── NullBuffer            (headless / tests)
+                         └── StubBuffer            (inspectable in-memory buffer)
+                         └── BridgeMediaBuffer     (wasm_player — MSE via JS bridge)
+                         └── GstMediaBuffer        (sink-gstreamer feature)
+                         └── (your implementation)
 
 GapController  (owned by DashSession; caller drives via session.tick_gap())
 └── tick_gap(position_s, buffered, PlaybackState) → Option<GapSeekTarget>
@@ -724,7 +666,7 @@ Data flow per segment:
 1. `AbrController::select` picks a `QualityDecision` from `AbrMetrics`.
 2. `DashSession` resolves the segment URL from the MPD `SegmentTemplate` for the current period.
 3. `SegmentFetcher::fetch` retrieves the bytes.
-4. `SourceBufferSink::append` forwards the `Chunk` to the `SourceBuffer`.
+4. `MediaBuffer::append(mt, data, is_init)` forwards the bytes to the decoder.
 5. At period boundaries, `fetch_next_segment` transparently advances to the next `Period` and re-fetches init segments before continuing.
 
 ---

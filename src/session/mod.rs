@@ -8,7 +8,7 @@
 //! - Maintains per-track state (current quality, segment number, sink).
 //! - Runs the [`AbrController`] to select quality for each fetch.
 //! - Dispatches `FetchRequest`s via a [`SegmentFetcher`].
-//! - Feeds fetched data into the appropriate [`SourceBufferSink`].
+//! - Feeds fetched data into the appropriate [`MediaBuffer`].
 //!
 //! # Sub-modules
 //!
@@ -67,10 +67,7 @@ use crate::{
     error::DashError,
     fetch::{FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     manifest::ManifestLoader,
-    media_source::{
-        sink::{SourceBufferSink, StreamInfo},
-        Chunk, MediaSource,
-    },
+    media_buffer::MediaBuffer,
     mp4::{parse_prft, parse_sidx, parse_sidx_entries, ProducerReferenceTime, SidxEntry},
 };
 
@@ -107,6 +104,39 @@ impl core::fmt::Display for MediaType {
     }
 }
 
+// ── FetchOutcome ──────────────────────────────────────────────────────────────
+
+/// The outcome of a successful [`DashSession::fetch_next_segment`] call.
+///
+/// This type replaces the old pattern of treating end-of-stream as an error.
+/// Callers should match on this instead of using `?` to propagate:
+///
+/// ```rust,ignore
+/// match session.fetch_next_segment(MediaType::Video, &metrics).await? {
+///     FetchOutcome::Fetched(decision) => {
+///         println!("fetched quality index {}", decision.index);
+///     }
+///     FetchOutcome::EndOfStream => {
+///         session.end_of_stream().await?;
+///         break;
+///     }
+/// }
+/// ```
+#[derive(Debug)]
+pub enum FetchOutcome {
+    /// A segment was fetched successfully.
+    ///
+    /// The inner [`QualityDecision`] describes which representation was
+    /// selected and why.
+    Fetched(QualityDecision),
+
+    /// All segments for all periods have been delivered.
+    ///
+    /// The caller should call [`DashSession::end_of_stream`] and stop the
+    /// fetch loop.  [`DashSession::run`] handles this automatically.
+    EndOfStream,
+}
+
 // ── DashEvent ─────────────────────────────────────────────────────────────────
 
 /// An in-band DASH event extracted from a `DASHEventMessageBox` (`emsg`) in a
@@ -130,14 +160,12 @@ impl core::fmt::Display for MediaType {
 /// ```no_run
 /// # use dash_rs::session::{DashSession, MediaType};
 /// # use dash_rs::fetch::stub::StubSegmentFetcher;
-/// # use dash_rs::media_source::stub::StubMediaSource;
+/// # use dash_rs::media_buffer::NullBuffer;
 /// # use std::sync::Arc;
 /// # use url::Url;
 /// # async fn example() -> Result<(), dash_rs::error::DashError> {
-/// # let mut media_source = StubMediaSource::new();
-/// # media_source.open();
 /// # let url = Url::parse("https://example.com/manifest.mpd").unwrap();
-/// let mut session = DashSession::from_url(&url, StubSegmentFetcher, media_source).await?;
+/// let mut session = DashSession::from_url(&url, StubSegmentFetcher).await?;
 ///
 /// // Subscribe *before* the fetch loop so no events are missed.
 /// let mut events = session.subscribe_events();
@@ -360,6 +388,35 @@ fn compute_track_reinit(
     }
 }
 
+// ── Append-window helpers ─────────────────────────────────────────────────────
+
+/// Constants matching `SourceBufferSink` in the original implementation.
+const APPEND_WINDOW_START_OFFSET: f64 = 0.1;
+const APPEND_WINDOW_END_OFFSET: f64 = 0.01;
+
+/// Compute the `(start, end)` append window for a period.
+///
+/// Mirrors `SourceBufferSink::update_append_window` from the old API.
+fn compute_append_window(
+    period_start_s: f64,
+    period_duration_s: Option<f64>,
+    presentation_duration_s: Option<f64>,
+) -> (f64, f64) {
+    let window_start = if period_start_s > 0.0 {
+        (period_start_s - APPEND_WINDOW_START_OFFSET).max(0.0)
+    } else {
+        0.0
+    };
+    let window_end = match period_duration_s {
+        Some(d) if d.is_finite() => period_start_s + d + APPEND_WINDOW_END_OFFSET,
+        _ => match presentation_duration_s {
+            Some(d) if d.is_finite() => d + APPEND_WINDOW_END_OFFSET,
+            _ => f64::INFINITY,
+        },
+    };
+    (window_start, window_end)
+}
+
 /// Apply a [`TrackReinit`] to an existing [`TrackState`] in-place.
 ///
 /// Updates the MIME type (via `change_type` if it changed), append window,
@@ -369,16 +426,20 @@ fn compute_track_reinit(
 async fn apply_track_reinit(
     track: &mut TrackState,
     ri: &TrackReinit,
-    stream_info: &StreamInfo,
-    media_source_duration: Option<f64>,
+    buf: &mut impl MediaBuffer,
+    period_start_s: f64,
+    period_duration_s: Option<f64>,
+    presentation_duration_s: Option<f64>,
 ) -> Result<(), DashError> {
-    if track.sink.mime_type() != ri.mime {
-        track.sink.change_type(&ri.mime).await?;
+    if track.current_mime != ri.mime {
+        buf.change_type(track._media_type.clone(), &ri.mime).await?;
+        track.current_mime = ri.mime.clone();
     }
-    track
-        .sink
-        .update_append_window(stream_info, media_source_duration);
-    track.sink.set_timestamp_offset(ri.timestamp_offset_s);
+    let (ws, we) = compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
+    buf.set_append_window(track._media_type.clone(), ws, we);
+    buf.set_timestamp_offset(track._media_type.clone(), ri.timestamp_offset_s);
+    track.timestamp_offset_s = ri.timestamp_offset_s;
+    track.append_window = (ws, we);
     track.representations = ri.representations.clone();
     track.segment_number = ri.start_number;
     track.start_number = ri.start_number;
@@ -425,8 +486,20 @@ struct TrackState {
     /// Total number of segments in this track.
     /// `None` for live streams or manifests without a declared duration.
     total_segments: Option<u64>,
-    /// The `SourceBufferSink` wrapping the underlying buffer.
-    sink: SourceBufferSink,
+    /// Current MIME type string for this track, as computed from the MPD.
+    ///
+    /// Used to detect codec changes at period boundaries so that
+    /// `buf.change_type()` is only called when needed.
+    current_mime: String,
+    /// Current `SourceBuffer.timestampOffset` value, in seconds.
+    ///
+    /// Stored here so it can be restored after `apply_live_pts_remap` and
+    /// forwarded to the buffer on period reinit.
+    timestamp_offset_s: f64,
+    /// Current append window `(start, end)` in seconds.
+    ///
+    /// Forwarded to the buffer on period reinit.
+    append_window: (f64, f64),
     /// How segment URLs are constructed for this track.
     addressing_mode: AddressingMode,
     /// For `$Time$` addressing: the start time (in timescale ticks) of the
@@ -490,7 +563,9 @@ impl TrackState {
     fn new(
         media_type: MediaType,
         representations: Vec<RepresentationInfo>,
-        sink: SourceBufferSink,
+        current_mime: String,
+        timestamp_offset_s: f64,
+        append_window: (f64, f64),
         start_number: u64,
         segment_duration_ms: f64,
         total_segments: Option<u64>,
@@ -508,7 +583,9 @@ impl TrackState {
             initial_segment_number: start_number,
             segment_duration_ms,
             total_segments,
-            sink,
+            current_mime,
+            timestamp_offset_s,
+            append_window,
             addressing_mode,
             next_segment_time: None,
             throughput_tracker: ThroughputTracker::new(),
@@ -529,31 +606,28 @@ impl TrackState {
 ///
 /// # Usage
 ///
-/// ```no_run
+/// ```rust,ignore
 /// # use std::sync::Arc;
 /// # use url::Url;
 /// # use dash_rs::session::{DashSession, MediaType};
 /// # use dash_rs::fetch::stub::StubSegmentFetcher;
-/// # use dash_rs::media_source::stub::StubMediaSource;
+/// # use dash_rs::media_buffer::NullBuffer;
 /// # use dash_rs::abr::AbrMetrics;
 /// # async fn example() -> Result<(), dash_rs::error::DashError> {
-/// let mut media_source = StubMediaSource::new();
-/// media_source.open();
-///
 /// let url = Url::parse("https://example.com/manifest.mpd").unwrap();
 /// let mut session = DashSession::from_url(
 ///     &url,
 ///     StubSegmentFetcher,
-///     media_source,
 /// ).await?;
 ///
+/// let mut buf = NullBuffer;
 /// // Drive the fetch loop.
-/// let metrics = session.current_metrics(MediaType::Video, 0.0);
-/// let _ = session.fetch_next_segment(MediaType::Video, &metrics).await?;
+/// let metrics = session.current_metrics(MediaType::Video, 0.0, &buf);
+/// let _ = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
+pub struct DashSession<F: SegmentFetcher> {
     mpd: MPD,
     base_url: Url,
     /// Alternative manifest URLs from `<Location>` elements in the MPD.
@@ -565,7 +639,6 @@ pub struct DashSession<F: SegmentFetcher, M: MediaSource> {
     /// manifest refresh.
     location_urls: Vec<Url>,
     fetcher: Arc<F>,
-    media_source: M,
     abr: AbrController,
     video_track: Option<TrackState>,
     audio_track: Option<TrackState>,
@@ -701,11 +774,14 @@ fn parse_byte_range(s: &str) -> Option<(u64, u64)> {
     Some((start.trim().parse().ok()?, end.trim().parse().ok()?))
 }
 
-impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
+impl<F: SegmentFetcher> DashSession<F> {
     // ── Constructors ──────────────────────────────────────────────────────────
 
-    /// Fetch the manifest at `url`, parse it, initialise source buffers on
-    /// `media_source`, and return a ready-to-use session.
+    /// Fetch the manifest at `url`, parse it, and return a ready-to-use session.
+    ///
+    /// The media buffer (`buf`) is not passed here — it is passed to each
+    /// individual operation (`run`, `fetch_next_segment`, etc.) so that the
+    /// same session object can be used with different buffers if needed.
     ///
     /// If the manifest contains `UTCTiming` elements, the first successful one
     /// is queried to compute a signed clock offset that corrects live-edge
@@ -715,9 +791,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// inject a different clock (e.g. on WASM), use
     /// [`Self::from_url_with_clock`].
     #[cfg(feature = "std")]
-    pub async fn from_url(url: &Url, fetcher: F, media_source: M) -> Result<Self, DashError> {
-        Self::from_url_with_clock(url, fetcher, media_source, crate::clock::SystemClock::arc())
-            .await
+    pub async fn from_url(url: &Url, fetcher: F) -> Result<Self, DashError> {
+        Self::from_url_with_clock(url, fetcher, crate::clock::SystemClock::arc()).await
     }
 
     /// Like [`Self::from_url`] but accepts a custom [`Clock`] implementation.
@@ -727,7 +802,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     pub async fn from_url_with_clock(
         url: &Url,
         fetcher: F,
-        mut media_source: M,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
         let fetcher = Arc::new(fetcher);
@@ -743,13 +817,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let client_now_s = clock.unix_s();
         let utc_offset = utc::resolve_utc_timing(&mpd, &fetcher, client_now_s).await;
 
-        // Open the media source before adding source buffers.  For browser MSE
-        // this awaits the `sourceopen` event; for other implementations the
-        // default is a no-op.
-        media_source.open().await?;
-
         let mut session =
-            Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, utc_offset, clock)?;
+            Self::from_mpd_with_utc(mpd, base_url, fetcher, utc_offset, clock)?;
         session.last_manifest_refresh = Some(session.clock.now_ms());
         Ok(session)
     }
@@ -768,13 +837,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
-        media_source: M,
     ) -> Result<Self, DashError> {
         Self::from_mpd_with_utc(
             mpd,
             base_url,
             fetcher,
-            media_source,
             0.0,
             crate::clock::SystemClock::arc(),
         )
@@ -788,10 +855,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
-        media_source: M,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
-        Self::from_mpd_with_utc(mpd, base_url, fetcher, media_source, 0.0, clock)
+        Self::from_mpd_with_utc(mpd, base_url, fetcher, 0.0, clock)
     }
 
     /// Internal constructor shared by [`Self::from_url_with_clock`] and
@@ -800,7 +866,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
-        mut media_source: M,
         utc_clock_offset_s: f64,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
@@ -810,6 +875,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
         let period = &mpd.periods[0];
         let presentation_duration = mpd.mediaPresentationDuration;
+        let presentation_duration_s = presentation_duration.map(|d| d.as_secs_f64());
 
         let video_adaptation = find_adaptation(period, &MediaType::Video);
         let audio_adaptation = find_adaptation(period, &MediaType::Audio);
@@ -818,32 +884,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let reinit = compute_track_reinit(adaptation, period, presentation_duration);
             if reinit.representations.is_empty() {
                 None
-            } else if !media_source.is_type_supported(&reinit.mime) {
-                tracing::warn!(
-                    mime = %reinit.mime,
-                    "video MIME type not supported by this MediaSource — \
-                     video track skipped (audio-only fallback)"
-                );
-                None
             } else {
-                let sink_buf = media_source.add_source_buffer(&reinit.mime)?;
-                let mut sink = SourceBufferSink::new(sink_buf);
-
                 let effective_duration = period.duration.or(presentation_duration);
-                let stream_info = StreamInfo {
-                    start: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
-                    duration: effective_duration.map(|d| d.as_secs_f64()),
-                };
-                sink.update_append_window(
-                    &stream_info,
-                    presentation_duration.map(|d| d.as_secs_f64()),
-                );
-                sink.set_timestamp_offset(reinit.timestamp_offset_s);
+                let period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                let period_duration_s = effective_duration.map(|d| d.as_secs_f64());
+                let (ws, we) = compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
 
                 Some(TrackState::new(
                     MediaType::Video,
                     reinit.representations,
-                    sink,
+                    reinit.mime,
+                    reinit.timestamp_offset_s,
+                    (ws, we),
                     reinit.start_number,
                     reinit.seg_dur_ms,
                     reinit.total_segments,
@@ -861,32 +913,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let reinit = compute_track_reinit(adaptation, period, presentation_duration);
             if reinit.representations.is_empty() {
                 None
-            } else if !media_source.is_type_supported(&reinit.mime) {
-                tracing::warn!(
-                    mime = %reinit.mime,
-                    "audio MIME type not supported by this MediaSource — \
-                     audio track skipped"
-                );
-                None
             } else {
-                let sink_buf = media_source.add_source_buffer(&reinit.mime)?;
-                let mut sink = SourceBufferSink::new(sink_buf);
-
                 let effective_duration = period.duration.or(presentation_duration);
-                let stream_info = StreamInfo {
-                    start: period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0),
-                    duration: effective_duration.map(|d| d.as_secs_f64()),
-                };
-                sink.update_append_window(
-                    &stream_info,
-                    presentation_duration.map(|d| d.as_secs_f64()),
-                );
-                sink.set_timestamp_offset(reinit.timestamp_offset_s);
+                let period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                let period_duration_s = effective_duration.map(|d| d.as_secs_f64());
+                let (ws, we) = compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
 
                 Some(TrackState::new(
                     MediaType::Audio,
                     reinit.representations,
-                    sink,
+                    reinit.mime,
+                    reinit.timestamp_offset_s,
+                    (ws, we),
                     reinit.start_number,
                     reinit.seg_dur_ms,
                     reinit.total_segments,
@@ -1093,7 +1131,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             base_url,
             location_urls,
             fetcher,
-            media_source,
             abr: AbrController::default(),
             video_track,
             audio_track,
@@ -1203,7 +1240,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     pub fn tick_gap(
         &mut self,
         position_s: f64,
-        buffered: &[crate::media_source::TimeRange],
+        buffered: &[crate::media_buffer::TimeRange],
         state: PlaybackState,
     ) -> Option<GapSeekTarget> {
         self.gap_controller.tick(position_s, buffered, state.suppresses_gap_jump())
@@ -1318,16 +1355,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.event_tx.new_receiver()
     }
 
-    /// Shared reference to the underlying [`MediaSource`].
-    pub fn media_source(&self) -> &M {
-        &self.media_source
-    }
-
-    /// Exclusive reference to the underlying [`MediaSource`].
-    pub fn media_source_mut(&mut self) -> &mut M {
-        &mut self.media_source
-    }
-
     /// Available video representations, sorted ascending by bandwidth.
     pub fn video_representations(&self) -> &[RepresentationInfo] {
         self.video_track
@@ -1360,14 +1387,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// from `query_position` in GStreamer or `currentTime` in MSE).  Passing
     /// `0.0` gives the absolute buffer-end time, which overestimates the
     /// available buffer after the first few segments.
-    pub fn current_metrics(&self, media_type: MediaType, position_s: f64) -> AbrMetrics {
+    pub fn current_metrics(&self, media_type: MediaType, position_s: f64, buf: &impl MediaBuffer) -> AbrMetrics {
         let track = match media_type {
             MediaType::Video => self.video_track.as_ref(),
             MediaType::Audio => self.audio_track.as_ref(),
         };
 
         let (buffer_level_ms, current_index, throughput_bps, latency_ms) = if let Some(t) = track {
-            let buffered = t.sink.buffered();
+            let buffered = buf.buffered(media_type.clone());
             let level = buffered
                 .last()
                 .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
@@ -1586,9 +1613,59 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// [`IterationSummary`]: driver::IterationSummary
     /// [`PlaybackDriver`]: driver::PlaybackDriver
-     pub async fn run<D: driver::PlaybackDriver>(&mut self, drv: &mut D) -> Result<(), DashError> {
+     pub async fn run<S: MediaBuffer, D: driver::PlaybackDriver>(&mut self, buf: &mut S, drv: &mut D) -> Result<(), DashError> {
         use driver::IterationSummary;
 
+        let mut prev_video_index: Option<usize> = None;
+        let mut prev_audio_index: Option<usize> = None;
+
+        // ── Startup sequence ─────────────────────────────────────────────────
+        // 1. Open the buffer (for MSE: creates MediaSource, awaits sourceopen).
+        buf.open().await?;
+
+        // 2. Notify the buffer whether the stream is live.
+        let is_live = self.is_live();
+        buf.set_live_mode(is_live);
+
+        // 3. For live streams, set the presentation duration to +∞.
+        if is_live {
+            buf.set_duration(f64::INFINITY);
+        }
+
+        // 4. Add tracks to the buffer.  If the buffer rejects a MIME type
+        //    (e.g. HEVC on Chrome), disable that track for this session.
+        if let Some(track) = self.video_track.as_ref() {
+            let mime = track.current_mime.clone();
+            let ts_off = track.timestamp_offset_s;
+            let aw = track.append_window;
+            if buf.add_track(MediaType::Video, &mime) {
+                buf.set_timestamp_offset(MediaType::Video, ts_off);
+                buf.set_append_window(MediaType::Video, aw.0, aw.1);
+            } else {
+                tracing::warn!(
+                    mime = %mime,
+                    "video MIME type not supported — video track skipped (audio-only fallback)"
+                );
+                self.video_track = None;
+            }
+        }
+        if let Some(track) = self.audio_track.as_ref() {
+            let mime = track.current_mime.clone();
+            let ts_off = track.timestamp_offset_s;
+            let aw = track.append_window;
+            if buf.add_track(MediaType::Audio, &mime) {
+                buf.set_timestamp_offset(MediaType::Audio, ts_off);
+                buf.set_append_window(MediaType::Audio, aw.0, aw.1);
+            } else {
+                tracing::warn!(
+                    mime = %mime,
+                    "audio MIME type not supported — audio track skipped"
+                );
+                self.audio_track = None;
+            }
+        }
+
+        // Compute gate and done flags after potential track disable.
         let gate = if self.has_video() {
             MediaType::Video
         } else {
@@ -1597,24 +1674,11 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let mut video_done = !self.has_video();
         let mut audio_done = !self.has_audio();
 
-        // ── Startup sequence ─────────────────────────────────────────────────
-        // 1. Notify the media source whether the stream is live so it can
-        //    apply any platform-specific live-mode behaviour (e.g. GStreamer
-        //    PTS probe) before the pipeline transitions to Playing.
-        let is_live = self.is_live();
-        self.media_source.set_live_mode(is_live);
+        // Previous quality indices — used to detect switches and fire
+        // `on_quality_change`. `None` before the first fetch so that the
+        // initial quality selection does not count as a switch.
 
-        // 2. For live streams, set the presentation duration to +∞ so that the
-        //    browser's <video> element does not believe the stream has ended.
-        if is_live {
-            // Ignore errors — not all implementations enforce duration (e.g.
-            // GStreamer just stores the value; a Closed browser source would
-            // error but that case cannot arise here because open() was already
-            // called by from_url_with_clock).
-            let _ = self.media_source.set_duration(f64::INFINITY);
-        }
-
-        // 3. Fetch init segments if the caller has not already done so.
+        // 5. Fetch init segments if the caller has not already done so.
         //    `init_segment_sent` is set to `true` by `fetch_init_segment` and
         //    reset to `false` at period boundaries by `apply_track_reinit`.
         if self.has_video()
@@ -1623,7 +1687,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .as_ref()
                 .is_some_and(|t| !t.init_segment_sent)
         {
-            self.fetch_init_segment(MediaType::Video).await?;
+            self.fetch_init_segment(MediaType::Video, buf).await?;
         }
         if self.has_audio()
             && self
@@ -1631,20 +1695,18 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                 .as_ref()
                 .is_some_and(|t| !t.init_segment_sent)
         {
-            self.fetch_init_segment(MediaType::Audio).await?;
+            self.fetch_init_segment(MediaType::Audio, buf).await?;
         }
 
-        // 4. Optionally remap epoch-scale PTS so that the first live-edge
+        // 6. Optionally remap epoch-scale PTS so that the first live-edge
         //    segment lands at presentation time ≈ 0 in the browser.
         //    GStreamer clients must NOT request this (they use probe-based
         //    subtraction via set_live_mode(true)).
         if is_live && drv.wants_pts_remap() {
-            self.apply_live_pts_remap();
+            self.apply_live_pts_remap(buf);
         }
 
-        // 5. Notify the driver that startup is complete.  Drivers use this to:
-        //    - Seek the renderer to `start_s` (WASM pattern).
-        //    - Transition the pipeline to Playing (GStreamer pattern).
+        // 7. Notify the driver that startup is complete.
         let start_s = self.live_presentation_start_s();
         drv.on_session_started(start_s).await;
 
@@ -1667,14 +1729,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
 
             // ── 3. Optional pruning ──────────────────────────────────────────
             if drv.enable_pruning() {
-                self.prune_all_tracks(session_pos, self.buffer_to_keep_s())
+                self.prune_all_tracks(session_pos, self.buffer_to_keep_s(), buf)
                     .await?;
             }
 
             // ── 4. Gap controller ────────────────────────────────────────────
             {
                 let pos = drv.position_s();
-                let buffered = self.buffered(gate.clone());
+                let buffered = buf.buffered(gate.clone());
                 if let Some(target) = self.tick_gap(pos, &buffered, drv.playback_state()) {
                     tracing::info!(
                         pos,
@@ -1698,16 +1760,27 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let mut video_decision = None;
 
             if !video_done {
-                let mut m = self.current_metrics(MediaType::Video, pos);
+                let mut m = self.current_metrics(MediaType::Video, pos, buf);
                 if let Some(b) = bps {
                     m.throughput_bps = b;
                 }
-                match self.fetch_next_segment(MediaType::Video, &m).await {
-                    Ok(d) => {
+                match self.fetch_next_segment(MediaType::Video, &m, buf).await {
+                    Ok(FetchOutcome::Fetched(d)) => {
                         tracing::debug!(index = d.index, reason = ?d.reason, "video segment fetched");
+                        if let Some(prev) = prev_video_index {
+                            if prev != d.index {
+                                drv.on_quality_change(
+                                    MediaType::Video,
+                                    prev,
+                                    d.index,
+                                    d.reason.clone(),
+                                );
+                            }
+                        }
+                        prev_video_index = Some(d.index);
                         video_decision = Some(d);
                     }
-                    Err(DashError::EndOfStream { .. }) => {
+                    Ok(FetchOutcome::EndOfStream) => {
                         tracing::info!("video: end of stream");
                         video_done = true;
                     }
@@ -1735,16 +1808,27 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let mut audio_decision = None;
 
             if !audio_done {
-                let mut m = self.current_metrics(MediaType::Audio, pos);
+                let mut m = self.current_metrics(MediaType::Audio, pos, buf);
                 if let Some(b) = bps {
                     m.throughput_bps = b;
                 }
-                match self.fetch_next_segment(MediaType::Audio, &m).await {
-                    Ok(d) => {
+                match self.fetch_next_segment(MediaType::Audio, &m, buf).await {
+                    Ok(FetchOutcome::Fetched(d)) => {
                         tracing::debug!(index = d.index, reason = ?d.reason, "audio segment fetched");
+                        if let Some(prev) = prev_audio_index {
+                            if prev != d.index {
+                                drv.on_quality_change(
+                                    MediaType::Audio,
+                                    prev,
+                                    d.index,
+                                    d.reason.clone(),
+                                );
+                            }
+                        }
+                        prev_audio_index = Some(d.index);
                         audio_decision = Some(d);
                     }
-                    Err(DashError::EndOfStream { .. }) => {
+                    Ok(FetchOutcome::EndOfStream) => {
                         tracing::info!("audio: end of stream");
                         audio_done = true;
                     }
@@ -1796,7 +1880,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             });
         }
 
-        self.end_of_stream().await?;
+        self.end_of_stream(buf).await?;
         Ok(())
     }
 
@@ -1918,28 +2002,33 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         &mut self,
         current_time_s: f64,
         buffer_to_keep_behind_s: f64,
+        buf: &mut impl MediaBuffer,
     ) -> Result<(), DashError> {
         let prune_end = (current_time_s - buffer_to_keep_behind_s).max(0.0);
         if prune_end <= 0.0 {
             return Ok(());
         }
 
-        if let Some(track) = self.video_track.as_mut() {
-            Self::prune_sink(&mut track.sink, prune_end).await?;
+        if self.video_track.is_some() {
+            Self::prune_buffer(MediaType::Video, buf, prune_end).await?;
         }
-        if let Some(track) = self.audio_track.as_mut() {
-            Self::prune_sink(&mut track.sink, prune_end).await?;
+        if self.audio_track.is_some() {
+            Self::prune_buffer(MediaType::Audio, buf, prune_end).await?;
         }
         Ok(())
     }
 
-    async fn prune_sink(sink: &mut SourceBufferSink, prune_end: f64) -> Result<(), DashError> {
-        let ranges: Vec<_> = sink.buffered();
+    async fn prune_buffer(
+        mt: MediaType,
+        buf: &mut impl MediaBuffer,
+        prune_end: f64,
+    ) -> Result<(), DashError> {
+        let ranges: Vec<_> = buf.buffered(mt.clone());
         for range in ranges {
             if range.end <= prune_end {
-                sink.remove(range.start, range.end).await?;
+                buf.remove_range(mt.clone(), range.start, range.end).await?;
             } else if range.start < prune_end {
-                sink.remove(range.start, prune_end).await?;
+                buf.remove_range(mt.clone(), range.start, prune_end).await?;
             }
         }
         Ok(())
@@ -2066,6 +2155,21 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         self.mpd.mpdtype.as_deref() == Some("dynamic")
     }
 
+    /// Total presentation duration of the content in seconds.
+    ///
+    /// Returns `Some(seconds)` for VOD streams where
+    /// `MPD@mediaPresentationDuration` is set in the manifest, and `None`
+    /// for live streams or VOD manifests that omit the attribute.
+    ///
+    /// Useful for rendering progress bars, duration displays, and seek ranges.
+    pub fn duration_s(&self) -> Option<f64> {
+        if self.is_live() {
+            None
+        } else {
+            self.mpd.mediaPresentationDuration.map(|d| d.as_secs_f64())
+        }
+    }
+
     /// Returns the DASH presentation-timeline position (in seconds) at which
     /// the first live segment will be buffered in the MSE `SourceBuffer`.
     ///
@@ -2154,7 +2258,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// The offset is computed from the track state at the time of the call.
     /// Calling this a second time would re-apply the (now-zero) offset and
     /// be a no-op in practice, but it is intended to be called exactly once.
-    pub fn apply_live_pts_remap(&mut self) {
+    pub fn apply_live_pts_remap(&mut self, buf: &mut impl MediaBuffer) {
         if !self.is_live() {
             return;
         }
@@ -2188,12 +2292,16 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         );
 
         if let Some(track) = self.video_track.as_mut() {
-            let current = track.sink.timestamp_offset();
-            track.sink.set_timestamp_offset(current - offset_s);
+            let current = track.timestamp_offset_s;
+            let new_offset = current - offset_s;
+            buf.set_timestamp_offset(MediaType::Video, new_offset);
+            track.timestamp_offset_s = new_offset;
         }
         if let Some(track) = self.audio_track.as_mut() {
-            let current = track.sink.timestamp_offset();
-            track.sink.set_timestamp_offset(current - offset_s);
+            let current = track.timestamp_offset_s;
+            let new_offset = current - offset_s;
+            buf.set_timestamp_offset(MediaType::Audio, new_offset);
+            track.timestamp_offset_s = new_offset;
         }
 
         self.live_pts_remap_offset_s = offset_s;
@@ -2279,23 +2387,6 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// Each list is capped at 100 entries (oldest evicted first).
     pub fn metrics(&self) -> &DashMetrics {
         &self.dash_metrics
-    }
-
-    /// Buffered time ranges for the given media track, as reported by the
-    /// underlying [`SourceBufferSink`].
-    ///
-    /// In the WASM / MSE player these come directly from `SourceBuffer.buffered`
-    /// in the browser and reflect real decoded data.  In the stub and GStreamer
-    /// implementations they reflect chunks explicitly appended with timing
-    /// information.
-    ///
-    /// Returns an empty `Vec` when the track is absent.
-    pub fn buffered(&self, media_type: MediaType) -> Vec<crate::media_source::TimeRange> {
-        let track = match media_type {
-            MediaType::Video => self.video_track.as_ref(),
-            MediaType::Audio => self.audio_track.as_ref(),
-        };
-        track.map(|t| t.sink.buffered()).unwrap_or_default()
     }
 
     /// Returns the most recently decoded `ProducerReferenceTimeBox` (`prft`)
@@ -2667,25 +2758,24 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// When a live segment returns HTTP 404 (not yet generated), the call waits
     /// one segment duration and retries once before propagating the error.
     ///
-    /// Returns [`DashError::EndOfStream`] when all segments in all periods have
-    /// been fetched.
+    /// Returns [`FetchOutcome::EndOfStream`] when all segments in all periods
+    /// have been fetched.  Any other error is a real failure.
     pub async fn fetch_next_segment(
         &mut self,
         media_type: MediaType,
         metrics: &AbrMetrics,
-    ) -> Result<QualityDecision, DashError> {
+        buf: &mut impl MediaBuffer,
+    ) -> Result<FetchOutcome, DashError> {
         loop {
             match self
-                .fetch_next_segment_inner(media_type.clone(), metrics)
+                .fetch_next_segment_inner(media_type.clone(), metrics, buf)
                 .await
             {
                 Err(DashError::EndOfStream { .. }) => {
-                    if self.try_advance_period().await? {
+                    if self.try_advance_period(buf).await? {
                         continue; // retry with new period
                     }
-                    return Err(DashError::EndOfStream {
-                        media_type: media_type.to_string(),
-                    });
+                    return Ok(FetchOutcome::EndOfStream);
                 }
                 // Live segment not yet generated: wait one segment duration then
                 // retry once.  If still unavailable, propagate as AllBaseUrlsFailed.
@@ -2703,10 +2793,12 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     Delay::new(core::time::Duration::from_millis(seg_dur_ms as u64)).await;
                     // Single retry: if still 404, propagate the underlying error.
                     return self
-                        .fetch_next_segment_inner(media_type.clone(), metrics)
-                        .await;
+                        .fetch_next_segment_inner(media_type.clone(), metrics, buf)
+                        .await
+                        .map(FetchOutcome::Fetched);
                 }
-                other => return other,
+                Ok(decision) => return Ok(FetchOutcome::Fetched(decision)),
+                Err(e) => return Err(e),
             }
         }
     }
@@ -2719,6 +2811,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         &mut self,
         media_type: MediaType,
         metrics: &AbrMetrics,
+        buf: &mut impl MediaBuffer,
     ) -> Result<QualityDecision, DashError> {
         self.refresh_manifest_if_due().await;
 
@@ -2921,16 +3014,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
                     rep_id = %new_rep_id,
                     "quality switch: re-appending init segment from cache"
                 );
-                let chunk = Chunk::new(data, None, None, format!("{}/init", media_type));
-                let track = self.track_mut(&media_type)?;
-                track.sink.append(chunk).await?;
+                buf.append(media_type.clone(), data, true).await?;
             } else {
                 tracing::debug!(
                     media_type = %media_type,
                     rep_id = %new_rep_id,
                     "quality switch: init segment not cached, fetching"
                 );
-                self.fetch_init_segment(media_type.clone()).await?;
+                self.fetch_init_segment(media_type.clone(), buf).await?;
             }
         }
 
@@ -2939,7 +3030,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         // the block above did not run.  Ensure the init segment has been sent
         // before any media data reaches the source buffer.
         if !quality_switched && !self.track(&media_type)?.init_segment_sent {
-            self.fetch_init_segment(media_type.clone()).await?;
+            self.fetch_init_segment(media_type.clone(), buf).await?;
         }
 
         // ── SegmentBase: lazy sidx population ────────────────────────────────
@@ -3265,9 +3356,8 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             let (quality_index, buffer_level_ms) = {
                 let track = self.track(&media_type)?;
                 let position_s = self.estimated_playback_position_s();
-                let level = track
-                    .sink
-                    .buffered()
+                let level = buf
+                    .buffered(media_type.clone())
                     .last()
                     .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
                     .unwrap_or(0.0);
@@ -3349,16 +3439,10 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
             }
         }
 
-        let chunk = Chunk::new(
-            response.data,
-            sidx.map(|s| s.start_s),
-            sidx.map(|s| s.end_s),
-            format!("{}/{}", media_type, seg_number),
-        );
-
         {
+            let data = response.data;
+            buf.append(media_type.clone(), data, false).await?;
             let track = self.track_mut(&media_type)?;
-            track.sink.append(chunk).await?;
             track.segment_number += 1;
             if let Some((seg_time, seg_dur)) = maybe_timeline_info {
                 track.next_segment_time = Some(seg_time + seg_dur);
@@ -3378,7 +3462,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     ///
     /// When `Ok(false)` is returned, there are no more periods and the caller
     /// should propagate [`DashError::EndOfStream`].
-    async fn try_advance_period(&mut self) -> Result<bool, DashError> {
+    async fn try_advance_period(&mut self, buf: &mut impl MediaBuffer) -> Result<bool, DashError> {
         let next_idx = self.current_period_index + 1;
         if next_idx >= self.mpd.periods.len() {
             return Ok(false);
@@ -3418,16 +3502,14 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         // `self.mpd` immutable borrow ends here.
 
         let ms_duration = presentation_duration.map(|d| d.as_secs_f64());
-        let stream_info = StreamInfo {
-            start: period_start_s,
-            duration: effective_duration_s,
-        };
 
         if let (Some(ri), Some(track)) = (&video_reinit, self.video_track.as_mut()) {
-            apply_track_reinit(track, ri, &stream_info, ms_duration).await?;
+            let period_dur_s = effective_duration_s;
+            apply_track_reinit(track, ri, buf, period_start_s, period_dur_s, ms_duration).await?;
         }
         if let (Some(ri), Some(track)) = (&audio_reinit, self.audio_track.as_mut()) {
-            apply_track_reinit(track, ri, &stream_info, ms_duration).await?;
+            let period_dur_s = effective_duration_s;
+            apply_track_reinit(track, ri, buf, period_start_s, period_dur_s, ms_duration).await?;
         }
 
         // Fetch init segments for the new period's tracks.
@@ -3437,10 +3519,10 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         // dash.js's GapController.js.
         self.gap_controller.on_track_switch_started();
         if self.video_track.is_some() {
-            self.fetch_init_segment(MediaType::Video).await?;
+            self.fetch_init_segment(MediaType::Video, buf).await?;
         }
         if self.audio_track.is_some() {
-            self.fetch_init_segment(MediaType::Audio).await?;
+            self.fetch_init_segment(MediaType::Audio, buf).await?;
         }
         self.gap_controller.on_track_switch_ended();
 
@@ -3531,7 +3613,7 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     /// Uses the same CDN blacklist-aware candidate loop as
     /// [`Self::fetch_next_segment`] so that CDN fallback and blacklisting work
     /// identically for init segments.
-    pub async fn fetch_init_segment(&mut self, media_type: MediaType) -> Result<usize, DashError> {
+    pub async fn fetch_init_segment(&mut self, media_type: MediaType, buf: &mut impl MediaBuffer) -> Result<usize, DashError> {
         let (init_path, candidates, byte_range, rep_id) = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];
@@ -3622,11 +3704,10 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
         let cache_key = format!("{}/{}", media_type, rep_id);
         self.init_cache.insert(cache_key, response.data.clone());
 
-        let chunk = Chunk::new(response.data, None, None, format!("{}/init", media_type));
+        buf.append(media_type.clone(), response.data, true).await?;
 
         {
             let track = self.track_mut(&media_type)?;
-            track.sink.append(chunk).await?;
             track.init_segment_sent = true;
         }
 
@@ -3640,9 +3721,9 @@ impl<F: SegmentFetcher, M: MediaSource> DashSession<F, M> {
     }
 
     /// Signal that no more segments will be appended.
-    pub async fn end_of_stream(&mut self) -> Result<(), DashError> {
+    pub async fn end_of_stream(&mut self, buf: &mut impl MediaBuffer) -> Result<(), DashError> {
         tracing::info!("signalling end of stream");
-        self.media_source.end_of_stream().await
+        buf.end_of_stream().await
     }
 
     // ── Private helpers ───────────────────────────────────────────────────────

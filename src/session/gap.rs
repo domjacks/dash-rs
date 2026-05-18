@@ -58,7 +58,7 @@
 //!   Call `DashSession::seek_to(period_end_s)` manually in the application
 //!   if needed.
 
-use crate::media_source::TimeRange;
+use crate::media_buffer::TimeRange;
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -164,7 +164,7 @@ pub struct GapSeekTarget {
 ///
 /// ```
 /// use dash_rs::session::{GapController, GapSeekTarget};
-/// use dash_rs::media_source::TimeRange;
+/// use dash_rs::media_buffer::TimeRange;
 ///
 /// let mut gap_ctrl = GapController::new();
 ///

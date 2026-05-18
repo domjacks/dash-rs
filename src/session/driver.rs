@@ -17,7 +17,7 @@ use async_trait::async_trait;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String};
 
-use crate::{abr::QualityDecision, session::GapSeekTarget};
+use crate::{abr::{AbrDecisionReason, QualityDecision}, session::{GapSeekTarget, MediaType}};
 
 // ── PlaybackState ─────────────────────────────────────────────────────────────
 
@@ -141,11 +141,33 @@ pub struct IterationSummary<'a> {
 /// Every method except [`position_s`][Self::position_s] has a sensible default
 /// so you only need to override what your platform actually requires.
 ///
+/// # Required annotation: `#[async_trait(?Send)]`
+///
+/// This trait uses `async-trait` and **must** be implemented with the
+/// `?Send` variant:
+///
+/// ```rust,ignore
+/// use async_trait::async_trait;
+/// use dash_rs::PlaybackDriver;
+///
+/// struct MyDriver;
+///
+/// #[async_trait(?Send)]   // ← the ?Send is required
+/// impl PlaybackDriver for MyDriver {
+///     fn position_s(&self) -> f64 { 0.0 }
+/// }
+/// ```
+///
+/// Using `#[async_trait]` (without `?Send`) produces a cryptic
+/// "associated type not found" compile error.  The `?Send` bound is
+/// required because `dash-rs` targets `wasm32-unknown-unknown` where most
+/// types are not `Send`.
+///
 /// # Minimal implementation
 ///
 /// ```rust,ignore
 /// use async_trait::async_trait;
-/// use dash_rs::session::driver::{IterationSummary, PlaybackDriver};
+/// use dash_rs::PlaybackDriver;
 ///
 /// struct MyDriver;
 ///
@@ -269,6 +291,35 @@ pub trait PlaybackDriver {
     ///
     /// Default: no-op.
     fn on_iteration_start(&mut self, _session_position_s: f64) {}
+
+    /// Called immediately when the ABR controller switches to a different
+    /// quality level during a fetch.
+    ///
+    /// This fires **before** [`on_iteration`][Self::on_iteration] in the same
+    /// loop iteration so that drivers can react to the switch (e.g. update a
+    /// bitrate indicator) as soon as it happens.
+    ///
+    /// Only fires on actual switches — if the ABR controller selects the same
+    /// index as the previous fetch, this method is not called.  It also does
+    /// not fire for the **first** segment fetch (there is no previous index to
+    /// switch from).
+    ///
+    /// # Arguments
+    ///
+    /// - `media_type` — which track switched (`Video` or `Audio`).
+    /// - `old_index` — representation index that was active before the switch.
+    /// - `new_index` — representation index just selected.
+    /// - `reason` — why the ABR controller chose the new index.
+    ///
+    /// Default: no-op.
+    fn on_quality_change(
+        &mut self,
+        _media_type: MediaType,
+        _old_index: usize,
+        _new_index: usize,
+        _reason: AbrDecisionReason,
+    ) {
+    }
 
     /// Called after **both** tracks have been fetched (or skipped at EOS).
     ///

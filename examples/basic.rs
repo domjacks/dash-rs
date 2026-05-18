@@ -13,7 +13,7 @@ use async_trait::async_trait;
 use dash_rs::{
     fetch::stub::StubSegmentFetcher,
     manifest::MPD,
-    media_source::stub::StubMediaSource,
+    media_buffer::NullBuffer,
     session::driver::{IterationSummary, PlaybackDriver},
     DashError, Player,
 };
@@ -54,17 +54,12 @@ async fn main() -> Result<(), DashError> {
         .with_max_level(tracing::Level::DEBUG)
         .init();
 
-    // 1. Create a stub media source (replaces the browser's MediaSource API).
-    //    `StubMediaSource` starts as Open by default — no explicit `open()`
-    //    call is needed.
-    let media_source = StubMediaSource::new();
-
-    // 2. Parse the MPD.  In a real application you would call
+    // 1. Parse the MPD.  In a real application you would call
     //    `Player::from_url` instead.
     let base_url = Url::parse("https://example.com/").unwrap();
     let mpd: MPD = dash_rs::manifest::parse(EXAMPLE_MPD).map_err(DashError::ManifestParse)?;
 
-    // 3. Simulate a short fetch loop — 5 segments per track — via PlaybackDriver.
+    // 2. Simulate a short fetch loop — 5 segments per track — via PlaybackDriver.
     //    Throughput escalates each iteration so the ABR controller should step
     //    up quality over time.
 
@@ -118,9 +113,9 @@ async fn main() -> Result<(), DashError> {
     }
 
     let fetcher = Arc::new(StubSegmentFetcher);
-    let mut player = Player::from_mpd(mpd, base_url, fetcher, media_source, BasicPlaybackDriver { seg: 0 })?;
+    let mut player = Player::from_mpd(mpd, base_url, fetcher, NullBuffer, BasicPlaybackDriver { seg: 0 })?;
 
-    // 4. Inspect available representations before starting the loop.
+    // 3. Inspect available representations before starting the loop.
     println!("=== Video representations ===");
     for (i, rep) in player.session().video_representations().iter().enumerate() {
         println!(

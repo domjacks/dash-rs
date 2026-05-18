@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
-    media_source::stub::StubMediaSource,
+    media_buffer::NullBuffer,
     session::driver::{IterationSummary, PlaybackDriver},
     DashError, Player,
 };
@@ -216,13 +216,7 @@ async fn main() -> Result<(), DashError> {
     // 1. Shared throughput tracker — the fetcher writes it; the loop reads it.
     let throughput_tracker = Arc::new(AtomicU64::new(0u64));
 
-    // 2. Open a stub media source.  No real decoder is attached; bytes are
-    //    appended through the full MSE abstraction and then discarded.
-    //    `StubMediaSource` starts as Open by default — no explicit `open()`
-    //    call is needed.
-    let media_source = StubMediaSource::new();
-
-    // 3. Build the driver before `Player::from_url` so we can move
+    // 2. Build the driver before `Player::from_url` so we can move
     //    `throughput_tracker` into it.  No session state is needed at
     //    construction time.
     let driver = HttpPlaybackDriver {
@@ -231,11 +225,11 @@ async fn main() -> Result<(), DashError> {
         last_transfer_ms: 0.0,
     };
 
-    // 4. Fetch and parse the MPD, then wrap into a Player.
+    // 3. Fetch and parse the MPD, then wrap into a Player.
     let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
-    let mut player = Player::from_url(&manifest_url, fetcher, media_source, driver).await?;
+    let mut player = Player::from_url(&manifest_url, fetcher, NullBuffer, driver).await?;
 
-    // 5. Print available representations.
+    // 4. Print available representations.
     if player.session().has_video() {
         println!("=== Video representations ===");
         for (i, rep) in player.session().video_representations().iter().enumerate() {
@@ -264,7 +258,7 @@ async fn main() -> Result<(), DashError> {
     }
     println!();
 
-    // 6. run() fetches until should_continue() returns false, then calls
+    // 5. run() fetches until should_continue() returns false, then calls
     //    end_of_stream() and returns.
     println!("=== Fetching {SEGMENTS_TO_FETCH} segments ===");
     println!(

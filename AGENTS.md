@@ -16,7 +16,7 @@ cargo test
 
 # A single integration suite
 cargo test --test abr_rules
-cargo test --test media_source
+cargo test --test media_buffer
 
 # Doc-tests only
 cargo test --doc
@@ -76,7 +76,7 @@ export PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/bin:$PATH"
 
 ### Async traits use `async-trait`
 
-All `async fn` methods on `SourceBuffer`, `MediaSource`, and `SegmentFetcher`
+All `async fn` methods on `MediaBuffer`, `SegmentFetcher`, and `PlaybackDriver`
 are defined with the `#[async_trait]` macro.  Implementations must import and
 apply it:
 
@@ -84,7 +84,7 @@ apply it:
 use async_trait::async_trait;
 
 #[async_trait(?Send)]
-impl SourceBuffer for MyBuffer { … }
+impl MediaBuffer for MyBuffer { … }
 ```
 
 Forgetting the macro, or using `#[async_trait]` (without `?Send`), produces
@@ -125,22 +125,22 @@ the one that appears **first in document order** is preferred.  This is
 implemented by using `(bandwidth, usize::MAX - index)` as the composite key
 in `max_by_key` inside `find_adaptation` (`src/session/mpd.rs`).
 
-### `MediaSource::is_type_supported` — graceful track skip
+### `MediaBuffer::add_track` — graceful track skip
 
-`MediaSource` has a default method `is_type_supported(&self, mime_type: &str) -> bool`
-that returns `true` for all types (preserving existing GStreamer / stub behaviour).
+`MediaBuffer` has a method `add_track(&mut self, mt: MediaType, mime_type: &str) -> bool`
+that returns `true` by default (in `NullBuffer` / `StubBuffer`).
 
-`from_mpd_with_utc` calls `is_type_supported` on the constructed MIME string
-**before** calling `add_source_buffer`.  If it returns `false`:
+`run()` calls `add_track` on the constructed MIME string **before** beginning
+segment fetching.  If it returns `false`:
 
-- Video track: a `warn!` is emitted and `video_track` is set to `None`.
+- Video track: a `warn!` is emitted and the video track is disabled.
   The session continues as audio-only.
-- Audio track: a `warn!` is emitted and `audio_track` is set to `None`.
+- Audio track: a `warn!` is emitted and the audio track is disabled.
 
-The `BridgeMediaSource` in `examples/wasm_player/src/media_source.rs` overrides
-this method to delegate to `MediaSource.isTypeSupported()` in the browser, so
+`BridgeMediaBuffer` in `examples/wasm_player/src/media_buffer.rs` delegates
+to `MediaSource.isTypeSupported()` in the browser inside `add_track`, so
 HEVC streams on Chrome/Firefox fall back to audio-only rather than crashing
-with a `NotSupportedError` from `addSourceBuffer`.
+with a `NotSupportedError`.
 
 Per-representation filtering (within a single `AdaptationSet` that mixes
 supported and unsupported codecs) is tracked as P2-14 in `COMPLIANCE.md`.
@@ -152,26 +152,23 @@ mutably borrowed.  Call `record_switch` separately after a quality change has
 actually been applied to track state.  See `DashSession::fetch_next_segment`
 for the correct pattern.
 
-### `StubSourceBuffer` only tracks timed chunks in `buffered()`
+### `StubBuffer` only tracks chunk count; `buffered()` always returns `[]`
 
-Init segments (`Chunk { start: None, end: None }`) are accepted without error
-but are not reflected in `buffered()`.  This matches the MSE spec — init
-segments do not advance the buffered range.
+`StubBuffer` records every appended `Bytes` object in `video_chunks` /
+`audio_chunks` but does not parse fMP4 timing, so `buffered()` always returns
+an empty list.  This matches the expected behaviour — init segments do not
+advance the buffered range, and media segment timing requires parsing the `sidx`
+box.
 
-### `StubMediaSource` starts as `ReadyState::Open`
+### `NullBuffer` — silent discard
 
-`StubMediaSource::new()` initialises the ready state to `Open` so that tests
-and stub-based examples do not require an explicit `media_source.open()` call.
-`open()` is still available — calling it on an already-open stub is a no-op.
-`DashSession::from_url` / `from_url_with_clock` call `media_source.open()`
-themselves, so production callers using `BridgeMediaSource` or
-`GstMediaSource` also require no manual `open()` call.
+`NullBuffer::new()` is ready to use immediately.  All methods use the default
+no-op implementations.  Use it for headless tests, benchmarks, and the
+`basic` / `http_fetch` examples.
 
-### `MediaSource` trait — default method behaviour
-
-There is no explicit queue struct.  Concurrent callers must not interleave
-`await` points across two `append` calls on the same sink.  Use a single
-`async` task or a mutex if multiple producers exist.
+`DashSession::from_url` / `from_url_with_clock` call `buf.open()` themselves,
+so callers using `BridgeMediaBuffer` or `GstMediaBuffer` require no manual
+`open()` call.
 
 ### `PlaybackDriver` — primary integration pattern
 
@@ -243,6 +240,19 @@ impl PlaybackDriver for MyDriver {
             s.video_buffer_ms / 1000.0,
         );
     }
+
+    // Optional: called when the ABR controller switches quality on a track.
+    // `prev_index` and `new_index` are indices into the representation list
+    // (0 = lowest quality).  Default is a no-op.
+    fn on_quality_change(
+        &mut self,
+        media_type: MediaType,
+        prev_index: usize,
+        new_index: usize,
+        reason: AbrDecisionReason,
+    ) {
+        println!("{media_type:?} quality switch {prev_index} → {new_index} ({reason:?})");
+    }
 }
 ```
 
@@ -253,8 +263,8 @@ session.run(&mut MyDriver { position_s: 0.0 }).await?;
 ```
 
 `run()` performs the full startup sequence before entering the fetch loop:
-`media_source.open()` → `set_live_mode(true)` (live only) →
-`set_duration(INFINITY)` (live only) → `fetch_init_segment` for each track →
+`buf.open()` → `set_live_mode(true)` (live only) →
+`set_duration(INFINITY)` (live only) → `add_track` for each track →
 `apply_live_pts_remap()` (live + `wants_pts_remap()`) →
 `on_session_started(live_presentation_start_s)` → `notify_playing()`.
 
@@ -270,6 +280,12 @@ what your platform actually requires.  A headless test driver needs only:
 fn position_s(&self) -> f64 { 0.0 }
 ```
 
+**`async_trait(?Send)` is required.** Implementations must be annotated with
+`#[async_trait(?Send)]` (note the `?Send`).  Using `#[async_trait]` without
+`?Send` produces a cryptic "associated type not found" compile error.  The
+`?Send` bound is mandatory because the library targets `wasm32-unknown-unknown`
+where most types are not `Send`.
+
 ### `Player` — single-type convenience wrapper
 
 `Player<F, M, D>` in `src/player.rs` owns both a `DashSession<F, M>` and a
@@ -277,16 +293,17 @@ fn position_s(&self) -> f64 { 0.0 }
 
 ```rust
 // From a URL (most common path):
-Player::from_url(&url, fetcher, media_source, MyDriver::new()).await?.run().await?;
+Player::from_url(&url, fetcher, buf, MyDriver::new()).await?.run().await?;
 
 // With a custom clock (WASM / no-std):
-Player::from_url_with_clock(&url, fetcher, ms, driver, clock).await?.run().await?;
+Player::from_url_with_clock(&url, fetcher, buf, driver, clock).await?.run().await?;
 
 // From an already-parsed MPD (tests / offline scenarios):
-Player::from_mpd(mpd, base_url, Arc::new(fetcher), ms, MyDriver::new())?.run().await?;
+// Note: from_mpd takes F directly — it wraps with Arc::new internally.
+Player::from_mpd(mpd, base_url, fetcher, buf, MyDriver::new())?.run().await?;
 
 // From an already-parsed MPD with a custom clock:
-Player::from_mpd_with_clock(mpd, base_url, Arc::new(fetcher), ms, driver, clock)?.run().await?;
+Player::from_mpd_with_clock(mpd, base_url, fetcher, buf, driver, clock)?.run().await?;
 ```
 
 To inspect representations before starting the loop, use `player.session()`:
@@ -305,6 +322,15 @@ let last_ms = player.driver().last_transfer_ms;
 // Or take ownership of both:
 let (session, driver) = player.into_parts();
 ```
+
+`Player` also exposes convenience forwarders so you rarely need to call through
+`.session()` for common operations:
+
+| Method | Forwards to |
+|---|---|
+| `player.is_live()` | `session.is_live()` |
+| `player.duration_s()` | `session.duration_s()` — `Some(secs)` for VOD, `None` for live |
+| `player.seek_to(pos_s)` | `session.seek_to(pos_s)` — snaps to nearest segment boundary |
 
 **`IterationSummary` carries session context the driver might need** so that
 most drivers do not have to query the session at construction time:
@@ -439,7 +465,7 @@ The first live-edge segment now lands at presentation time ≈ 0 in the browser.
 so `bridge.seekTo(0)` is a trivial seek that every browser handles.
 
 **GStreamer clients must NOT call `apply_live_pts_remap()`**.  They use
-`GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction).
+`GstMediaBuffer::set_live_mode(true)` (probe-based PTS subtraction).
 Double-applying would shift timestamps by twice the offset and corrupt decoding.
 
 `seek_to` accounts for remapped streams: `position_s` is received in remapped
@@ -453,10 +479,9 @@ is 0.0 (VOD or non-remapped live streams).
 and callers that need to convert between coordinate spaces.
 
 `DashSession::buffered(media_type)` returns the current buffered time ranges
-from the track's `SourceBufferSink`, delegating to the underlying
-`SourceBuffer::buffered()`.  Used by the WASM player's `tick_gap` call to pass
-real-time buffered ranges to the gap controller.  Returns an empty `Vec` when
-the track is absent.
+from the `MediaBuffer`, delegating to `MediaBuffer::buffered(mt)`.  Used by
+the WASM player's `tick_gap` call to pass real-time buffered ranges to the gap
+controller.  Returns an empty `Vec` when the track is absent.
 
 ### `timestampOffset` formula (DASH spec §5.3.9.6)
 
@@ -542,13 +567,13 @@ and if a seek is recommended it calls `session.seek_to()` then
 controller manually:
 
 ```rust
-session.media_source_mut().set_playing()?;
+// GStreamer: transition the pipeline to Playing in GstPlaybackDriver::on_session_started()
 session.notify_playing();
 
 // In your fetch / UI loop (e.g. every 200 ms):
 let target = session.tick_gap(
     renderer_position_s,    // from GStreamer query_position or equivalent
-    &source_buffer_ranges,  // union of SourceBuffer::buffered() across tracks
+    &buffered_ranges,       // from MediaBuffer::buffered() per track, merged
     driver.playback_state(),
 );
 if let Some(t) = target {
@@ -565,7 +590,7 @@ The **period-end stall jump** (dash.js: `timeToStreamEnd < smallGapLimit → see
 to stream end`) is not yet implemented in `GapController`.  If a live stream
 stalls at a period boundary, call `session.seek_to(period_end_s)` manually.
 
-### `GstSourceBuffer` / `GstMediaSource` known gaps and workarounds
+### `GstMediaBuffer` / GStreamer known gaps and workarounds
 
 - **Absolute-timestamp live streams (BBC CMAF)**: `DashSession::from_mpd_with_utc`
   snaps `next_segment_time` to the live-edge aligned position in the actual
@@ -576,15 +601,14 @@ stalls at a period boundary, call `session.seek_to(period_end_s)` manually.
   returns the snapped tick value divided by the timescale for Timeline tracks, so
   the WASM player's `seekTo()` call is accurate.
   For GStreamer (`sink-gstreamer` feature), absolute-timestamp PTS remapping is
-  handled by `GstMediaSource::set_live_mode(true)` (probe-based PTS subtraction) —
+  handled by `GstMediaBuffer::set_live_mode(true)` (probe-based PTS subtraction) —
   call it after `DashSession::from_url` and before `set_playing` whenever
   `session.is_live()`.
-- `buffered()` only tracks ranges from chunks whose `Chunk::start`/`end` are set.
-  DASH segments currently do not carry timing (they are set to `None`), so the
-  buffer-occupancy ABR rule sees an empty range.  Work-around: parse the fMP4
-  `sidx` box to extract timing before building the `Chunk`.
-- `remove()` does not flush GStreamer's downstream queue; it only removes the
-  locally tracked time range.
+- `buffered()` always returns `vec![]` for `GstMediaBuffer` — GStreamer does not
+  expose buffered time ranges in the MSE sense.  Use `ThroughputRule` (via
+  `throughput_override_bps`) for quality selection in GStreamer builds.
+- `remove_range()` is a no-op for `GstMediaBuffer`; GStreamer manages its own
+  internal buffer.
 - `change_type()` does not renegotiate caps with GStreamer at runtime.
 
 ---
@@ -619,19 +643,19 @@ Each rule lives in its own file under `src/abr/`.  Rules must:
 - Be registered in `AbrController::default()` in `src/abr/mod.rs`.
 - Have unit tests in `tests/abr_rules.rs`.
 
-### Adding a `MediaSource` or `SourceBuffer` implementation
+### Adding a `MediaBuffer` implementation
 
 Concrete implementations that are only needed by a specific example belong
 **alongside that example**, not in `src/`.  Create an
 `examples/<example-name>/` subdirectory, put the implementation in its own
-file (e.g. `examples/gstreamer_player/gst_media_source.rs`), and declare it
-as a module from `main.rs` (`mod gst_media_source;`).  Import the library
-traits via `dash_rs::media_source::{MediaSource, SourceBuffer, …}`.
+file (e.g. `examples/gstreamer_player/gst_media_buffer.rs`), and declare it
+as a module from `main.rs` (`mod gst_media_buffer;`).  Import the library
+traits via `dash_rs::media_buffer::{MediaBuffer, TimeRange}`.
 
 Only promote an implementation into `src/` if it is intended to be reusable
 by downstream crates.
 
-Do not modify `src/media_source/mod.rs` (the trait definitions) unless the
+Do not modify `src/media_buffer.rs` (the trait definitions) unless the
 MSE spec requires a new method.
 
 ### Adding a `SegmentFetcher` implementation
@@ -666,10 +690,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Platform-agnostic monotonic clock helper | `src/time.rs` |
 | ABR rule trait | `src/abr/rule.rs` |
 | ABR controller | `src/abr/mod.rs` |
-| `MediaSource` / `SourceBuffer` traits | `src/media_source/mod.rs` |
-| Append queue + window management | `src/media_source/sink.rs` |
-| In-memory stub implementations | `src/media_source/stub.rs` |
-| GStreamer `MediaSource` / `SourceBuffer` (`sink-gstreamer` feature) | `examples/gstreamer_player/gst_media_source.rs` |
+| `MediaBuffer` trait + `NullBuffer` + `StubBuffer` | `src/media_buffer.rs` |
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
@@ -690,17 +711,17 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | XS datetime parser (`parse_xs_datetime`) | `src/util.rs` |
 | ISO BMFF box parsing (`sidx` timing, `sidx` byte-range index, `emsg`) | `src/mp4.rs` |
 | ABR unit tests | `tests/abr_rules.rs` |
-| MSE abstraction tests | `tests/media_source.rs` |
+| `MediaBuffer` abstraction tests | `tests/media_buffer.rs` |
 | Live-stream API + SegmentTimeline + UTCTiming + emsg tests | `tests/session.rs` |
 | Stub end-to-end example | `examples/basic.rs` |
 | Real HTTP fetch example | `examples/http_fetch.rs` |
 | GStreamer full-playback example | `examples/gstreamer_player/main.rs` |
+| GStreamer `MediaBuffer` (`GstMediaBuffer`) | `examples/gstreamer_player/gst_media_buffer.rs` |
 | GStreamer HTTP fetcher (`HttpSegmentFetcher`) | `examples/gstreamer_player/fetcher.rs` |
 | GStreamer playback driver (`GstPlaybackDriver`) | `examples/gstreamer_player/driver.rs` |
 | WASM player bridge types (`JsBridge` extern, `js_err`) | `examples/wasm_player/src/bridge.rs` |
 | WASM player clock (`BridgeClock`) | `examples/wasm_player/src/clock.rs` |
-| WASM player source buffer (`BridgeSourceBuffer`) | `examples/wasm_player/src/source_buffer.rs` |
-| WASM player media source (`BridgeMediaSource`) | `examples/wasm_player/src/media_source.rs` |
+| WASM player `MediaBuffer` (`BridgeMediaBuffer`) | `examples/wasm_player/src/media_buffer.rs` |
 | WASM player fetcher (`FetchResult` extern, `BridgeFetcher`) | `examples/wasm_player/src/fetcher.rs` |
 | WASM player driver (`WasmPlaybackDriver`) | `examples/wasm_player/src/driver.rs` |
 | WASM player entry points (`init`, `play`) | `examples/wasm_player/src/lib.rs` |
@@ -713,9 +734,9 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 | dash.js | dash-rs |
 |---|---|
-| `ExternalMediaSource.js` | `media_source::MediaSource` trait + `stub::StubMediaSource` |
-| `ExternalSourceBuffer.js` | `media_source::SourceBuffer` trait + `stub::StubSourceBuffer` |
-| `SourceBufferSink.js` | `media_source::sink::SourceBufferSink` |
+| `ExternalMediaSource.js` | `media_buffer::MediaBuffer` trait + `NullBuffer` + `StubBuffer` |
+| `ExternalSourceBuffer.js` | `media_buffer::MediaBuffer::append` / `remove_range` / `change_type` |
+| `SourceBufferSink.js` | Inlined into `DashSession` — no separate sink struct |
 | `FragmentLoader.js` / `URLLoader.js` | `fetch::SegmentFetcher` trait + `fetch::stub::StubSegmentFetcher` |
 | `ManifestLoader.js` | `manifest::ManifestLoader` |
 | `XlinkController.js` / `XlinkLoader.js` | `session::xlink::resolve_xlinks` (called automatically inside `DashSession::from_url`) |

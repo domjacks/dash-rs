@@ -16,18 +16,7 @@ pub enum DashError {
     #[error("manifest is empty or contains no periods")]
     EmptyManifest,
 
-    // --- Media source errors ---
-    #[error("media source is not open (ready state: {state:?})")]
-    MediaSourceNotOpen {
-        state: crate::media_source::ReadyState,
-    },
-
-    #[error("source buffer not found for mime type: {mime_type}")]
-    SourceBufferNotFound { mime_type: String },
-
-    #[error("source buffer is currently updating")]
-    SourceBufferUpdating,
-
+    // --- Media buffer errors ---
     #[error("append failed: {0}")]
     AppendFailed(String),
 
@@ -44,20 +33,19 @@ pub enum DashError {
     #[error("invalid time range: start={start} end={end}")]
     InvalidTimeRange { start: f64, end: f64 },
 
-    /// All segments for this track have been fetched.
-    ///
-    /// Returned by [`crate::session::DashSession::fetch_next_segment`] once the
-    /// segment number advances past the total derived from
-    /// `MPD@mediaPresentationDuration`.  The caller should call
-    /// [`crate::session::DashSession::end_of_stream`] and stop the fetch loop.
-    #[error("end of stream: no more segments for {media_type}")]
-    EndOfStream { media_type: String },
-
     /// Every `BaseURL` candidate for a segment was tried and all failed.
     ///
     /// The last underlying error is included for diagnostics.
     #[error("all CDN base URLs failed for segment (last error: {last_error})")]
     AllBaseUrlsFailed { last_error: String },
+
+    /// Internal sentinel used by `fetch_next_segment_inner` to signal
+    /// period-boundary end-of-stream.  Converted to
+    /// [`crate::session::FetchOutcome::EndOfStream`] at the public
+    /// `fetch_next_segment` boundary and should never escape to callers.
+    #[doc(hidden)]
+    #[error("end of stream: no more segments for {media_type}")]
+    EndOfStream { media_type: String },
 
     /// A segment fetch was abandoned because it was taking too long.
     ///
