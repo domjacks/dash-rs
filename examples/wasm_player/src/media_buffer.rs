@@ -14,8 +14,6 @@ use dash_rs::{
     session::MediaType,
 };
 use js_sys::Uint8Array;
-use wasm_bindgen::JsCast;
-use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::bridge::{js_err, JsBridge};
