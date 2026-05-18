@@ -17,11 +17,7 @@ use crate::abr::RepresentationInfo;
 #[cfg(not(feature = "std"))]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
-use alloc::{
-    borrow::ToOwned,
-    string::String,
-    vec::Vec,
-};
+use alloc::{borrow::ToOwned, string::String, vec::Vec};
 
 // ── Public helpers ────────────────────────────────────────────────────────────
 
@@ -520,8 +516,8 @@ mod tests {
 mod extended_tests {
     use super::*;
     use crate::manifest::mpd_types::{
-        AdaptationSet, BaseURL, Period, Representation, SegmentBase, SegmentList,
-        SegmentTemplate, SegmentTimeline, SegmentURL, S,
+        AdaptationSet, BaseURL, Period, Representation, SegmentBase, SegmentList, SegmentTemplate,
+        SegmentTimeline, SegmentURL, S,
     };
     use crate::session::MediaType;
 

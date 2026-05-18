@@ -57,8 +57,8 @@ pub use url::Url;
 pub use url_type::Url;
 
 // Top-level re-exports for the most commonly used types.
-pub use abr::{AbrController, AbrDecisionReason, AbrMetrics, QualityDecision};
 pub use abr::rule::RepresentationInfo;
+pub use abr::{AbrController, AbrDecisionReason, AbrMetrics, QualityDecision};
 pub use clock::Clock;
 #[cfg(feature = "std")]
 pub use clock::SystemClock;
@@ -66,9 +66,9 @@ pub use error::DashError;
 pub use fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
 pub use manifest::MPD;
 pub use media_buffer::{MediaBuffer, NullBuffer, StubBuffer, StubChunk, TimeRange};
-pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 #[cfg(feature = "events")]
 pub use mp4::parse_all_emsg;
+pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 pub use player::Player;
 pub use session::driver::{IterationSummary, PlaybackDriver, PlaybackState};
 #[cfg(feature = "events")]

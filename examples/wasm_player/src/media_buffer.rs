@@ -145,11 +145,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         _is_init: bool,
     ) -> Result<(), DashError> {
         let id = self.sb_id(mt)?.to_owned();
-        tracing::debug!(
-            ?mt,
-            bytes = data.len(),
-            "BridgeMediaBuffer: appendBuffer"
-        );
+        tracing::debug!(?mt, bytes = data.len(), "BridgeMediaBuffer: appendBuffer");
         let array = Uint8Array::from(data.as_ref());
         JsFuture::from(self.bridge.append_buffer(&id, &array))
             .await
@@ -157,12 +153,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         Ok(())
     }
 
-    async fn remove_range(
-        &mut self,
-        mt: MediaType,
-        start: f64,
-        end: f64,
-    ) -> Result<(), DashError> {
+    async fn remove_range(&mut self, mt: MediaType, start: f64, end: f64) -> Result<(), DashError> {
         let id = self.sb_id(mt)?.to_owned();
         tracing::debug!(?mt, start, end, "BridgeMediaBuffer: remove");
         JsFuture::from(self.bridge.remove_range(&id, start, end))

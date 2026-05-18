@@ -76,7 +76,11 @@ impl PlaybackDriver for GstPlaybackDriver {
             return None;
         }
         let bps = f64::from_bits(raw);
-        if bps > 0.0 { Some(bps) } else { None }
+        if bps > 0.0 {
+            Some(bps)
+        } else {
+            None
+        }
     }
 
     fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {

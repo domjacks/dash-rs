@@ -81,14 +81,13 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
     /// Call [`Self::from_url_with_clock`] to inject a custom clock (e.g. on
     /// WASM where `std::time::Instant` is unavailable).
     #[cfg(feature = "std")]
-    pub async fn from_url(
-        url: &Url,
-        fetcher: F,
-        buf: S,
-        driver: D,
-    ) -> Result<Self, DashError> {
+    pub async fn from_url(url: &Url, fetcher: F, buf: S, driver: D) -> Result<Self, DashError> {
         let session = DashSession::from_url(url, fetcher).await?;
-        Ok(Self { session, buf, driver })
+        Ok(Self {
+            session,
+            buf,
+            driver,
+        })
     }
 
     /// Like [`Self::from_url`] but accepts a custom [`Clock`] implementation.
@@ -103,7 +102,11 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
         let session = DashSession::from_url_with_clock(url, fetcher, clock).await?;
-        Ok(Self { session, buf, driver })
+        Ok(Self {
+            session,
+            buf,
+            driver,
+        })
     }
 
     /// Wrap an already-parsed `mpd` into a `Player` ready to
@@ -124,7 +127,11 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         driver: D,
     ) -> Result<Self, DashError> {
         let session = DashSession::from_mpd(mpd, base_url, fetcher)?;
-        Ok(Self { session, buf, driver })
+        Ok(Self {
+            session,
+            buf,
+            driver,
+        })
     }
 
     /// Like [`Self::from_mpd`] but accepts a custom [`Clock`] implementation.
@@ -141,7 +148,11 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
         let session = DashSession::from_mpd_with_clock(mpd, base_url, fetcher, clock)?;
-        Ok(Self { session, buf, driver })
+        Ok(Self {
+            session,
+            buf,
+            driver,
+        })
     }
 
     // ── Playback ──────────────────────────────────────────────────────────────

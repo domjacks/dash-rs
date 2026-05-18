@@ -435,7 +435,8 @@ async fn apply_track_reinit(
         buf.change_type(track._media_type.clone(), &ri.mime).await?;
         track.current_mime = ri.mime.clone();
     }
-    let (ws, we) = compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
+    let (ws, we) =
+        compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
     buf.set_append_window(track._media_type.clone(), ws, we);
     buf.set_timestamp_offset(track._media_type.clone(), ri.timestamp_offset_s);
     track.timestamp_offset_s = ri.timestamp_offset_s;
@@ -817,8 +818,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         let client_now_s = clock.unix_s();
         let utc_offset = utc::resolve_utc_timing(&mpd, &fetcher, client_now_s).await;
 
-        let mut session =
-            Self::from_mpd_with_utc(mpd, base_url, fetcher, utc_offset, clock)?;
+        let mut session = Self::from_mpd_with_utc(mpd, base_url, fetcher, utc_offset, clock)?;
         session.last_manifest_refresh = Some(session.clock.now_ms());
         Ok(session)
     }
@@ -833,11 +833,7 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// The session uses a [`SystemClock`] for all time measurements.  To
     /// inject a different clock, use [`Self::from_mpd_with_clock`].
     #[cfg(feature = "std")]
-    pub fn from_mpd(
-        mpd: MPD,
-        base_url: Url,
-        fetcher: Arc<F>,
-    ) -> Result<Self, DashError> {
+    pub fn from_mpd(mpd: MPD, base_url: Url, fetcher: Arc<F>) -> Result<Self, DashError> {
         Self::from_mpd_with_utc(
             mpd,
             base_url,
@@ -888,7 +884,11 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let effective_duration = period.duration.or(presentation_duration);
                 let period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
                 let period_duration_s = effective_duration.map(|d| d.as_secs_f64());
-                let (ws, we) = compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
+                let (ws, we) = compute_append_window(
+                    period_start_s,
+                    period_duration_s,
+                    presentation_duration_s,
+                );
 
                 Some(TrackState::new(
                     MediaType::Video,
@@ -917,7 +917,11 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let effective_duration = period.duration.or(presentation_duration);
                 let period_start_s = period.start.map(|d| d.as_secs_f64()).unwrap_or(0.0);
                 let period_duration_s = effective_duration.map(|d| d.as_secs_f64());
-                let (ws, we) = compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
+                let (ws, we) = compute_append_window(
+                    period_start_s,
+                    period_duration_s,
+                    presentation_duration_s,
+                );
 
                 Some(TrackState::new(
                     MediaType::Audio,
@@ -1243,7 +1247,8 @@ impl<F: SegmentFetcher> DashSession<F> {
         buffered: &[crate::media_buffer::TimeRange],
         state: PlaybackState,
     ) -> Option<GapSeekTarget> {
-        self.gap_controller.tick(position_s, buffered, state.suppresses_gap_jump())
+        self.gap_controller
+            .tick(position_s, buffered, state.suppresses_gap_jump())
     }
 
     /// Read-only access to the gap controller settings.
@@ -1387,7 +1392,12 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// from `query_position` in GStreamer or `currentTime` in MSE).  Passing
     /// `0.0` gives the absolute buffer-end time, which overestimates the
     /// available buffer after the first few segments.
-    pub fn current_metrics(&self, media_type: MediaType, position_s: f64, buf: &impl MediaBuffer) -> AbrMetrics {
+    pub fn current_metrics(
+        &self,
+        media_type: MediaType,
+        position_s: f64,
+        buf: &impl MediaBuffer,
+    ) -> AbrMetrics {
         let track = match media_type {
             MediaType::Video => self.video_track.as_ref(),
             MediaType::Audio => self.audio_track.as_ref(),
@@ -1570,7 +1580,7 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// let clock = session.clock_arc();
     /// loop {
     ///     if buf < custom_target { break; }
-     ///     clock.set_timeout(500.0).await;
+    ///     clock.set_timeout(500.0).await;
     ///     session.sync_playback_state(driver.playback_state());
     /// }
     /// ```
@@ -1613,7 +1623,11 @@ impl<F: SegmentFetcher> DashSession<F> {
     ///
     /// [`IterationSummary`]: driver::IterationSummary
     /// [`PlaybackDriver`]: driver::PlaybackDriver
-     pub async fn run<S: MediaBuffer, D: driver::PlaybackDriver>(&mut self, buf: &mut S, drv: &mut D) -> Result<(), DashError> {
+    pub async fn run<S: MediaBuffer, D: driver::PlaybackDriver>(
+        &mut self,
+        buf: &mut S,
+        drv: &mut D,
+    ) -> Result<(), DashError> {
         use driver::IterationSummary;
 
         let mut prev_video_index: Option<usize> = None;
@@ -3613,7 +3627,11 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// Uses the same CDN blacklist-aware candidate loop as
     /// [`Self::fetch_next_segment`] so that CDN fallback and blacklisting work
     /// identically for init segments.
-    pub async fn fetch_init_segment(&mut self, media_type: MediaType, buf: &mut impl MediaBuffer) -> Result<usize, DashError> {
+    pub async fn fetch_init_segment(
+        &mut self,
+        media_type: MediaType,
+        buf: &mut impl MediaBuffer,
+    ) -> Result<usize, DashError> {
         let (init_path, candidates, byte_range, rep_id) = {
             let track = self.track(&media_type)?;
             let rep = &track.representations[track.current_index];

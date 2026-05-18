@@ -268,9 +268,9 @@ impl MediaBuffer for GstMediaBuffer {
             .iter()
             .filter_map(|x| x.as_ref())
         {
-            appsrc.end_of_stream().map_err(|e| {
-                DashError::AppendFailed(format!("appsrc EOS failed: {e:?}"))
-            })?;
+            appsrc
+                .end_of_stream()
+                .map_err(|e| DashError::AppendFailed(format!("appsrc EOS failed: {e:?}")))?;
         }
         Ok(())
     }
@@ -341,12 +341,7 @@ impl MediaBuffer for GstMediaBuffer {
         Ok(())
     }
 
-    async fn remove_range(
-        &mut self,
-        mt: MediaType,
-        start: f64,
-        end: f64,
-    ) -> Result<(), DashError> {
+    async fn remove_range(&mut self, mt: MediaType, start: f64, end: f64) -> Result<(), DashError> {
         tracing::warn!(
             ?mt,
             start,
@@ -488,8 +483,7 @@ fn wire_sink_chain(
 
                 if is_segment {
                     let new_seg = gst::FormattedSegment::<gst::ClockTime>::new();
-                    info.data =
-                        Some(gst::PadProbeData::Event(gst::event::Segment::new(&new_seg)));
+                    info.data = Some(gst::PadProbeData::Event(gst::event::Segment::new(&new_seg)));
                     tracing::info!("live PTS probe: replaced SEGMENT with zeroed TIME segment");
                     return gst::PadProbeReturn::Ok;
                 }

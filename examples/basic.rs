@@ -113,7 +113,13 @@ async fn main() -> Result<(), DashError> {
     }
 
     let fetcher = Arc::new(StubSegmentFetcher);
-    let mut player = Player::from_mpd(mpd, base_url, fetcher, NullBuffer, BasicPlaybackDriver { seg: 0 })?;
+    let mut player = Player::from_mpd(
+        mpd,
+        base_url,
+        fetcher,
+        NullBuffer,
+        BasicPlaybackDriver { seg: 0 },
+    )?;
 
     // 3. Inspect available representations before starting the loop.
     println!("=== Video representations ===");

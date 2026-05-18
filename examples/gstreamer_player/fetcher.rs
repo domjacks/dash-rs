@@ -87,15 +87,15 @@ impl SegmentFetcher for HttpSegmentFetcher {
     }
 
     async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        let resp = self
-            .client
-            .head(url.as_str())
-            .send()
-            .await
-            .map_err(|e| FetchError::Network {
-                url: url.clone(),
-                message: e.to_string(),
-            })?;
+        let resp =
+            self.client
+                .head(url.as_str())
+                .send()
+                .await
+                .map_err(|e| FetchError::Network {
+                    url: url.clone(),
+                    message: e.to_string(),
+                })?;
         Ok(resp.status().is_success())
     }
 

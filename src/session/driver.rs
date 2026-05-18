@@ -17,7 +17,10 @@ use async_trait::async_trait;
 #[cfg(not(feature = "std"))]
 use alloc::{boxed::Box, string::String};
 
-use crate::{abr::{AbrDecisionReason, QualityDecision}, session::{GapSeekTarget, MediaType}};
+use crate::{
+    abr::{AbrDecisionReason, QualityDecision},
+    session::{GapSeekTarget, MediaType},
+};
 
 // ── PlaybackState ─────────────────────────────────────────────────────────────
 

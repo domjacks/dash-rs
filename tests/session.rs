@@ -128,11 +128,8 @@ impl SegmentFetcher for MockFetcher {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-
 /// Build a `DashSession` from a raw XML string without a network call.
-fn session_from_xml(
-    xml: &str,
-) -> DashSession<dash_rs::fetch::stub::StubSegmentFetcher> {
+fn session_from_xml(xml: &str) -> DashSession<dash_rs::fetch::stub::StubSegmentFetcher> {
     let mpd = dash_rs::manifest::parse(xml).expect("MPD parse failed");
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
@@ -213,9 +210,7 @@ async fn should_not_refresh_immediately_after_from_url() {
     let xml = live_mpd("PT30S");
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let session = DashSession::from_url(&url, fetcher).await.unwrap();
     assert!(!session.should_refresh_manifest());
 }
 
@@ -233,9 +228,7 @@ async fn refresh_manifest_updates_segment_count() {
     let xml_v2 = live_mpd("PT8S");
     let fetcher = MockFetcher::with_manifests(&[&xml_v1, &xml_v2]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
 
@@ -261,7 +254,9 @@ async fn refresh_manifest_updates_segment_count() {
     }
 
     // Fifth call: fetched = 4, total = 4 → EndOfStream.
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream after 4 fetches, got {result:?}"
@@ -290,9 +285,7 @@ async fn refresh_manifest_updates_minimum_update_period() {
     let xml_v1 = live_mpd("PT30S"); // minimumUpdatePeriod = PT4S
     let fetcher = MockFetcher::with_manifests(&[&xml_v1, MPD_V2_8S]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(session.minimum_update_period_ms(), Some(4_000));
 
@@ -462,9 +455,7 @@ async fn live_edge_segment_number_near_live_edge() {
     let fetcher = RecordingFetcher::new(&[&xml], Arc::clone(&recorded));
 
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert!(session.is_live(), "stream should be identified as live");
 
@@ -552,9 +543,7 @@ async fn timeline_vod_fetches_in_time_order() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[TIMELINE_VOD_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
 
@@ -645,9 +634,7 @@ async fn init_cache_hit_avoids_duplicate_network_fetch() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[MULTI_REP_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Explicitly fetch init for rep v1 (index 0) → populates cache.
     session
@@ -706,9 +693,7 @@ async fn init_cache_miss_fetches_and_caches() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[MULTI_REP_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // No explicit fetch_init_segment call — cache is empty.
     // High-throughput fetch switches to v2; init-v2.mp4 is not cached, so
@@ -778,9 +763,7 @@ async fn sliding_window_snaps_segment_number_when_behind_window() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[&xml_v1, &xml_v2], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     // Fetch 3 segments → segment_number = 4.
@@ -825,9 +808,7 @@ async fn sliding_window_no_snap_when_segment_number_inside_window() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[&xml_v1, &xml_v2], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     // Fetch 3 segments → segment_number = 4.
@@ -864,9 +845,7 @@ async fn timeline_vod_eos_after_all_segments() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[TIMELINE_VOD_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
 
@@ -877,7 +856,9 @@ async fn timeline_vod_eos_after_all_segments() {
             .expect("segment fetch should succeed");
     }
 
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream after timeline exhausted, got {result:?}"
@@ -892,9 +873,7 @@ async fn timeline_repeat_attribute_produces_correct_times() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[TIMELINE_REPEAT_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
 
@@ -927,7 +906,9 @@ async fn timeline_repeat_attribute_produces_correct_times() {
 
     // After all repeats, the timeline is exhausted → EOS.
     drop(urls);
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream after repeat segments exhausted, got {result:?}"
@@ -1015,9 +996,7 @@ async fn utc_direct_scheme_sets_offset() {
 
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let client_now_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1052,9 +1031,7 @@ async fn utc_http_xsdate_scheme_fetches_via_fetcher() {
 
     let fetcher = UtcMockFetcher::new(&xml, "2000-01-01T00:00:00Z");
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let client_now_s = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1092,9 +1069,7 @@ async fn utc_unsupported_schemes_fall_back_to_zero() {
 
     let fetcher = MockFetcher::with_manifests(&[xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(
         session.utc_clock_offset_s(),
@@ -1228,9 +1203,7 @@ async fn emsg_v1_event_delivered_to_subscriber() {
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Subscribe before the fetch so no events are missed.
     let mut events = session.subscribe_events();
@@ -1265,9 +1238,7 @@ async fn emsg_v0_fields_preserved_through_broadcast() {
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let mut events = session.subscribe_events();
 
@@ -1298,9 +1269,7 @@ async fn emsg_no_subscriber_does_not_panic() {
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Deliberately do NOT call subscribe_events().
     let result = session
@@ -1321,9 +1290,7 @@ async fn emsg_two_events_in_one_segment() {
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let mut events = session.subscribe_events();
 
@@ -1400,9 +1367,7 @@ async fn current_metrics_throughput_nonzero_after_first_fetch() {
 
     let fetcher = TimedSegmentFetcher::new(STATIC_MPD, bytes, duration_ms);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Before any fetch: throughput must be 0.
     assert_eq!(
@@ -1412,7 +1377,9 @@ async fn current_metrics_throughput_nonzero_after_first_fetch() {
         0.0
     );
     assert_eq!(
-        session.current_metrics(MediaType::Video, 0.0, &NullBuffer).latency_ms,
+        session
+            .current_metrics(MediaType::Video, 0.0, &NullBuffer)
+            .latency_ms,
         0.0
     );
 
@@ -1442,9 +1409,7 @@ async fn current_metrics_throughput_ema_updates_each_fetch() {
 
     let fetcher = TimedSegmentFetcher::new(STATIC_MPD, bytes, duration_ms);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Fetch 5 segments (VOD has 15 total at 2 s each).
     for _ in 0..5 {
@@ -1495,9 +1460,7 @@ async fn current_metrics_audio_and_video_independent() {
 
     let fetcher = TimedSegmentFetcher::new(AUDIO_VIDEO_MPD, 50_000, 200);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Before any fetches both tracks report 0.
     assert_eq!(
@@ -1566,9 +1529,7 @@ async fn segmentlist_vod_fetches_in_order() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[SEGMENTLIST_VOD_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
 
@@ -1611,9 +1572,7 @@ async fn segmentlist_eos_after_all_urls() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[SEGMENTLIST_VOD_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
 
@@ -1626,7 +1585,9 @@ async fn segmentlist_eos_after_all_urls() {
     }
 
     // Fourth call must signal EOS.
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream after all SegmentURL entries consumed, got {result:?}"
@@ -1641,9 +1602,7 @@ async fn segmentlist_init_segment_resolved() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[SEGMENTLIST_VOD_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     session
         .fetch_init_segment(MediaType::Video, &mut buf)
@@ -1788,9 +1747,7 @@ async fn segmentbase_fetches_sidx_then_first_segment() {
     let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     session
@@ -1831,9 +1788,7 @@ async fn segmentbase_eos_after_all_subsegments() {
     let log = Arc::new(Mutex::new(Vec::new()));
     let fetcher = SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, log);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     // Fetch both subsegments successfully.
@@ -1844,7 +1799,9 @@ async fn segmentbase_eos_after_all_subsegments() {
             .unwrap_or_else(|e| panic!("segment {i} failed: {e}"));
     }
     // Third call must be EOS.
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream after all SegmentBase subsegments, got {result:?}"
@@ -1861,9 +1818,7 @@ async fn segmentbase_init_segment_uses_byte_range() {
     let log: Arc<Mutex<Vec<(String, Option<(u64, u64)>)>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = SegmentBaseFetcher::new(SEGMENTBASE_MPD, sidx, Arc::clone(&log));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     session
         .fetch_init_segment(MediaType::Video, &mut buf)
@@ -2002,9 +1957,7 @@ async fn bitrate_cap_enforced_in_fetch_next_segment() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[MULTI_REP_MPD2], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Cap at 1 Mbps (index 1 = "mid"); high-throughput metrics would otherwise
     // select index 2 = "high".
@@ -2086,9 +2039,7 @@ async fn multi_period_advances_on_period_end() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[MPD2], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(session.period_count(), 2);
 
@@ -2178,9 +2129,7 @@ async fn multi_period_eos_after_last_period() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[MPD3], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = AbrMetrics::new(4_000_000.0, 10_000.0);
 
@@ -2553,9 +2502,7 @@ async fn refresh_manifest_updates_base_url_to_location_url() {
     ]);
 
     let url = Url::parse(&primary).unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(session.manifest_url().as_str(), primary);
 
@@ -2581,9 +2528,7 @@ async fn refresh_manifest_updates_location_urls_from_refreshed_manifest() {
     ]);
 
     let url = Url::parse(&primary).unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(
         session.location_urls().len(),
@@ -2615,9 +2560,7 @@ async fn refresh_manifest_returns_error_when_all_locations_fail() {
     ]);
 
     let url = Url::parse(&primary).unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let result = session.refresh_manifest().await;
     assert!(
@@ -2722,9 +2665,7 @@ async fn cdn_blacklist_skips_failing_cdn_on_subsequent_fetches() {
     let fetcher = CdnFetcher::new(TWO_CDN_MPD, &["cdn1.example.com"], Arc::clone(&attempted));
 
     let url = Url::parse("http://primary.example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Disable the default 600-second cooldown and use a long-enough value for
     // the test to remain deterministic without sleeping.
@@ -2754,7 +2695,9 @@ async fn cdn_blacklist_skips_failing_cdn_on_subsequent_fetches() {
     // Second fetch: cdn1 is blacklisted → only cdn2 should be tried.
     // EOS after 1 segment (total_segments = 1), so we expect EndOfStream here.
     // We just need to verify cdn1 was NOT attempted regardless of the outcome.
-    let _ = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await; // may succeed or return EOS — we only care about the URL log
+    let _ = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await; // may succeed or return EOS — we only care about the URL log
 
     let urls_after_second = attempted.lock().unwrap();
     let cdn1_count_after_second = urls_after_second
@@ -2835,9 +2778,7 @@ async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
     };
 
     let url = Url::parse("http://primary.example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Use a 60-second cooldown so both CDNs stay blacklisted across the test.
     session.set_cdn_blacklist_cooldown_ms(60_000);
@@ -2846,7 +2787,9 @@ async fn cdn_blacklist_retries_all_when_all_are_blacklisted() {
     let mut buf = NullBuffer;
 
     // First fetch: cdn1 fails (blacklisted), cdn2 fails (blacklisted) → error.
-    let first = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let first = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         first.is_err(),
         "first fetch should fail when both CDNs are down"
@@ -3109,9 +3052,8 @@ async fn seek_to_remapped_live_snaps_to_correct_segment() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let clock = Arc::new(FixedClock1000 {});
 
-    let mut session =
-        DashSession::from_mpd_with_clock(mpd, base_url, fetcher, clock)
-            .expect("session construction failed");
+    let mut session = DashSession::from_mpd_with_clock(mpd, base_url, fetcher, clock)
+        .expect("session construction failed");
 
     let mut buf = NullBuffer;
 
@@ -3318,7 +3260,9 @@ async fn audio_only_video_fetch_returns_no_representations() {
     let mut buf = NullBuffer;
     let mut session = session_from_xml(AUDIO_ONLY_MPD);
     let metrics = default_metrics();
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Err(DashError::NoRepresentations { .. })),
         "expected NoRepresentations, got {result:?}"
@@ -3628,17 +3572,14 @@ async fn fetch_next_segment_eos_when_past_availability_end_time() {
     let mpd = dash_rs::manifest::parse(MPD_XML).unwrap();
     let base_url = Url::parse("http://example.com/").unwrap();
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
-    let mut session = DashSession::from_mpd_with_clock(
-        mpd,
-        base_url,
-        fetcher,
-        Arc::new(PastClock),
-    )
-    .unwrap();
+    let mut session =
+        DashSession::from_mpd_with_clock(mpd, base_url, fetcher, Arc::new(PastClock)).unwrap();
 
     let metrics = default_metrics();
     let mut buf = NullBuffer;
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream when past availabilityEndTime, got: {result:?}"
@@ -3812,13 +3753,17 @@ async fn seek_to_anchors_timeline_next_segment_time() {
     // Fetch 3 segments from position 4 s — should get t=4000, t=6000, t=8000.
     // The 4th call should yield EndOfStream.
     for i in 0..3 {
-        let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+        let result = session
+            .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+            .await;
         assert!(
             result.is_ok(),
             "segment {i} after seek should succeed, got: {result:?}"
         );
     }
-    let result = session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await;
+    let result = session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await;
     assert!(
         matches!(result, Ok(FetchOutcome::EndOfStream)),
         "expected EndOfStream after 3 segments from seek position, got: {result:?}"
@@ -3855,9 +3800,7 @@ async fn time_shift_buffer_depth_updated_on_manifest_refresh() {
 
     let fetcher = MockFetcher::with_manifests(&[&initial, &refreshed]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(
         session.time_shift_buffer_depth_ms(),
@@ -3907,9 +3850,7 @@ async fn period_start_s_updated_on_manifest_refresh() {
 
     let fetcher = MockFetcher::with_manifests(&[&initial, &refreshed]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Before refresh: period_start = 0 s, seek to 12 s → snapped to seg 6 → 12 s
     let snapped_before = session.seek_to(12.0);
@@ -4142,9 +4083,7 @@ async fn last_producer_reference_time_is_populated_from_segment() {
         segment_data: segment,
     };
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Before any segment fetch, the accessor returns None.
     assert!(
@@ -4155,7 +4094,10 @@ async fn last_producer_reference_time_is_populated_from_segment() {
     );
 
     // Fetch the init segment.
-    session.fetch_init_segment(MediaType::Video, &mut buf).await.unwrap();
+    session
+        .fetch_init_segment(MediaType::Video, &mut buf)
+        .await
+        .unwrap();
 
     // Fetch one media segment (returns the prft-containing payload).
     let metrics = default_metrics();
@@ -4210,15 +4152,16 @@ async fn throughput_tracker_non_zero_after_first_segment() {
         segment_data,
     };
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Before fetching: throughput_bps should be 0.
     let before = session.current_metrics(MediaType::Video, 0.0, &NullBuffer);
     assert_eq!(before.throughput_bps, 0.0, "expected 0 before any fetch");
 
-    session.fetch_init_segment(MediaType::Video, &mut buf).await.unwrap();
+    session
+        .fetch_init_segment(MediaType::Video, &mut buf)
+        .await
+        .unwrap();
     let metrics = default_metrics();
     session
         .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
@@ -4305,17 +4248,13 @@ fn video_track_skipped_when_mime_not_supported() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
 
     // from_mpd always succeeds — track filtering happens in run() via MediaBuffer
-    let session =
-        DashSession::from_mpd(mpd, base_url, fetcher).expect("from_mpd must not fail");
+    let session = DashSession::from_mpd(mpd, base_url, fetcher).expect("from_mpd must not fail");
 
     assert!(
         session.has_video(),
         "video track present (filtering happens in run())"
     );
-    assert!(
-        session.has_audio(),
-        "audio track should be present"
-    );
+    assert!(session.has_audio(), "audio track should be present");
     let reps = session.audio_representations();
     assert_eq!(reps[0].id, "a1");
 }
@@ -4521,9 +4460,7 @@ async fn live_av_fetch_both_tracks_succeeds() {
     let (xml, _) = live_av_mpd_with_ast(1_000);
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     session.notify_playing();
 
@@ -4557,13 +4494,14 @@ async fn live_av_no_eos_for_open_ended_stream() {
     let (xml, _) = live_av_mpd_with_ast(1_000);
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     for _ in 0..5 {
-        match session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await {
+        match session
+            .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+            .await
+        {
             Ok(FetchOutcome::Fetched(_)) => {}
             Ok(FetchOutcome::EndOfStream) => {
                 panic!("live stream must not return EndOfStream");
@@ -4644,9 +4582,7 @@ async fn live_audio_only_fetch_succeeds() {
 
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     session
@@ -4656,7 +4592,9 @@ async fn live_audio_only_fetch_succeeds() {
     // Video fetch must return NoRepresentations (no video track).
     assert!(
         matches!(
-            session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await,
+            session
+                .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+                .await,
             Err(DashError::NoRepresentations { .. })
         ),
         "video fetch on audio-only stream must return NoRepresentations"
@@ -4696,9 +4634,7 @@ async fn live_audio_only_should_refresh_manifest() {
 
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert!(session.is_live(), "stream must be live");
     // minimumUpdatePeriod=PT0S → refresh is always due.
@@ -4759,9 +4695,7 @@ async fn live_timeline_fetch_uses_live_edge_time() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[&xml], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     session
@@ -4802,9 +4736,7 @@ async fn live_timeline_consecutive_fetches_advance_time() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[&xml], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     // Fetch 3 media segments.
@@ -4932,9 +4864,7 @@ async fn refresh_manifest_resnaps_live_edge_when_segment_falls_behind() {
     // Serve the same manifest twice: once for initial load, once for refresh.
     let fetcher = MockFetcher::with_manifests(&[&xml, &xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let initial_seg = session.current_segment_number(&MediaType::Video);
     assert!(
@@ -4968,9 +4898,7 @@ async fn live_av_refresh_resnaps_both_tracks() {
     let (xml, expected_start) = live_av_mpd_with_ast(1_000);
     let fetcher = MockFetcher::with_manifests(&[&xml, &xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let initial_v = session.current_segment_number(&MediaType::Video);
     let initial_a = session.current_segment_number(&MediaType::Audio);
@@ -5151,14 +5079,20 @@ async fn vod_av_both_tracks_fetch_all_segments() {
 
     for _ in 0..10 {
         if !video_done {
-            match session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await {
+            match session
+                .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+                .await
+            {
                 Ok(FetchOutcome::Fetched(_)) => {}
                 Ok(FetchOutcome::EndOfStream) => video_done = true,
                 Err(e) => panic!("unexpected video error: {e}"),
             }
         }
         if !audio_done {
-            match session.fetch_next_segment(MediaType::Audio, &metrics, &mut buf).await {
+            match session
+                .fetch_next_segment(MediaType::Audio, &metrics, &mut buf)
+                .await
+            {
                 Ok(FetchOutcome::Fetched(_)) => {}
                 Ok(FetchOutcome::EndOfStream) => audio_done = true,
                 Err(e) => panic!("unexpected audio error: {e}"),
@@ -5190,12 +5124,18 @@ async fn vod_av_eos_fires_independently_per_track() {
     let mut audio_ok_count = 0u32;
 
     for _ in 0..10 {
-        match session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await {
+        match session
+            .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+            .await
+        {
             Ok(FetchOutcome::Fetched(_)) => video_ok_count += 1,
             Ok(FetchOutcome::EndOfStream) => video_eos_count += 1,
             Err(e) => panic!("unexpected video error: {e}"),
         }
-        match session.fetch_next_segment(MediaType::Audio, &metrics, &mut buf).await {
+        match session
+            .fetch_next_segment(MediaType::Audio, &metrics, &mut buf)
+            .await
+        {
             Ok(FetchOutcome::Fetched(_)) => audio_ok_count += 1,
             Ok(FetchOutcome::EndOfStream) => audio_eos_count += 1,
             Err(e) => panic!("unexpected audio error: {e}"),
@@ -5252,9 +5192,7 @@ async fn aod_live_live_edge_snapped() {
 
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert!(!session.has_video(), "AOD stream must have no video track");
     assert!(session.has_audio(), "AOD stream must have an audio track");
@@ -5300,13 +5238,14 @@ async fn aod_live_no_eos() {
 
     let fetcher = MockFetcher::with_manifests(&[&xml]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     for _ in 0..5 {
-        match session.fetch_next_segment(MediaType::Audio, &metrics, &mut buf).await {
+        match session
+            .fetch_next_segment(MediaType::Audio, &metrics, &mut buf)
+            .await
+        {
             Ok(FetchOutcome::Fetched(_)) => {}
             Ok(FetchOutcome::EndOfStream) => {
                 panic!("AOD live stream must not return EndOfStream")
@@ -5326,9 +5265,7 @@ async fn timeline_vod_av_both_tracks_fetch_in_time_order() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[TIMELINE_VOD_AV_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = default_metrics();
     let mut video_done = false;
@@ -5336,14 +5273,20 @@ async fn timeline_vod_av_both_tracks_fetch_in_time_order() {
 
     for _ in 0..10 {
         if !video_done {
-            match session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await {
+            match session
+                .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+                .await
+            {
                 Ok(FetchOutcome::Fetched(_)) => {}
                 Ok(FetchOutcome::EndOfStream) => video_done = true,
                 Err(e) => panic!("unexpected video error: {e}"),
             }
         }
         if !audio_done {
-            match session.fetch_next_segment(MediaType::Audio, &metrics, &mut buf).await {
+            match session
+                .fetch_next_segment(MediaType::Audio, &metrics, &mut buf)
+                .await
+            {
                 Ok(FetchOutcome::Fetched(_)) => {}
                 Ok(FetchOutcome::EndOfStream) => audio_done = true,
                 Err(e) => panic!("unexpected audio error: {e}"),
@@ -5414,9 +5357,7 @@ async fn multi_period_av_advances_through_period_boundary() {
     let recorded: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let fetcher = RecordingFetcher::new(&[MULTI_PERIOD_AV_MPD], Arc::clone(&recorded));
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(session.period_count(), 2, "should have 2 periods");
     assert_eq!(
@@ -5434,7 +5375,10 @@ async fn multi_period_av_advances_through_period_boundary() {
 
     for _ in 0..10 {
         if !video_done {
-            match session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await {
+            match session
+                .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+                .await
+            {
                 Ok(FetchOutcome::Fetched(_)) => {
                     // After fetching period 1's only video segment and advancing,
                     // current_period_index should become 1.
@@ -5447,7 +5391,10 @@ async fn multi_period_av_advances_through_period_boundary() {
             }
         }
         if !audio_done {
-            match session.fetch_next_segment(MediaType::Audio, &metrics, &mut buf).await {
+            match session
+                .fetch_next_segment(MediaType::Audio, &metrics, &mut buf)
+                .await
+            {
                 Ok(FetchOutcome::Fetched(_)) => {}
                 Ok(FetchOutcome::EndOfStream) => audio_done = true,
                 Err(e) => panic!("unexpected audio error: {e}"),
@@ -5612,13 +5559,9 @@ fn audio_track_skipped_when_audio_mime_not_supported() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
 
     // from_mpd always succeeds regardless of MIME type
-    let session =
-        DashSession::from_mpd(mpd, base_url, fetcher).expect("from_mpd must not fail");
+    let session = DashSession::from_mpd(mpd, base_url, fetcher).expect("from_mpd must not fail");
 
-    assert!(
-        session.has_video(),
-        "video track should be present"
-    );
+    assert!(session.has_video(), "video track should be present");
     assert!(
         session.has_audio(),
         "audio track should be present (filtering happens in run())"
@@ -6000,9 +5943,7 @@ async fn abandon_timeout_returns_segment_abandoned_error() {
     let fetcher = HangingFetcher {
         manifest: bytes::Bytes::from(STATIC_MPD.to_string()),
     };
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // Set a 1 ms timeout — will fire almost immediately.
     session.set_abandon_timeout_ms(Some(1));
@@ -6154,7 +6095,9 @@ fn update_metrics_applies_abr_decision() {
 
     // Initially at index 0 (lowest bitrate).
     assert_eq!(
-        session.current_metrics(MediaType::Video, 0.0, &NullBuffer).current_index,
+        session
+            .current_metrics(MediaType::Video, 0.0, &NullBuffer)
+            .current_index,
         Some(0),
         "should start at index 0"
     );
@@ -6163,7 +6106,9 @@ fn update_metrics_applies_abr_decision() {
     let metrics = AbrMetrics::new(100_000_000.0, 30_000.0);
     session.update_metrics(&MediaType::Video, metrics);
 
-    let idx = session.current_metrics(MediaType::Video, 0.0, &NullBuffer).current_index;
+    let idx = session
+        .current_metrics(MediaType::Video, 0.0, &NullBuffer)
+        .current_index;
     assert!(
         idx.unwrap_or(0) >= 1,
         "after update_metrics with high throughput, index should be > 0; got {idx:?}"
@@ -6207,7 +6152,9 @@ fn select_quality_does_not_mutate_state() {
 
     // Current index must still be 0 (select_quality does not mutate).
     assert_eq!(
-        session.current_metrics(MediaType::Video, 0.0, &NullBuffer).current_index,
+        session
+            .current_metrics(MediaType::Video, 0.0, &NullBuffer)
+            .current_index,
         Some(0),
         "select_quality must not change current_index"
     );
@@ -6266,9 +6213,7 @@ async fn metrics_http_request_recorded_after_fetch() {
     let mut buf = NullBuffer;
     let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     assert_eq!(
         session.metrics().http_requests.len(),
@@ -6296,9 +6241,7 @@ async fn metrics_http_request_has_correct_fields() {
     let mut buf = NullBuffer;
     let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // 10 Mbps throughput → ABR should select highest quality (index 2 = "high").
     let high_metrics = AbrMetrics::new(10_000_000.0, 4_000.0);
@@ -6329,9 +6272,7 @@ async fn metrics_buffer_level_sample_recorded_per_fetch() {
     let mut buf = NullBuffer;
     let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
     for i in 1..=3u64 {
@@ -6354,9 +6295,7 @@ async fn metrics_representation_switch_recorded() {
     let mut buf = NullBuffer;
     let fetcher = MockFetcher::with_manifests(&[METRICS_MPD]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     // First fetch at low throughput → selects index 0 ("low").
     let low_metrics = AbrMetrics::new(200_000.0, 4_000.0);
@@ -6414,13 +6353,14 @@ async fn metrics_ring_buffer_caps_at_100() {
 
     let fetcher = MockFetcher::with_manifests(&[big_mpd]);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher)
-        .await
-        .unwrap();
+    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
 
     let metrics = AbrMetrics::new(1_000_000.0, 4_000.0);
     for _ in 0..110 {
-        match session.fetch_next_segment(MediaType::Video, &metrics, &mut buf).await {
+        match session
+            .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+            .await
+        {
             Ok(FetchOutcome::Fetched(_)) => {}
             Ok(FetchOutcome::EndOfStream) => break,
             Err(e) => panic!("unexpected error: {e}"),
@@ -6468,9 +6408,7 @@ async fn sync_playback_state_idempotent() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
     let base = url::Url::parse("http://example.com/").unwrap();
-    let mut session =
-        DashSession::from_mpd_with_clock(mpd, base, fetcher, clock.clone())
-            .unwrap();
+    let mut session = DashSession::from_mpd_with_clock(mpd, base, fetcher, clock.clone()).unwrap();
 
     session.notify_playing();
 
@@ -6515,9 +6453,7 @@ async fn sync_playback_state_pause_resume_unfreezes_estimate() {
     let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
     let mpd = dash_rs::manifest::parse(STATIC_MPD).unwrap();
     let base = url::Url::parse("http://example.com/").unwrap();
-    let mut session =
-        DashSession::from_mpd_with_clock(mpd, base, fetcher, clock.clone())
-            .unwrap();
+    let mut session = DashSession::from_mpd_with_clock(mpd, base, fetcher, clock.clone()).unwrap();
 
     session.notify_playing();
 

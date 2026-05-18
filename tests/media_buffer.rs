@@ -83,7 +83,9 @@ fn stub_buffer_add_track_sets_mime_and_returns_true() {
 async fn stub_buffer_change_type_updates_mime() {
     let mut buf = StubBuffer::new();
     buf.add_track(MediaType::Video, "video/mp4");
-    buf.change_type(MediaType::Video, "video/webm").await.unwrap();
+    buf.change_type(MediaType::Video, "video/webm")
+        .await
+        .unwrap();
     assert_eq!(buf.video_mime, "video/webm");
 }
 
@@ -111,8 +113,12 @@ async fn stub_buffer_append_records_chunks() {
     let init = Bytes::from_static(b"init-data");
     let media = Bytes::from_static(b"media-data");
 
-    buf.append(MediaType::Video, init.clone(), true).await.unwrap();
-    buf.append(MediaType::Video, media.clone(), false).await.unwrap();
+    buf.append(MediaType::Video, init.clone(), true)
+        .await
+        .unwrap();
+    buf.append(MediaType::Video, media.clone(), false)
+        .await
+        .unwrap();
 
     assert_eq!(buf.video_chunks.len(), 2);
     assert!(buf.video_chunks[0].is_init);
@@ -125,8 +131,12 @@ async fn stub_buffer_append_records_chunks() {
 #[tokio::test]
 async fn stub_buffer_append_audio_separate_from_video() {
     let mut buf = StubBuffer::new();
-    buf.append(MediaType::Video, Bytes::from_static(b"v"), false).await.unwrap();
-    buf.append(MediaType::Audio, Bytes::from_static(b"a"), false).await.unwrap();
+    buf.append(MediaType::Video, Bytes::from_static(b"v"), false)
+        .await
+        .unwrap();
+    buf.append(MediaType::Audio, Bytes::from_static(b"a"), false)
+        .await
+        .unwrap();
     assert_eq!(buf.video_chunks.len(), 1);
     assert_eq!(buf.audio_chunks.len(), 1);
 }
@@ -135,9 +145,15 @@ async fn stub_buffer_append_audio_separate_from_video() {
 fn stub_buffer_bytes_appended() {
     let buf = tokio::runtime::Runtime::new().unwrap().block_on(async {
         let mut b = StubBuffer::new();
-        b.append(MediaType::Video, Bytes::from(vec![0u8; 100]), true).await.unwrap();
-        b.append(MediaType::Video, Bytes::from(vec![0u8; 200]), false).await.unwrap();
-        b.append(MediaType::Audio, Bytes::from(vec![0u8; 50]), true).await.unwrap();
+        b.append(MediaType::Video, Bytes::from(vec![0u8; 100]), true)
+            .await
+            .unwrap();
+        b.append(MediaType::Video, Bytes::from(vec![0u8; 200]), false)
+            .await
+            .unwrap();
+        b.append(MediaType::Audio, Bytes::from(vec![0u8; 50]), true)
+            .await
+            .unwrap();
         b
     });
     assert_eq!(buf.video_bytes_appended(), 300);
@@ -163,7 +179,9 @@ fn stub_buffer_buffered_always_empty() {
 #[tokio::test]
 async fn stub_buffer_remove_range_is_noop() {
     let mut buf = StubBuffer::new();
-    buf.append(MediaType::Video, Bytes::from_static(b"data"), false).await.unwrap();
+    buf.append(MediaType::Video, Bytes::from_static(b"data"), false)
+        .await
+        .unwrap();
     // remove_range is a no-op for StubBuffer (no timing tracking).
     buf.remove_range(MediaType::Video, 0.0, 10.0).await.unwrap();
     // Chunk is still there — stub doesn't remove it.
