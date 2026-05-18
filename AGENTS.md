@@ -190,9 +190,25 @@ impl PlaybackDriver for MyDriver {
     fn position_s(&self) -> f64 { self.position_s }
 
     // Optional: cache the session's estimated position at iteration start.
-    fn on_iteration_start(&mut self, session_position_s: f64) {
+    fn on_iteration_start(&mut self, session_position_s: f64, _video_buffer_ms: f64, _audio_buffer_ms: f64) {
         self.position_s = session_position_s;
     }
+
+    // Optional: handle a user-initiated seek (e.g. scrubbing the seek bar).
+    // Return Some(pos_s) once, then clear the pending seek (destructive read).
+    // run() repositions the fetch cursor, resets the clock baseline, and
+    // re-enables any EOS-fired tracks before the next segment pair is fetched.
+    // Default: None — no seek pending.
+    fn pending_seek_s(&mut self) -> Option<f64> { None }
+
+    // Optional: non-destructive peek — returns true when a seek is pending
+    // without consuming it.  Used by run() to interrupt buffer gate waits
+    // (video and audio) within ≤ 500 ms of a seek arriving, preventing a
+    // permanent stall when the user seeks while the buffer is already full.
+    // Override alongside pending_seek_s(); must return true whenever
+    // pending_seek_s() would return Some(_).
+    // Default: false.
+    fn has_pending_seek(&self) -> bool { false }
 
     // Optional: called when the gap controller recommends a seek.
     // The session's fetch position has already been reset; seek the renderer.

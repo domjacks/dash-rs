@@ -13,7 +13,6 @@ use dash_rs::{
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-
 use crate::bridge::JsBridge;
 
 // ── WasmPlaybackDriver ────────────────────────────────────────────────────────
@@ -49,6 +48,26 @@ impl PlaybackDriver for WasmPlaybackDriver {
 
     async fn on_gap_seek(&mut self, target: GapSeekTarget) {
         self.bridge.seek_to(target.position_s);
+    }
+
+    /// Consume any pending user seek posted by the `seeking` event handler in
+    /// `app.js`.  Returns `Some(pos)` once then clears the flag; rapid seeks
+    /// coalesce to the last position.
+    fn pending_seek_s(&mut self) -> Option<f64> {
+        let s = self.bridge.get_pending_seek();
+        if s.is_nan() {
+            None
+        } else {
+            self.bridge.clear_pending_seek();
+            Some(s)
+        }
+    }
+
+    /// Non-destructive peek — returns `true` while a user seek is pending
+    /// without clearing the flag.  Used by the buffer-gate loop to bail out
+    /// early so the seek is processed on the next main-loop iteration.
+    fn has_pending_seek(&self) -> bool {
+        !self.bridge.get_pending_seek().is_nan()
     }
 
     /// Request PTS remapping so that epoch-scale live timestamps (e.g. BBC

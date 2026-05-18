@@ -283,6 +283,46 @@ pub trait PlaybackDriver {
         true
     }
 
+    /// Returns a pending user-initiated seek position in seconds, if any.
+    ///
+    /// Called at the start of each `run()` iteration, immediately after
+    /// [`should_continue`][Self::should_continue].  When `Some(pos)` is
+    /// returned the session:
+    ///
+    /// 1. Repositions the segment-fetch cursor via [`DashSession::seek_to`].
+    /// 2. Resets the wall-clock baseline via [`DashSession::notify_playing`]
+    ///    so that [`DashSession::estimated_buffer_level_ms`] counts from zero
+    ///    at the new position.
+    /// 3. Clears any end-of-stream flags so tracks that finished before the
+    ///    seek target resume fetching.
+    ///
+    /// The implementation **must** clear the pending seek before returning so
+    /// that subsequent calls return `None` (destructive read).  Rapid seeks
+    /// coalesce naturally — only the most recent position matters.
+    ///
+    /// Default: `None` — no seek pending.
+    fn pending_seek_s(&mut self) -> Option<f64> {
+        None
+    }
+
+    /// Returns `true` when a user-initiated seek is pending **without**
+    /// consuming it.
+    ///
+    /// This is a non-destructive companion to
+    /// [`pending_seek_s`][Self::pending_seek_s].  It is queried by the
+    /// buffer-gate loops inside [`DashSession::run`] to bail out early when a
+    /// new seek arrives while the gate is sleeping.  Without this, a seek that
+    /// fires while the video gate is blocked waits up to one full
+    /// `buffer_target_ms` worth of 500 ms gate-loop ticks before being
+    /// processed, leaving the browser stalled with no data at the new seek
+    /// target.
+    ///
+    /// **Override this method whenever you override `pending_seek_s`.**
+    /// The default returns `false` (never any seek pending).
+    fn has_pending_seek(&self) -> bool {
+        false
+    }
+
     /// Called at the **start** of each loop iteration, before the buffer gate
     /// and fetch.  Receives the session's current estimated playback position
     /// and per-track buffer levels (in milliseconds).

@@ -6505,7 +6505,7 @@ async fn wait_for_buffer_capacity_returns_immediately_when_below_target() {
     // (Using tokio::time::timeout to guard against a hang.)
     tokio::time::timeout(
         std::time::Duration::from_millis(200),
-        session.wait_for_buffer_capacity(&MediaType::Video, || false),
+        session.wait_for_buffer_capacity(&MediaType::Video, || false, || false),
     )
     .await
     .expect("wait_for_buffer_capacity must return immediately when buffer is below target");
@@ -6549,7 +6549,7 @@ mod run_driver_tests {
             self.iterations < self.max_iterations
         }
 
-        fn on_iteration_start(&mut self, _pos: f64) {
+        fn on_iteration_start(&mut self, _pos: f64, _vbuf: f64, _abuf: f64) {
             self.iterations += 1;
         }
 

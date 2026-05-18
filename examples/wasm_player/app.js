@@ -204,6 +204,14 @@ form.addEventListener('submit', async (e) => {
   dp.stateText.textContent = '—';
   dp.dot.className = 'dot';
 
+  // Forward browser seek events to the Rust fetch loop.
+  // The 'seeking' event fires as soon as video.currentTime changes, before
+  // the browser has loaded data at the new position.  Notifying here (rather
+  // than on 'seeked') lets Rust redirect the segment cursor on the very next
+  // fetch iteration, minimising the window where wrong segments are appended.
+  const onSeeking = () => { if (activeBridge) activeBridge.notifySeek(video.currentTime); };
+  video.addEventListener('seeking', onSeeking);
+
   try {
     // Create a fresh bridge for each playback session so MSE state is clean.
     const bridge = createBridge(video, log);
@@ -218,5 +226,6 @@ form.addEventListener('submit', async (e) => {
     console.error('dash-rs error:', err);
   } finally {
     activeBridge = null;
+    video.removeEventListener('seeking', onSeeking);
   }
 });

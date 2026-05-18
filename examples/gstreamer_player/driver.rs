@@ -98,7 +98,12 @@ impl PlaybackDriver for GstPlaybackDriver {
         true
     }
 
-    fn on_iteration_start(&mut self, session_position_s: f64) {
+    fn on_iteration_start(
+        &mut self,
+        session_position_s: f64,
+        _video_buffer_level_ms: f64,
+        _audio_buffer_level_ms: f64,
+    ) {
         self.cached_pos_s = session_position_s;
         self.seg += 1;
     }

@@ -432,13 +432,13 @@ async fn apply_track_reinit(
     presentation_duration_s: Option<f64>,
 ) -> Result<(), DashError> {
     if track.current_mime != ri.mime {
-        buf.change_type(track._media_type.clone(), &ri.mime).await?;
+        buf.change_type(track._media_type, &ri.mime).await?;
         track.current_mime = ri.mime.clone();
     }
     let (ws, we) =
         compute_append_window(period_start_s, period_duration_s, presentation_duration_s);
-    buf.set_append_window(track._media_type.clone(), ws, we);
-    buf.set_timestamp_offset(track._media_type.clone(), ri.timestamp_offset_s);
+    buf.set_append_window(track._media_type, ws, we);
+    buf.set_timestamp_offset(track._media_type, ri.timestamp_offset_s);
     track.timestamp_offset_s = ri.timestamp_offset_s;
     track.append_window = (ws, we);
     track.representations = ri.representations.clone();
@@ -1404,7 +1404,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         };
 
         let (buffer_level_ms, current_index, throughput_bps, latency_ms) = if let Some(t) = track {
-            let buffered = buf.buffered(media_type.clone());
+            let buffered = buf.buffered(media_type);
             let level = buffered
                 .last()
                 .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
@@ -1463,6 +1463,24 @@ impl<F: SegmentFetcher> DashSession<F> {
             self.playback_state = PlaybackState::Buffering;
             self.paused_at = Some(self.clock.now_ms());
         }
+    }
+
+    /// Unconditionally reset the playback wall-clock to the current instant.
+    ///
+    /// Called by [`Self::run`] immediately after [`Self::seek_to`] so that
+    /// [`Self::estimated_buffer_level_ms`] always starts from a clean
+    /// zero-based baseline at the new seek position, regardless of the
+    /// playback state at the time of the seek.
+    ///
+    /// Unlike [`Self::notify_playing`], which takes a "freeze-accumulate"
+    /// branch when the state is `Buffering` or `Paused`, this method always
+    /// performs the full reset: `playback_started_at = now`,
+    /// `total_paused_ms = 0`, `paused_at = None`, `playback_state = Playing`.
+    fn reset_clock_for_seek(&mut self) {
+        self.playback_started_at = Some(self.clock.now_ms());
+        self.total_paused_ms = 0.0;
+        self.paused_at = None;
+        self.playback_state = PlaybackState::Playing;
     }
 
     /// Whether the session is currently tracking a paused pipeline.
@@ -1543,24 +1561,46 @@ impl<F: SegmentFetcher> DashSession<F> {
     ///   frozen (paused or buffering).  Queried after every sleep tick so that
     ///   pause/resume transitions are handled without the caller needing a
     ///   `was_paused` variable.
+    /// * `interrupt` — closure that returns `true` to break out of the gate
+    ///   loop immediately, checked both before and after each 500 ms sleep.
+    ///   Pass `|| false` when no early-exit condition is needed.  The primary
+    ///   use-case is `|| driver.has_pending_seek()`: when a new user seek
+    ///   arrives while the gate is sleeping, the loop exits on the next tick
+    ///   (≤ 500 ms) so the main `run()` loop can reposition the cursor and
+    ///   start fetching at the new target instead of waiting for the full
+    ///   buffer to drain.
     ///
     /// # Example
     ///
     /// ```ignore
-    /// session.wait_for_buffer_capacity(&MediaType::Video,
-    ///     || driver.playback_state().freezes_clock()).await;
+    /// session.wait_for_buffer_capacity(
+    ///     &MediaType::Video,
+    ///     || driver.playback_state().freezes_clock(),
+    ///     || driver.has_pending_seek(),
+    /// ).await;
     /// session.fetch_next_segment(MediaType::Video, &metrics).await?;
     /// ```
     pub async fn wait_for_buffer_capacity(
         &mut self,
         media_type: &MediaType,
         frozen: impl Fn() -> bool,
+        interrupt: impl Fn() -> bool,
     ) {
         // Clone the Arc so the await point on set_timeout does not hold a
         // borrow on `self`, allowing sync_playback_state to take &mut self.
         let clock = Arc::clone(&self.clock);
         while self.estimated_buffer_level_ms(media_type) >= self.buffer_target_ms() {
+            // Bail out immediately if the caller signals an early-exit
+            // condition (e.g. a new user seek has been queued).
+            if interrupt() {
+                break;
+            }
             clock.set_timeout(500.0).await;
+            // Check again after the sleep — a seek may have arrived during
+            // the 500 ms wait.
+            if interrupt() {
+                break;
+            }
             self.sync_playback_state(if frozen() {
                 PlaybackState::Paused
             } else {
@@ -1734,6 +1774,23 @@ impl<F: SegmentFetcher> DashSession<F> {
                 break;
             }
 
+            // ── User seek ────────────────────────────────────────────────────
+            // Check before any position/buffer reads so the new cursor is in
+            // effect for the entire iteration (gap controller, ABR, fetches).
+            if let Some(pos) = drv.pending_seek_s() {
+                tracing::info!(pos, "run: user-initiated seek");
+                self.seek_to(pos);
+                // Unconditionally reset the wall-clock so estimated_buffer_level_ms
+                // starts from a clean zero baseline at the new position,
+                // regardless of the playback state at the time of the seek.
+                self.reset_clock_for_seek();
+                // Re-enable any tracks whose EOS fired before the seek target.
+                video_done = !self.has_video();
+                audio_done = !self.has_audio();
+                prev_video_index = None;
+                prev_audio_index = None;
+            }
+
             // ── 1. Pause sync ────────────────────────────────────────────────
             self.sync_playback_state(drv.playback_state());
 
@@ -1752,7 +1809,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             // ── 4. Gap controller ────────────────────────────────────────────
             {
                 let pos = drv.position_s();
-                let buffered = buf.buffered(gate.clone());
+                let buffered = buf.buffered(gate);
                 if let Some(target) = self.tick_gap(pos, &buffered, drv.playback_state()) {
                     tracing::info!(
                         pos,
@@ -1767,8 +1824,12 @@ impl<F: SegmentFetcher> DashSession<F> {
             }
 
             // ── 5. Video buffer gate ─────────────────────────────────────────
-            self.wait_for_buffer_capacity(&gate, || drv.playback_state().freezes_clock())
-                .await;
+            self.wait_for_buffer_capacity(
+                &gate,
+                || drv.playback_state().freezes_clock(),
+                || drv.has_pending_seek(),
+            )
+            .await;
 
             // ── 6. Video fetch ───────────────────────────────────────────────
             let pos = drv.position_s();
@@ -1810,12 +1871,21 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let audio_target = drv.audio_gate_target_ms(vbuf, self.buffer_target_ms());
                 let clock = Arc::clone(&self.clock);
                 while self.estimated_buffer_level_ms(&MediaType::Audio) >= audio_target {
+                    // Bail out immediately if a new seek has been queued so
+                    // the main loop can reposition without waiting a full tick.
+                    if drv.has_pending_seek() {
+                        break;
+                    }
                     tracing::debug!(
                         buf_ms = self.estimated_buffer_level_ms(&MediaType::Audio) as u64,
                         target_ms = audio_target as u64,
                         "audio buffer gate: waiting"
                     );
                     clock.set_timeout(500.0).await;
+                    // Check again after the sleep.
+                    if drv.has_pending_seek() {
+                        break;
+                    }
                     self.sync_playback_state(drv.playback_state());
                 }
             }
@@ -2039,12 +2109,12 @@ impl<F: SegmentFetcher> DashSession<F> {
         buf: &mut impl MediaBuffer,
         prune_end: f64,
     ) -> Result<(), DashError> {
-        let ranges: Vec<_> = buf.buffered(mt.clone());
+        let ranges: Vec<_> = buf.buffered(mt);
         for range in ranges {
             if range.end <= prune_end {
-                buf.remove_range(mt.clone(), range.start, range.end).await?;
+                buf.remove_range(mt, range.start, range.end).await?;
             } else if range.start < prune_end {
-                buf.remove_range(mt.clone(), range.start, prune_end).await?;
+                buf.remove_range(mt, range.start, prune_end).await?;
             }
         }
         Ok(())
@@ -2784,7 +2854,7 @@ impl<F: SegmentFetcher> DashSession<F> {
     ) -> Result<FetchOutcome, DashError> {
         loop {
             match self
-                .fetch_next_segment_inner(media_type.clone(), metrics, buf)
+                .fetch_next_segment_inner(media_type, metrics, buf)
                 .await
             {
                 Err(DashError::EndOfStream { .. }) => {
@@ -2809,7 +2879,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                     Delay::new(core::time::Duration::from_millis(seg_dur_ms as u64)).await;
                     // Single retry: if still 404, propagate the underlying error.
                     return self
-                        .fetch_next_segment_inner(media_type.clone(), metrics, buf)
+                        .fetch_next_segment_inner(media_type, metrics, buf)
                         .await
                         .map(FetchOutcome::Fetched);
                 }
@@ -3003,7 +3073,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             let wall_ms = (self.clock.unix_s() + self.utc_clock_offset_s) * 1_000.0;
             self.dash_metrics.push_switch(RepresentationSwitchRecord {
                 wall_ms,
-                media_type: media_type.clone(),
+                media_type,
                 from_index,
                 to_index: decision.index,
                 reason: decision.reason.clone(),
@@ -3030,14 +3100,14 @@ impl<F: SegmentFetcher> DashSession<F> {
                     rep_id = %new_rep_id,
                     "quality switch: re-appending init segment from cache"
                 );
-                buf.append(media_type.clone(), data, true).await?;
+                buf.append(media_type, data, true).await?;
             } else {
                 tracing::debug!(
                     media_type = %media_type,
                     rep_id = %new_rep_id,
                     "quality switch: init segment not cached, fetching"
                 );
-                self.fetch_init_segment(media_type.clone(), buf).await?;
+                self.fetch_init_segment(media_type, buf).await?;
             }
         }
 
@@ -3046,7 +3116,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         // the block above did not run.  Ensure the init segment has been sent
         // before any media data reaches the source buffer.
         if !quality_switched && !self.track(&media_type)?.init_segment_sent {
-            self.fetch_init_segment(media_type.clone(), buf).await?;
+            self.fetch_init_segment(media_type, buf).await?;
         }
 
         // ── SegmentBase: lazy sidx population ────────────────────────────────
@@ -3373,7 +3443,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let track = self.track(&media_type)?;
                 let position_s = self.estimated_playback_position_s();
                 let level = buf
-                    .buffered(media_type.clone())
+                    .buffered(media_type)
                     .last()
                     .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
                     .unwrap_or(0.0);
@@ -3381,7 +3451,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             };
             self.dash_metrics.push_http(HttpRequestRecord {
                 wall_ms,
-                media_type: media_type.clone(),
+                media_type,
                 segment_number: seg_number,
                 url: response.final_url.to_string(),
                 bytes_received: response.bytes_received,
@@ -3391,7 +3461,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             });
             self.dash_metrics.push_buffer_level(BufferLevelSample {
                 wall_ms,
-                media_type: media_type.clone(),
+                media_type,
                 level_ms: buffer_level_ms,
             });
         }
@@ -3441,7 +3511,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                         "emsg event"
                     );
                     let event = DashEvent {
-                        media_type: media_type.clone(),
+                        media_type,
                         scheme_id_uri: emsg.scheme_id_uri,
                         value: emsg.value,
                         presentation_time_s: emsg.presentation_time_s,
@@ -3457,7 +3527,7 @@ impl<F: SegmentFetcher> DashSession<F> {
 
         {
             let data = response.data;
-            buf.append(media_type.clone(), data, false).await?;
+            buf.append(media_type, data, false).await?;
             let track = self.track_mut(&media_type)?;
             track.segment_number += 1;
             if let Some((seg_time, seg_dur)) = maybe_timeline_info {
@@ -3724,7 +3794,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         let cache_key = format!("{}/{}", media_type, rep_id);
         self.init_cache.insert(cache_key, response.data.clone());
 
-        buf.append(media_type.clone(), response.data, true).await?;
+        buf.append(media_type, response.data, true).await?;
 
         {
             let track = self.track_mut(&media_type)?;

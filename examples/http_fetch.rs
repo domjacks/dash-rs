@@ -154,7 +154,7 @@ impl PlaybackDriver for HttpPlaybackDriver {
         self.segments_fetched < SEGMENTS_TO_FETCH
     }
 
-    fn on_iteration_start(&mut self, _session_pos: f64) {
+    fn on_iteration_start(&mut self, _session_pos: f64, _vbuf: f64, _abuf: f64) {
         self.segments_fetched += 1;
     }
 

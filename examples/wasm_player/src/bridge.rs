@@ -150,6 +150,16 @@ extern "C" {
     // Debug panel status push — compact JSON string; JS calls JSON.parse on it.
     #[wasm_bindgen(method, js_name = reportStatus)]
     pub(crate) fn report_status(this: &JsBridge, json: &str);
+
+    // ── User seek ─────────────────────────────────────────────────────────
+    // Pending seek target in seconds, or NaN when no seek is pending.
+    // Set by JS (bridge.notifySeek) when the user moves the <video> seek bar.
+    #[wasm_bindgen(method, js_name = getPendingSeek)]
+    pub(crate) fn get_pending_seek(this: &JsBridge) -> f64;
+
+    // Clear the pending seek flag (called by Rust after consuming the value).
+    #[wasm_bindgen(method, js_name = clearPendingSeek)]
+    pub(crate) fn clear_pending_seek(this: &JsBridge);
 }
 
 // ── js_err helper ─────────────────────────────────────────────────────────────

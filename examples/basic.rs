@@ -82,7 +82,7 @@ async fn main() -> Result<(), DashError> {
             self.seg < 5
         }
 
-        fn on_iteration_start(&mut self, _pos: f64) {
+        fn on_iteration_start(&mut self, _pos: f64, _vbuf: f64, _abuf: f64) {
             self.seg += 1;
         }
 

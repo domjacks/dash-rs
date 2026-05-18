@@ -24,6 +24,19 @@ export function createBridge(video, log) {
   // Debug-panel state — latest status snapshot pushed from Rust each loop tick.
   let _latestStatus = null;
 
+  // User-seek state — set by notifySeek() when the browser fires 'seeking'.
+  // NaN means "no seek pending"; any finite value is a target in seconds.
+  // Rust reads this via getPendingSeek() and clears it via clearPendingSeek().
+  let pendingSeek = NaN;
+
+  // Rust-initiated seek counter.
+  // seekTo() increments this (only when video.currentTime actually changes)
+  // so that the resulting browser 'seeking' event can be identified as
+  // Rust-initiated and suppressed in notifySeek().  Without this guard the
+  // 'seeking' task queued by seekTo() fires after an await point and
+  // overwrites a pending user seek, causing a permanent Buffering stall.
+  let rustSeekingCount = 0;
+
   return {
 
     // ── Clock ──────────────────────────────────────────────────────────────────
@@ -50,7 +63,14 @@ export function createBridge(video, log) {
     // timestamp (potentially billions of seconds for BBC-style epoch streams)
     // so the video element must be seeked to where the buffered content lives.
     // Called once after session construction, before any segments are fetched.
+    //
+    // We increment rustSeekingCount (only when the position actually changes)
+    // so that the browser 'seeking' event queued by this assignment is
+    // recognised as Rust-initiated and suppressed in notifySeek().
     seekTo(time_s) {
+      if (video.currentTime !== time_s) {
+        rustSeekingCount++;
+      }
       log('MSE', `video.currentTime = ${time_s.toFixed(3)}`);
       video.currentTime = time_s;
     },
@@ -299,6 +319,38 @@ export function createBridge(video, log) {
     // Called by the setInterval updater in app.js.
     getLatestStatus() {
       return _latestStatus;
+    },
+
+    // ── User seek ──────────────────────────────────────────────────────────────
+
+    // Called by app.js when the browser fires the 'seeking' event.
+    // Stores the target position so that Rust's pending_seek_s() picks it up
+    // on the next fetch-loop iteration and repositions the segment cursor.
+    //
+    // Rust-initiated seeks (seekTo() above) also trigger 'seeking'.  We
+    // suppress those by checking rustSeekingCount so they do not masquerade
+    // as user seeks — which would cause Rust to re-seek to the wrong position
+    // while video.currentTime is already at the user's target, resulting in a
+    // permanent Buffering stall.
+    notifySeek(pos_s) {
+      if (rustSeekingCount > 0) {
+        rustSeekingCount--;
+        log('MSE', `seek suppressed (Rust-initiated) @ ${pos_s.toFixed(3)} s`);
+        return;
+      }
+      log('MSE', `seek pending → ${pos_s.toFixed(3)} s`);
+      pendingSeek = pos_s;
+    },
+
+    // Pending seek target in seconds, or NaN if none.
+    // Rust calls this via WasmPlaybackDriver::pending_seek_s().
+    getPendingSeek() {
+      return pendingSeek;
+    },
+
+    // Clear the pending seek flag after Rust has consumed the value.
+    clearPendingSeek() {
+      pendingSeek = NaN;
     },
 
   };
