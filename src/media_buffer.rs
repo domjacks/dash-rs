@@ -39,6 +39,7 @@
 //! [mse]: https://www.w3.org/TR/media-source/
 
 extern crate alloc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use async_trait::async_trait;
@@ -127,11 +128,7 @@ pub trait MediaBuffer {
     /// Change the codec of an existing track at a period boundary.
     ///
     /// Corresponds to `SourceBuffer.changeType()` in the MSE spec.
-    async fn change_type(
-        &mut self,
-        _mt: MediaType,
-        _mime_type: &str,
-    ) -> Result<(), DashError> {
+    async fn change_type(&mut self, _mt: MediaType, _mime_type: &str) -> Result<(), DashError> {
         Ok(())
     }
 
@@ -327,12 +324,7 @@ impl MediaBuffer for StubBuffer {
         }
     }
 
-    async fn append(
-        &mut self,
-        mt: MediaType,
-        data: Bytes,
-        is_init: bool,
-    ) -> Result<(), DashError> {
+    async fn append(&mut self, mt: MediaType, data: Bytes, is_init: bool) -> Result<(), DashError> {
         let chunk = StubChunk { data, is_init };
         match mt {
             MediaType::Video => self.video_chunks.push(chunk),
