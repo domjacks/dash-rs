@@ -1739,7 +1739,9 @@ impl<F: SegmentFetcher> DashSession<F> {
 
             // ── 2. Iteration start ───────────────────────────────────────────
             let session_pos = self.estimated_playback_position_s();
-            drv.on_iteration_start(session_pos);
+            let v_buf = self.estimated_buffer_level_ms(&MediaType::Video);
+            let a_buf = self.estimated_buffer_level_ms(&MediaType::Audio);
+            drv.on_iteration_start(session_pos, v_buf, a_buf);
 
             // ── 3. Optional pruning ──────────────────────────────────────────
             if drv.enable_pruning() {

@@ -284,16 +284,25 @@ pub trait PlaybackDriver {
     }
 
     /// Called at the **start** of each loop iteration, before the buffer gate
-    /// and fetch.  Receives the session's current estimated playback position.
+    /// and fetch.  Receives the session's current estimated playback position
+    /// and per-track buffer levels (in milliseconds).
     ///
     /// Use this to:
     /// - Advance a per-iteration counter or state machine before
     ///   `throughput_override_bps` or `should_continue` is queried.
     /// - Cache the session position so that `position_s()` can return it
     ///   without holding a reference to the session (GStreamer pattern).
+    /// - Forward buffer levels to `MediaBuffer::buffered()` so that the ABR
+    ///   controller receives a non-zero buffer level and can select higher
+    ///   quality representations.
     ///
     /// Default: no-op.
-    fn on_iteration_start(&mut self, _session_position_s: f64) {}
+    fn on_iteration_start(
+        &mut self,
+        _session_position_s: f64,
+        _video_buffer_level_ms: f64,
+        _audio_buffer_level_ms: f64,
+    ) {}
 
     /// Called immediately when the ABR controller switches to a different
     /// quality level during a fetch.
