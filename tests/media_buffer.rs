@@ -22,6 +22,15 @@ fn null_buffer_buffered_always_empty() {
     assert!(buf.buffered(MediaType::Audio).is_empty());
 }
 
+#[test]
+fn null_buffer_has_buffer_tracking_default_true() {
+    let buf = NullBuffer;
+    assert!(
+        buf.has_buffer_tracking(),
+        "NullBuffer uses the default impl which returns true"
+    );
+}
+
 #[tokio::test]
 async fn null_buffer_append_is_noop() {
     let mut buf = NullBuffer;

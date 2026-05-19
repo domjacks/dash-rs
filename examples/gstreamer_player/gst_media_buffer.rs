@@ -354,11 +354,20 @@ impl MediaBuffer for GstMediaBuffer {
     /// Always returns `vec![]`.
     ///
     /// GStreamer does not expose buffered time ranges in the same way as MSE.
-    /// The ABR controller will see zero buffer level and behave conservatively;
-    /// use `ThroughputRule` (via `throughput_override_bps`) for quality
-    /// selection in GStreamer builds.
+    /// [`has_buffer_tracking`][Self::has_buffer_tracking] returns `false` so
+    /// that [`DashSession::current_metrics`] substitutes the session's own
+    /// segment-count estimate, giving buffer-occupancy ABR rules a realistic
+    /// level rather than a permanent zero.
     fn buffered(&self, _mt: MediaType) -> Vec<TimeRange> {
         vec![]
+    }
+
+    /// Returns `false` — GStreamer does not expose MSE-style buffered time
+    /// ranges, so the session falls back to its own
+    /// [`estimated_buffer_level_ms`][dash_rs::session::DashSession::estimated_buffer_level_ms]
+    /// when computing ABR metrics.
+    fn has_buffer_tracking(&self) -> bool {
+        false
     }
 }
 

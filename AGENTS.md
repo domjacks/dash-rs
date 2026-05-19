@@ -145,6 +145,25 @@ with a `NotSupportedError`.
 Per-representation filtering (within a single `AdaptationSet` that mixes
 supported and unsupported codecs) is tracked as P2-14 in `COMPLIANCE.md`.
 
+### `MediaBuffer::has_buffer_tracking` — ABR buffer-level source
+
+`MediaBuffer` has a method `fn has_buffer_tracking(&self) -> bool` that
+defaults to `true`.  It controls how `DashSession::current_metrics()` obtains
+the buffer level passed to ABR rules:
+
+- `true` (default — `NullBuffer`, `StubBuffer`, `BridgeMediaBuffer`): the level
+  comes from `MediaBuffer::buffered()`, which returns real MSE `TimeRanges` data.
+- `false` (`GstMediaBuffer`): `buffered()` always returns `vec![]` because
+  GStreamer does not expose MSE-style buffered ranges.  `current_metrics()`
+  substitutes `estimated_buffer_level_ms` (a wall-clock approximation based on
+  segments fetched minus elapsed playing time), so `InsufficientBufferRule` and
+  `BufferOccupancyRule` receive a meaningful level rather than zero.
+
+Implementations that override `buffered()` to return an empty slice when the
+buffer is genuinely drained (e.g. stall) should keep `has_buffer_tracking()`
+returning `true` — the empty slice correctly signals a critical buffer level to
+ABR rules, and the fallback must not activate in that case.
+
 ### `AbrController::select` takes `&self`; `record_switch` takes `&mut self`
 
 `select` is intentionally immutable so it can be called while other state is
@@ -621,8 +640,12 @@ stalls at a period boundary, call `session.seek_to(period_end_s)` manually.
   call it after `DashSession::from_url` and before `set_playing` whenever
   `session.is_live()`.
 - `buffered()` always returns `vec![]` for `GstMediaBuffer` — GStreamer does not
-  expose buffered time ranges in the MSE sense.  Use `ThroughputRule` (via
-  `throughput_override_bps`) for quality selection in GStreamer builds.
+  expose buffered time ranges in the MSE sense.  `GstMediaBuffer` overrides
+  `has_buffer_tracking()` → `false` so that `current_metrics()` substitutes
+  `estimated_buffer_level_ms` instead of reading 0.0 from the empty slice.
+  This prevents `InsufficientBufferRule` from permanently pinning quality to
+  index 0.  Use `ThroughputRule` (via `throughput_override_bps`) for quality
+  selection in GStreamer builds.
 - `remove_range()` is a no-op for `GstMediaBuffer`; GStreamer manages its own
   internal buffer.
 - `change_type()` does not renegotiate caps with GStreamer at runtime.

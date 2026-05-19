@@ -3557,6 +3557,64 @@ fn current_metrics_buffer_level_at_position_zero() {
     assert_eq!(metrics_before.buffer_level_ms, 0.0);
 }
 
+/// When the `MediaBuffer` returns `has_buffer_tracking() = false`,
+/// `current_metrics` must fall back to `estimated_buffer_level_ms` rather
+/// than deriving the level from the (always-empty) `buffered()` return value.
+/// This is the fix for GStreamer builds where `buffered()` always returns `[]`.
+#[tokio::test]
+async fn current_metrics_uses_estimated_level_when_no_buffer_tracking() {
+    const MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="static"
+     mediaPresentationDuration="PT20S">
+  <Period>
+    <AdaptationSet mimeType="video/mp4" contentType="video">
+      <SegmentTemplate media="seg-$Number$.m4s" initialization="init.mp4"
+                       startNumber="1" duration="2" timescale="1"/>
+      <Representation id="v1" bandwidth="1000000"/>
+    </AdaptationSet>
+  </Period>
+</MPD>"#;
+
+    // A MediaBuffer that always returns [] from buffered() and declares it has
+    // no buffer tracking — simulates a GStreamer appsrc sink.
+    struct NoTrackingBuffer;
+    #[async_trait]
+    impl MediaBuffer for NoTrackingBuffer {
+        fn buffered(&self, _mt: MediaType) -> Vec<TimeRange> {
+            vec![] // always empty, like GstMediaBuffer
+        }
+        fn has_buffer_tracking(&self) -> bool {
+            false
+        }
+    }
+
+    let mut buf = NoTrackingBuffer;
+    let mut session = session_from_xml(MPD);
+
+    // Before any fetch, estimated level is 0 — no segments fetched yet.
+    let m = session.current_metrics(MediaType::Video, 0.0, &buf);
+    assert_eq!(
+        m.buffer_level_ms, 0.0,
+        "estimated level is 0 before any segments are fetched"
+    );
+
+    // Fetch one 2 s segment.  After the fetch, the session's estimated level
+    // is 1 × 2000 ms − elapsed_playing_ms.  Since notify_playing hasn't been
+    // called, elapsed = 0 → estimated = 2000 ms exactly.
+    let metrics = AbrMetrics::new(1_000_000.0, 0.0);
+    session
+        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
+        .await
+        .expect("fetch must succeed");
+
+    let m = session.current_metrics(MediaType::Video, 0.0, &buf);
+    assert!(
+        m.buffer_level_ms >= 2_000.0,
+        "after one 2 s segment, estimated level must be ≥ 2000 ms; got {}",
+        m.buffer_level_ms
+    );
+}
+
 /// When position_s is set to the buffer end, buffer_level_ms is 0 (nothing
 /// ahead).
 #[test]

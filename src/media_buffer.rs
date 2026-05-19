@@ -192,6 +192,26 @@ pub trait MediaBuffer {
     fn buffered(&self, _mt: MediaType) -> Vec<TimeRange> {
         alloc::vec![]
     }
+
+    /// Returns `true` when [`buffered`][Self::buffered] provides meaningful
+    /// time-range data.
+    ///
+    /// When this returns `false`, [`DashSession::current_metrics`] substitutes
+    /// the session's own [`estimated_buffer_level_ms`] in place of the value
+    /// derived from `buffered()`, so that buffer-occupancy ABR rules
+    /// ([`InsufficientBufferRule`], [`BufferOccupancyRule`]) receive a
+    /// realistic level rather than a permanent zero.
+    ///
+    /// **Override to `false` for sinks that cannot report buffered ranges**,
+    /// e.g. a GStreamer `appsrc` pipeline where data is consumed opaquely by
+    /// the renderer with no MSE-equivalent `SourceBuffer.buffered` API.
+    ///
+    /// [`estimated_buffer_level_ms`]: crate::session::DashSession::estimated_buffer_level_ms
+    /// [`InsufficientBufferRule`]: crate::abr::insufficient_buffer::InsufficientBufferRule
+    /// [`BufferOccupancyRule`]: crate::abr::buffer::BufferOccupancyRule
+    fn has_buffer_tracking(&self) -> bool {
+        true
+    }
 }
 
 // ── NullBuffer ───────────────────────────────────────────────────────────────
