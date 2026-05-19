@@ -10,6 +10,14 @@ streaming session from native Rust code.
 
 ## What's included
 
+- VOD/AOD playback
+- Live playback
+- Seeking
+- ABR (see rules below)
+- Playback metrics
+- Logging
+- WASM + GStreamer examples (see below for how to run)
+
 ### ABR rules
 
 | Rule | Algorithm | dash.js equivalent |
