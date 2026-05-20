@@ -20,6 +20,22 @@ pub enum AbrDecisionReason {
     RequestAbandoned,
 }
 
+impl core::fmt::Display for AbrDecisionReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self {
+            Self::Initial => "initial",
+            Self::ThroughputBased => "throughput",
+            Self::BufferOccupancyBased => "buffer-occupancy",
+            Self::InsufficientBuffer => "insufficient-buffer",
+            Self::SwitchHistoryThrottle => "switch-history-throttle",
+            Self::Override => "override",
+            Self::DroppedFrames => "dropped-frames",
+            Self::RequestAbandoned => "request-abandoned",
+        };
+        f.write_str(s)
+    }
+}
+
 /// The output from [`crate::abr::AbrController`]: which representation index
 /// to use next, and why.
 #[derive(Debug, Clone)]
@@ -33,5 +49,11 @@ pub struct QualityDecision {
 impl QualityDecision {
     pub fn new(index: usize, reason: AbrDecisionReason) -> Self {
         Self { index, reason }
+    }
+}
+
+impl core::fmt::Display for QualityDecision {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "index={} reason={}", self.index, self.reason)
     }
 }

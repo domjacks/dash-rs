@@ -369,3 +369,37 @@ impl MediaBuffer for StubBuffer {
         alloc::vec![]
     }
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::TimeRange;
+
+    #[test]
+    fn time_range_duration_normal() {
+        let r = TimeRange::new(1.0, 5.0);
+        assert!((r.duration() - 4.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_range_duration_zero_length() {
+        let r = TimeRange::new(3.0, 3.0);
+        assert!((r.duration() - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn time_range_duration_inverted_is_negative() {
+        // Callers must not construct inverted ranges, but the struct itself
+        // does not panic — it returns a negative duration so the ABR controller
+        // and gap detector can detect the anomaly.
+        let r = TimeRange::new(5.0, 1.0);
+        assert!(r.duration() < 0.0, "inverted range should yield negative duration");
+    }
+
+    #[test]
+    fn time_range_duration_nan_propagates() {
+        let r = TimeRange::new(f64::NAN, 5.0);
+        assert!(r.duration().is_nan(), "NaN start should propagate through duration()");
+    }
+}

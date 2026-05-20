@@ -10,12 +10,15 @@
 //! - Pushes a console progress row after every segment pair.
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Arc,
 };
 
 use async_trait::async_trait;
-use dash_rs::session::driver::{IterationSummary, PlaybackDriver, PlaybackState};
+use dash_rs::{
+    session::driver::{IterationSummary, PlaybackDriver, PlaybackState},
+    ThroughputCell,
+};
 use gst::prelude::*;
 use gstreamer as gst;
 
@@ -24,7 +27,7 @@ use gstreamer as gst;
 pub(crate) struct GstPlaybackDriver {
     pub(crate) is_paused: Arc<AtomicBool>,
     pub(crate) is_buffering: Arc<AtomicBool>,
-    pub(crate) throughput_tracker: Arc<AtomicU64>,
+    pub(crate) throughput: Arc<ThroughputCell>,
     /// Cloned pipeline handle — used to call `set_state(Playing)` in
     /// `on_session_started` after init segments have been pushed.
     pipeline: gst::Pipeline,
@@ -37,13 +40,13 @@ impl GstPlaybackDriver {
     pub(crate) fn new(
         is_paused: Arc<AtomicBool>,
         is_buffering: Arc<AtomicBool>,
-        throughput_tracker: Arc<AtomicU64>,
+        throughput: Arc<ThroughputCell>,
         pipeline: gst::Pipeline,
     ) -> Self {
         Self {
             is_paused,
             is_buffering,
-            throughput_tracker,
+            throughput,
             pipeline,
             cached_pos_s: 0.0,
             seg: 0,
@@ -69,18 +72,7 @@ impl PlaybackDriver for GstPlaybackDriver {
     }
 
     fn throughput_override_bps(&self) -> Option<f64> {
-        let raw = self.throughput_tracker.load(Ordering::Relaxed);
-        if raw == 0 {
-            // No fetch has completed yet — let the ABR controller use its own
-            // throughput estimate rather than treating bandwidth as 0 bps.
-            return None;
-        }
-        let bps = f64::from_bits(raw);
-        if bps > 0.0 {
-            Some(bps)
-        } else {
-            None
-        }
+        self.throughput.get()
     }
 
     fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {
@@ -121,7 +113,7 @@ impl PlaybackDriver for GstPlaybackDriver {
     }
 
     fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-        let measured_bps = f64::from_bits(self.throughput_tracker.load(Ordering::Relaxed));
+        let measured_kbps = self.throughput.get().unwrap_or(0.0) / 1_000.0;
         let buf_ms = if s.video_buffer_ms > 0.0 {
             s.video_buffer_ms
         } else {
@@ -152,7 +144,7 @@ impl PlaybackDriver for GstPlaybackDriver {
             aud_reason,
             buf_ms / 1_000.0,
             video_ms,
-            measured_bps / 1_000.0,
+            measured_kbps,
         );
     }
 }

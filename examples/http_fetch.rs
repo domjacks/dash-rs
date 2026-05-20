@@ -13,10 +13,7 @@
 //!   cargo run --example http_fetch -- https://your-stream/manifest.mpd
 
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Instant,
 };
 
@@ -26,7 +23,7 @@ use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     media_buffer::NullBuffer,
     session::driver::{IterationSummary, PlaybackDriver},
-    DashError, Player,
+    DashError, Player, ThroughputCell,
 };
 use url::Url;
 
@@ -35,16 +32,15 @@ use url::Url;
 /// A [`SegmentFetcher`] backed by a `reqwest` HTTP client.
 ///
 /// After every successful fetch the measured throughput (bits per second) is
-/// published into `last_throughput_bps` via an `AtomicU64` bit-cast so the
-/// outer fetch loop can read real values back for the next ABR decision.
+/// published into `throughput` so the outer fetch loop can read real values
+/// back for the next ABR decision.
 struct HttpSegmentFetcher {
     client: reqwest::Client,
-    /// `f64::to_bits(throughput_bps)` after each completed fetch.
-    last_throughput_bps: Arc<AtomicU64>,
+    throughput: Arc<ThroughputCell>,
 }
 
 impl HttpSegmentFetcher {
-    fn new(throughput_tracker: Arc<AtomicU64>) -> Self {
+    fn new(throughput: Arc<ThroughputCell>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("dash-rs-example/0.1")
             .timeout(std::time::Duration::from_secs(30))
@@ -52,7 +48,7 @@ impl HttpSegmentFetcher {
             .expect("failed to build HTTP client");
         Self {
             client,
-            last_throughput_bps: throughput_tracker,
+            throughput,
         }
     }
 }
@@ -93,8 +89,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
         // Publish throughput so the outer loop can build accurate AbrMetrics.
         if transfer_duration_ms > 0 {
             let bps = (bytes_received as f64 * 8.0) / (transfer_duration_ms as f64 / 1_000.0);
-            self.last_throughput_bps
-                .store(bps.to_bits(), Ordering::Relaxed);
+            self.throughput.set(bps);
         }
 
         Ok(FetchResponse {
@@ -139,32 +134,29 @@ const SEGMENTS_TO_FETCH: u32 = 4;
 /// Stops the loop after [`SEGMENTS_TO_FETCH`] iterations and feeds real
 /// measured throughput back into the ABR controller.
 struct HttpPlaybackDriver {
-    throughput_tracker: Arc<AtomicU64>,
+    throughput: Arc<ThroughputCell>,
     segments_fetched: u32,
     last_transfer_ms: f64,
+    cached_pos_s: f64,
 }
 
 #[async_trait(?Send)]
 impl PlaybackDriver for HttpPlaybackDriver {
     fn position_s(&self) -> f64 {
-        0.0
+        self.cached_pos_s
     }
 
     fn should_continue(&self) -> bool {
         self.segments_fetched < SEGMENTS_TO_FETCH
     }
 
-    fn on_iteration_start(&mut self, _session_pos: f64, _vbuf: f64, _abuf: f64) {
+    fn on_iteration_start(&mut self, session_pos: f64, _vbuf: f64, _abuf: f64) {
+        self.cached_pos_s = session_pos;
         self.segments_fetched += 1;
     }
 
     fn throughput_override_bps(&self) -> Option<f64> {
-        let raw = self.throughput_tracker.load(Ordering::Relaxed);
-        if raw == 0 {
-            None
-        } else {
-            Some(f64::from_bits(raw))
-        }
+        self.throughput.get()
     }
 
     fn on_iteration(&mut self, s: &IterationSummary<'_>) {
@@ -187,7 +179,7 @@ impl PlaybackDriver for HttpPlaybackDriver {
             aud_idx,
             aud_reason,
             s.last_transfer_ms as u64,
-            s.last_throughput_bps / 1_000.0,
+            s.last_throughput_bps.unwrap_or(0.0) / 1_000.0,
         );
     }
 }
@@ -213,20 +205,20 @@ async fn main() -> Result<(), DashError> {
     println!("Manifest: {manifest_url}");
     println!();
 
-    // 1. Shared throughput tracker — the fetcher writes it; the loop reads it.
-    let throughput_tracker = Arc::new(AtomicU64::new(0u64));
+    // 1. Shared throughput cell — the fetcher writes it; the driver reads it.
+    let throughput = Arc::new(ThroughputCell::new());
 
     // 2. Build the driver before `Player::from_url` so we can move
-    //    `throughput_tracker` into it.  No session state is needed at
-    //    construction time.
+    //    `throughput` into it.  No session state is needed at construction time.
     let driver = HttpPlaybackDriver {
-        throughput_tracker: Arc::clone(&throughput_tracker),
+        throughput: Arc::clone(&throughput),
         segments_fetched: 0,
         last_transfer_ms: 0.0,
+        cached_pos_s: 0.0,
     };
 
     // 3. Fetch and parse the MPD, then wrap into a Player.
-    let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
+    let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput));
     let mut player = Player::from_url(&manifest_url, fetcher, NullBuffer, driver).await?;
 
     // 4. Print available representations.

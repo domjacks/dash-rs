@@ -2,32 +2,31 @@
 //! backed by a `reqwest` HTTP client.
 //!
 //! After every successful fetch the measured throughput (bits per second) is
-//! published into `last_throughput_bps` via an `AtomicU64` bit-cast so the
-//! outer fetch loop can read real values back for the next ABR decision.
+//! published into `throughput` so the driver can feed real values to the ABR
+//! controller on the next iteration.
 
 use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
+    sync::Arc,
     time::Instant,
 };
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use dash_rs::fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
+use dash_rs::{
+    fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
+    ThroughputCell,
+};
 use url::Url;
 
 // ── HttpSegmentFetcher ────────────────────────────────────────────────────────
 
 pub(crate) struct HttpSegmentFetcher {
     client: reqwest::Client,
-    /// `f64::to_bits(throughput_bps)` after each completed fetch.
-    pub(crate) last_throughput_bps: Arc<AtomicU64>,
+    pub(crate) throughput: Arc<ThroughputCell>,
 }
 
 impl HttpSegmentFetcher {
-    pub(crate) fn new(throughput_tracker: Arc<AtomicU64>) -> Self {
+    pub(crate) fn new(throughput: Arc<ThroughputCell>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent("dash-rs-gstreamer-example/0.1")
             .timeout(std::time::Duration::from_secs(30))
@@ -35,7 +34,7 @@ impl HttpSegmentFetcher {
             .expect("failed to build HTTP client");
         Self {
             client,
-            last_throughput_bps: throughput_tracker,
+            throughput,
         }
     }
 }
@@ -74,8 +73,7 @@ impl SegmentFetcher for HttpSegmentFetcher {
 
         if transfer_duration_ms > 0 {
             let bps = (bytes_received as f64 * 8.0) / (transfer_duration_ms as f64 / 1_000.0);
-            self.last_throughput_bps
-                .store(bps.to_bits(), Ordering::Relaxed);
+            self.throughput.set(bps);
         }
 
         Ok(FetchResponse {

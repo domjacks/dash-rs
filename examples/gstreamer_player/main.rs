@@ -53,11 +53,11 @@ mod fetcher;
 mod gst_media_buffer;
 
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     mpsc, Arc,
 };
 
-use dash_rs::{DashError, Player};
+use dash_rs::{DashError, Player, ThroughputCell};
 use driver::GstPlaybackDriver;
 use fetcher::HttpSegmentFetcher;
 use gst::prelude::*;
@@ -73,15 +73,15 @@ const DEFAULT_MPD_URL: &str = "https://dash.akamaized.net/akamai/bbb_30fps/bbb_3
 async fn run_session(
     manifest_url: Url,
     buf: GstMediaBuffer,
-    throughput_tracker: Arc<AtomicU64>,
+    throughput: Arc<ThroughputCell>,
     is_paused: Arc<AtomicBool>,
     is_buffering: Arc<AtomicBool>,
 ) -> Result<(), DashError> {
-    let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput_tracker));
+    let fetcher = HttpSegmentFetcher::new(Arc::clone(&throughput));
 
     // Grab the pipeline handle before buf is moved into Player::from_url.
     let pipeline = buf.pipeline();
-    let driver = GstPlaybackDriver::new(is_paused, is_buffering, throughput_tracker, pipeline);
+    let driver = GstPlaybackDriver::new(is_paused, is_buffering, throughput, pipeline);
 
     // Player::from_url fetches + parses the MPD, opens the media buffer, and
     // sets up the GStreamer appsrc chains.  GstMediaBuffer::open() is a no-op
@@ -181,8 +181,8 @@ fn run() {
     });
     let pipeline = buf.pipeline();
 
-    // Shared throughput tracker.
-    let throughput_tracker = Arc::new(AtomicU64::new(0u64));
+    // Shared throughput cell.
+    let throughput = Arc::new(ThroughputCell::new());
 
     // Shared pause-state flag updated from the GLib bus watch on the main
     // thread and read by the background fetch loop.
@@ -197,7 +197,7 @@ fn run() {
     // Spawn a background OS thread that owns the tokio runtime and the
     // session.  This keeps the main thread free for GStreamer's bus loop
     // (required for macOS video-sink rendering).
-    let throughput_tracker_bg = Arc::clone(&throughput_tracker);
+    let throughput_bg = Arc::clone(&throughput);
     let is_paused_bg = Arc::clone(&is_paused);
     let is_buffering_bg = Arc::clone(&is_buffering);
     std::thread::spawn(move || {
@@ -209,7 +209,7 @@ fn run() {
         let result = rt.block_on(run_session(
             manifest_url,
             buf,
-            throughput_tracker_bg,
+            throughput_bg,
             is_paused_bg,
             is_buffering_bg,
         ));

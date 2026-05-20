@@ -6804,3 +6804,36 @@ mod run_driver_tests {
         }
     }
 }
+
+// ── MockFetcher queue exhaustion ──────────────────────────────────────────────
+
+#[cfg(test)]
+mod mock_fetcher_exhaustion {
+    use super::*;
+
+    /// When `MockFetcher`'s manifest queue is drained, subsequent manifest
+    /// requests return empty bytes.  `refresh_manifest` must propagate that as
+    /// an error rather than silently succeeding with a corrupt session state.
+    #[tokio::test]
+    async fn refresh_manifest_errors_when_queue_exhausted() {
+        let updated_mpd = live_mpd("PT30S");
+        let fetcher = MockFetcher::with_manifests(&[updated_mpd.as_str()]);
+        let mpd = dash_rs::manifest::parse(&live_mpd("PT4S")).unwrap();
+        let base_url = Url::parse("http://example.com/").unwrap();
+        let mut session =
+            DashSession::from_mpd(mpd, base_url, Arc::new(fetcher)).expect("from_mpd failed");
+
+        // First refresh consumes the only entry in the queue — should succeed.
+        assert!(
+            session.refresh_manifest().await.is_ok(),
+            "first refresh should succeed"
+        );
+
+        // Second refresh: queue is empty → empty bytes → MPD parse failure.
+        let result = session.refresh_manifest().await;
+        assert!(
+            result.is_err(),
+            "refresh with exhausted queue should return an error"
+        );
+    }
+}

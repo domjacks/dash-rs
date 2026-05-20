@@ -303,3 +303,81 @@ fn parse_adaptation_sets(xml: &str) -> Option<Vec<AdaptationSet>> {
     }
     Some(period.adaptations)
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::{check_xlink, parse_adaptation_sets, parse_periods, XLinkAction};
+    use crate::Url;
+
+    fn base() -> Url {
+        Url::parse("http://example.com/").unwrap()
+    }
+
+    // ── check_xlink ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn check_xlink_skips_absent_href() {
+        assert!(matches!(check_xlink(&None, &None, &base()), XLinkAction::Skip));
+    }
+
+    #[test]
+    fn check_xlink_skips_on_request_actuate() {
+        let href = Some("http://example.com/period.xml".to_owned());
+        let actuate = Some("onRequest".to_owned());
+        assert!(matches!(check_xlink(&href, &actuate, &base()), XLinkAction::Skip));
+    }
+
+    #[test]
+    fn check_xlink_removes_resolve_to_zero_sentinel() {
+        let href = Some("urn:mpeg:dash:resolve-to-zero:2013".to_owned());
+        let actuate = Some("onLoad".to_owned());
+        assert!(matches!(check_xlink(&href, &actuate, &base()), XLinkAction::Remove));
+    }
+
+    #[test]
+    fn check_xlink_fetch_absolute_url() {
+        let href = Some("http://cdn.example.com/extra.xml".to_owned());
+        let actuate = Some("onLoad".to_owned());
+        let action = check_xlink(&href, &actuate, &base());
+        assert!(matches!(action, XLinkAction::Fetch(_)));
+    }
+
+    #[test]
+    fn check_xlink_fetch_relative_url_resolved_against_base() {
+        let href = Some("segments/extra.xml".to_owned());
+        let actuate = Some("onLoad".to_owned());
+        let action = check_xlink(&href, &actuate, &base());
+        assert!(matches!(action, XLinkAction::Fetch(_)));
+    }
+
+    // ── parse_periods ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_periods_from_bare_fragment() {
+        let xml = r#"<Period id="p1" start="PT0S"><AdaptationSet mimeType="video/mp4"><Representation id="v1" bandwidth="500000"/></AdaptationSet></Period>"#;
+        let periods = parse_periods(xml).expect("should parse bare Period fragment");
+        assert_eq!(periods.len(), 1);
+        assert_eq!(periods[0].id.as_deref(), Some("p1"));
+    }
+
+    #[test]
+    fn parse_periods_returns_none_for_garbage_xml() {
+        assert!(parse_periods("not xml at all!!!").is_none());
+    }
+
+    // ── parse_adaptation_sets ─────────────────────────────────────────────────
+
+    #[test]
+    fn parse_adaptation_sets_from_bare_fragment() {
+        let xml = r#"<AdaptationSet mimeType="video/mp4" lang="en"><Representation id="v1" bandwidth="500000"/></AdaptationSet>"#;
+        let sets = parse_adaptation_sets(xml).expect("should parse bare AdaptationSet fragment");
+        assert_eq!(sets.len(), 1);
+    }
+
+    #[test]
+    fn parse_adaptation_sets_returns_none_for_garbage_xml() {
+        assert!(parse_adaptation_sets("garbage").is_none());
+    }
+}

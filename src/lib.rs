@@ -20,6 +20,7 @@ pub mod mp4;
 pub mod player;
 pub mod session;
 mod time;
+pub mod throughput_cell;
 pub mod util;
 
 #[cfg(not(feature = "std"))]
@@ -51,3 +52,4 @@ pub use session::{
     BufferLevelSample, DashMetrics, DashSession, FetchOutcome, GapControllerSettings,
     GapSeekReason, GapSeekTarget, HttpRequestRecord, MediaType, RepresentationSwitchRecord,
 };
+pub use throughput_cell::ThroughputCell;

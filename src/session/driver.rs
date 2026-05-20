@@ -118,8 +118,8 @@ pub struct IterationSummary<'a> {
     pub last_transfer_ms: f64,
 
     /// Measured throughput of the most recently completed HTTP request (bps),
-    /// or `0.0` if no request has completed yet.
-    pub last_throughput_bps: f64,
+    /// or `None` if no request has completed yet.
+    pub last_throughput_bps: Option<f64>,
 
     /// Total number of video representations available in the current period,
     /// or `0` if the video track is absent.

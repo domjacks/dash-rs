@@ -334,11 +334,11 @@ Player::from_url(&url, fetcher, buf, MyDriver::new()).await?.run().await?;
 Player::from_url_with_clock(&url, fetcher, buf, driver, clock).await?.run().await?;
 
 // From an already-parsed MPD (tests / offline scenarios):
-// Note: from_mpd takes F directly — it wraps with Arc::new internally.
-Player::from_mpd(mpd, base_url, fetcher, buf, MyDriver::new())?.run().await?;
+// Note: from_mpd takes Arc<F> — callers must wrap the fetcher with Arc::new.
+Player::from_mpd(mpd, base_url, Arc::new(fetcher), buf, MyDriver::new())?.run().await?;
 
 // From an already-parsed MPD with a custom clock:
-Player::from_mpd_with_clock(mpd, base_url, fetcher, buf, driver, clock)?.run().await?;
+Player::from_mpd_with_clock(mpd, base_url, Arc::new(fetcher), buf, driver, clock)?.run().await?;
 ```
 
 To inspect representations before starting the loop, use `player.session()`:

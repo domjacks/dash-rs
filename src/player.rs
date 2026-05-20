@@ -50,6 +50,7 @@
 use alloc::sync::Arc;
 
 use crate::{
+    abr::rule::RepresentationInfo,
     clock::Clock,
     error::DashError,
     fetch::SegmentFetcher,
@@ -231,6 +232,22 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
     /// Forwards to [`DashSession::duration_s`].
     pub fn duration_s(&self) -> Option<f64> {
         self.session.duration_s()
+    }
+
+    /// Available video representations sorted ascending by bandwidth, or an
+    /// empty slice if the stream has no video track.
+    ///
+    /// Forwards to [`DashSession::video_representations`].
+    pub fn video_representations(&self) -> &[RepresentationInfo] {
+        self.session.video_representations()
+    }
+
+    /// Available audio representations sorted ascending by bandwidth, or an
+    /// empty slice if the stream has no audio track.
+    ///
+    /// Forwards to [`DashSession::audio_representations`].
+    pub fn audio_representations(&self) -> &[RepresentationInfo] {
+        self.session.audio_representations()
     }
 
     // ── Destructuring ─────────────────────────────────────────────────────────

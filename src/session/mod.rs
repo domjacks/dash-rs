@@ -1952,13 +1952,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             let (last_url, last_tms, last_tbps) = self
                 .metrics()
                 .last_http_request()
-                .map(|r| {
-                    (
-                        r.url.clone(),
-                        r.transfer_duration_ms,
-                        r.throughput_bps.unwrap_or(0.0),
-                    )
-                })
+                .map(|r| (r.url.clone(), r.transfer_duration_ms, r.throughput_bps))
                 .unwrap_or_default();
 
             let video_bw = video_decision

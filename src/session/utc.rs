@@ -309,6 +309,11 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
 
     let is_leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
 
+    let max_day = DAYS_IN_MONTH[(month - 1) as usize] + if month == 2 && is_leap(year) { 1 } else { 0 };
+    if day > max_day {
+        return None;
+    }
+
     // Days from 1970-01-01 to start of `year`.
     let mut days: u64 = 0;
     for y in 1970..year {
@@ -386,6 +391,13 @@ mod tests {
         // produce a timestamp that is off by the offset amount.
         assert!(parse_rfc2822_date("Fri, 13 Feb 2009 23:31:30 +0200").is_none());
         assert!(parse_rfc2822_date("Fri, 13 Feb 2009 23:31:30 EST").is_none());
+    }
+
+    #[test]
+    fn rfc2822_day_out_of_range_returns_none() {
+        // Day 32 is impossible in any month — must not silently produce a
+        // wrong timestamp by overflowing into the next month.
+        assert!(parse_rfc2822_date("Fri, 32 Jan 2009 00:00:00 GMT").is_none());
     }
 
     #[test]
