@@ -359,7 +359,7 @@ pub(super) fn merge_segment_lists(
 /// Extract `(start_number, segment_duration_ms, total_segments)` for a track
 /// that uses `SegmentList` addressing.
 ///
-/// `start_number` is taken from `SegmentList@startNumber` (default 0).
+/// `start_number` is taken from `SegmentList@startNumber` (default 1 per DASH spec §5.3.9.2).
 /// The segment index into `segment_urls` is computed as
 /// `segment_number − start_number`, so a `startNumber="1"` SegmentList
 /// works just like a `SegmentTemplate` with the same `startNumber`.
@@ -374,7 +374,7 @@ pub(super) fn extract_segment_list_timing(
         return (0, 2_000.0, None);
     };
 
-    let start_number = sl.startNumber.unwrap_or(0);
+    let start_number = sl.startNumber.unwrap_or(1);
 
     let seg_dur_ms = match (sl.duration, sl.timescale) {
         (Some(dur), Some(ts)) => dur as f64 / ts as f64 * 1_000.0,
@@ -913,8 +913,8 @@ mod extended_tests {
         a.representations = vec![r];
 
         let (start, dur_ms, total) = extract_segment_list_timing(&a, &Period::default());
-        // startNumber is not propagated through merge_segment_lists; default is 0.
-        assert_eq!(start, 0);
+        // startNumber is not propagated through merge_segment_lists; spec default is 1.
+        assert_eq!(start, 1);
         assert!((dur_ms - 2_000.0).abs() < 1.0);
         assert_eq!(total, Some(3));
     }

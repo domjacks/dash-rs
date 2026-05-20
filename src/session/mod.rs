@@ -1996,19 +1996,10 @@ impl<F: SegmentFetcher> DashSession<F> {
         Ok(())
     }
 
-    /// Estimated buffer level ahead of the current playback position, in
-    /// milliseconds.
-    pub fn estimated_buffer_level_ms(&self, media_type: &MediaType) -> f64 {
-        let track = match self.track(media_type) {
-            Ok(t) => t,
-            Err(_) => return 0.0,
-        };
-        let segments_fetched = track
-            .segment_number
-            .saturating_sub(track.initial_segment_number);
-        let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
-        let elapsed_ms = self
-            .playback_started_at
+    /// Wall-clock milliseconds elapsed since playback started, excluding all
+    /// paused time.  Returns `0.0` before [`Self::notify_playing`] is called.
+    fn effective_elapsed_ms(&self) -> f64 {
+        self.playback_started_at
             .map(|started_ms| {
                 let total_elapsed = self.clock.now_ms() - started_ms;
                 let current_pause_ms = if self.playback_state.freezes_clock() {
@@ -2020,26 +2011,27 @@ impl<F: SegmentFetcher> DashSession<F> {
                 };
                 (total_elapsed - self.total_paused_ms - current_pause_ms).max(0.0)
             })
-            .unwrap_or(0.0);
-        (pushed_ms - elapsed_ms).max(0.0)
+            .unwrap_or(0.0)
+    }
+
+    /// Estimated buffer level ahead of the current playback position, in
+    /// milliseconds.
+    pub fn estimated_buffer_level_ms(&self, media_type: &MediaType) -> f64 {
+        let track = match self.track(media_type) {
+            Ok(t) => t,
+            Err(_) => return 0.0,
+        };
+        let segments_fetched = track
+            .segment_number
+            .saturating_sub(track.initial_segment_number);
+        let pushed_ms = segments_fetched as f64 * track.segment_duration_ms;
+        (pushed_ms - self.effective_elapsed_ms()).max(0.0)
     }
 
     /// Estimated wall-clock seconds elapsed since playback started, excluding
     /// time spent paused.
     pub fn estimated_playback_position_s(&self) -> f64 {
-        self.playback_started_at
-            .map(|started_ms| {
-                let total_elapsed = self.clock.now_ms() - started_ms;
-                let current_pause_ms = if self.playback_state.freezes_clock() {
-                    self.paused_at
-                        .map(|pa_ms| self.clock.now_ms() - pa_ms)
-                        .unwrap_or(0.0)
-                } else {
-                    0.0
-                };
-                ((total_elapsed - self.total_paused_ms - current_pause_ms) / 1_000.0).max(0.0)
-            })
-            .unwrap_or(0.0)
+        (self.effective_elapsed_ms() / 1_000.0).max(0.0)
     }
 
     /// The buffer fill target in milliseconds (default 12 000 ms).
@@ -2191,8 +2183,6 @@ impl<F: SegmentFetcher> DashSession<F> {
         // this is a no-op (backward-compatible).
         let remap_offset = self.live_pts_remap_offset_s;
 
-        let mut snapped_s: f64 = position_s;
-
         for track in [self.video_track.as_mut(), self.audio_track.as_mut()]
             .into_iter()
             .flatten()
@@ -2255,13 +2245,20 @@ impl<F: SegmentFetcher> DashSession<F> {
             // requires the init segment (ftyp + moov) before any moof boxes.
             // For MSE SourceBuffers, re-appending the init segment is a no-op.
             track.init_segment_sent = false;
-
-            // Return the snapped position in the same coordinate space that
-            // position_s was given in (remapped if remap was applied, un-remapped
-            // otherwise) so the caller can use the value directly.
-            let snapped_offset = new_seg.saturating_sub(track.start_number);
-            snapped_s = snapped_offset as f64 * seg_dur_s + track.period_start_s - remap_offset;
         }
+
+        // Prefer the video track for the snapped return value (it is the primary
+        // timeline for A/V streams).  Fall back to audio for audio-only sessions.
+        let snapped_s = self
+            .video_track
+            .as_ref()
+            .or(self.audio_track.as_ref())
+            .map(|t| {
+                let seg_dur_s = t.segment_duration_ms / 1_000.0;
+                let snapped_offset = t.segment_number.saturating_sub(t.start_number);
+                snapped_offset as f64 * seg_dur_s + t.period_start_s - remap_offset
+            })
+            .unwrap_or(position_s);
 
         tracing::info!(requested_s = position_s, snapped_s, "DashSession::seek_to");
         self.gap_controller.on_seek();

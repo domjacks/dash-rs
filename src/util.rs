@@ -34,6 +34,7 @@ pub fn parse_iso_duration(s: &str) -> Option<Duration> {
     let mut total_secs: f64 = 0.0;
     let mut chars = s[1..].chars().peekable(); // skip leading 'P'
     let mut in_time_part = false;
+    let mut found_any = false;
 
     while chars.peek().is_some() {
         // 'T' switches from date designators to time designators.
@@ -65,6 +66,12 @@ pub fn parse_iso_duration(s: &str) -> Option<Duration> {
             (true, 'S') => total_secs += num,
             _ => {} // ignore unknown designators
         }
+        found_any = true;
+    }
+
+    // "P" and "PT" alone have no components and are not valid ISO 8601 durations.
+    if !found_any {
+        return None;
     }
 
     Some(Duration::from_secs_f64(total_secs))
@@ -271,6 +278,18 @@ mod tests {
     #[test]
     fn iso_no_p_prefix_returns_none() {
         assert_eq!(parse_iso_duration("30S"), None);
+    }
+
+    #[test]
+    fn iso_bare_p_returns_none() {
+        // "P" with no components is not a valid ISO 8601 duration.
+        assert_eq!(parse_iso_duration("P"), None);
+    }
+
+    #[test]
+    fn iso_bare_pt_returns_none() {
+        // "PT" with no time components is not a valid ISO 8601 duration.
+        assert_eq!(parse_iso_duration("PT"), None);
     }
 
     // ── parse_xs_datetime ─────────────────────────────────────────────────────

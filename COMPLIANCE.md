@@ -66,10 +66,17 @@ All items below are implemented and covered by tests.
 | 44 | WASM player `current_metrics` now passes `video.currentTime` (via `getCurrentTime()` bridge) as `position_s` instead of a hardcoded `0.0`, fixing the hugely inflated `buffer_level_ms` for epoch-timestamp live streams (BBC IPTV) where content sits at ~1.778×10⁹ s | — |
  | 45 | `DashSession::apply_live_pts_remap()` — opt-in method that shifts `SourceBuffer.timestampOffset` on all active sinks by `-(initial_segment_number − start_number) × seg_dur_s` (Number) or `-(next_segment_time / timescale)` (Timeline) so that epoch-scale fMP4 content lands near presentation time 0 in the browser; `live_presentation_start_s()` returns ≈ 0 after the call; WASM player calls this automatically before the fetch loop on live streams; GStreamer players must NOT call it (they use probe-based PTS subtraction via `set_live_mode(true)`); fixes the Safari stall where `video.currentTime` is reset to 0 before content is buffered at the live-edge PTS | — |
  | 46 | `DashSession::seek_to` corrected for remapped live streams: `position_s` received from the browser is in remapped (≈0-based) time; the segment-number formula now adds `live_pts_remap_offset_s` back before dividing, and the returned snapped value subtracts it, so both the segment number and the caller's seek target are correct; backward-compatible because offset is 0.0 when `apply_live_pts_remap` has not been called | — |
- | 47 | `DashSession::buffered(media_type)` public accessor delegates to the track's `SourceBufferSink::buffered()`, providing real-time buffered ranges to callers (e.g. the gap controller loop) without exposing internals; returns empty `Vec` when the track is absent | — |
- | 48 | WASM player `tick_gap` loop integrated: at every fetch iteration `session.tick_gap(position_s, &buffered, is_paused)` is called with the live `video.currentTime` and `video.paused` state (via new `isPaused()` bridge call); when a seek is recommended the player calls `bridge.seek_to`, `session.seek_to`, and `session.notify_playing()` — mirrors dash.js `GapController.js` | — |
+ | 47 | Callers access buffered time ranges directly via `MediaBuffer::buffered(media_type)` and pass them to `DashSession::tick_gap`; `DashSession` does not store the buffer so it cannot expose a `buffered()` accessor directly | — |
+ | 48 | WASM player `tick_gap` loop integrated: at every fetch iteration `session.tick_gap(position_s, &buffered, state)` is called with the live `video.currentTime` and playback state (via bridge); when a seek is recommended the player calls `bridge.seek_to`, `session.seek_to`, and `session.notify_playing()` — mirrors dash.js `GapController.js` | — |
  | 49 | `extract_segment_timing` no longer sets `total_segments` from a SegmentTimeline that contains an `r=-1` (infinite-repeat) entry; such timelines are unbounded and EOS must be determined by `availabilityEndTime` or segment fetch failure, not by segment count — fixes premature `EndOfStream` on first fetch of any live `r=-1` stream | §5.3.9.6.4 |
  | 50 | Formal metrics collection (`DashMetrics`) — three bounded ring-buffer lists (cap 100, matching dash.js `MAX_SAVED_METRICS_REQUESTS`): `HttpRequestRecord` (per `fetch_next_segment` call: wall_ms, segment_number, url, bytes_received, transfer_duration_ms, throughput_bps, quality_index), `RepresentationSwitchRecord` (per quality switch: wall_ms, from_index, to_index, reason), `BufferLevelSample` (per fetch at ABR decision time: wall_ms, level_ms); exposed via `DashSession::metrics()` (`&DashMetrics`); timestamps are absolute Unix milliseconds; module at `src/session/metrics.rs` | dash.js `DashMetrics.js` |
+ | 51 | `DroppedFramesRule` — downgrades quality when the ratio of dropped frames to total frames exceeds a configurable threshold; implemented in `src/abr/dropped_frames.rs`; registered in `AbrController::default()`; covered by tests in `tests/abr_rules.rs` | dash.js `DroppedFramesRule.js` |
+ | 52 | `AbandonRequestsRule` — abandons a slow segment fetch and drops quality when the projected completion time would exceed a multiplier of the remaining segment duration; implemented in `src/abr/abandon_requests.rs`; registered in `AbrController::default()`; covered by tests in `tests/abr_rules.rs` | dash.js `AbandonRequestsRule.js` |
+ | 53 | `SwitchHistoryRule` — imposes a cooldown after a quality switch to prevent oscillation; implemented in `src/abr/switch_history.rs`; registered in `AbrController`; covered by tests in `tests/abr_rules.rs` | dash.js `SwitchHistoryRule.js` |
+ | 54 | `DashSession::set_max_bitrate` / `clear_max_bitrate` / `max_bitrate` — per-track ABR bitrate cap; implemented in `src/session/mod.rs`; tested in `tests/session.rs` | — |
+ | 55 | `PlaybackDriver::enable_pruning` — opt-in buffer pruning behind the playback position; `run()` calls `prune_all_tracks` each iteration when enabled; implemented in `src/session/driver.rs` | — |
+ | 56 | `PlaybackDriver::on_quality_change` — callback fired by `run()` when the ABR controller switches quality; carries previous index, new index, and `AbrDecisionReason`; implemented in `src/session/driver.rs` | — |
+ | 57 | `PlaybackDriver::pending_seek_s` / `has_pending_seek` — destructive / non-destructive user-seek API; `run()` calls `pending_seek_s()` each iteration and interrupts buffer-gate waits via `has_pending_seek()`; implemented in `src/session/driver.rs` | — |
 
 ---
 
@@ -96,10 +103,10 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 **Gap**: For live streams with a target latency, `CatchupController.js` (dash.js) adjusts playback rate to converge.  `ServiceDescription` latency and rate are parsed (`target_latency_ms`, `playback_rate_range`) but nothing drives the renderer rate.
 
 **Fix**:
-1. Add `set_playback_rate(rate: f64)` to the `MediaSource` trait.
+1. Add `set_playback_rate(rate: f64)` to the `MediaBuffer` trait.
 2. `DashSession` computes `rate = f(actual_latency, target_latency, playback_rate_range)` and calls it.
 
-**Files**: `src/media_source/mod.rs`, `src/session/mod.rs`
+**Files**: `src/media_buffer.rs`, `src/session/mod.rs`
 
 ---
 
@@ -139,6 +146,39 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
+### P1-11: `<EssentialProperty>` unknown scheme silently ignored (non-conformant)
+
+**Gap**: §5.8.4 — when a client encounters an `<EssentialProperty>` element whose `@schemeIdUri` it does not recognise it **must not play** that Representation or AdaptationSet.  dash-rs currently ignores unknown `EssentialProperty` elements and plays the stream regardless, which is non-conformant.
+
+**Fix**: Parse `EssentialProperty` elements on `AdaptationSet` and `Representation`.  In `find_adaptation` / `extract_representations`, return `DashError::UnsupportedEssentialProperty(scheme_uri)` for any unknown scheme.  Add a registry of well-known schemes that the library handles (e.g. HDR, accessibility roles) and skip the error for those.
+
+**Files**: `src/error.rs` (new variant), `src/session/mpd.rs`
+
+---
+
+### P1-12: `<ContentProtection>` parse and pssh extraction missing
+
+**Gap**: `<ContentProtection>` elements are not parsed.  No `pssh` box extraction from init segments.  Without this, callers cannot implement key-system initialisation (Widevine, PlayReady, FairPlay) even if they have their own CDM.
+
+**Fix**:
+1. Parse `ContentProtection` descriptors on `Representation` / `AdaptationSet` and expose them on `TrackState` (scheme URI, value string, `default_KID`).
+2. Extract `pssh` boxes from init segments and expose via a `DashSession::pssh_for_track(media_type)` accessor.
+3. CDM/EME integration (key requests, licence exchange) belongs in examples.
+
+**Files**: `src/manifest/parser.rs`, `src/session/mod.rs`, `src/mp4.rs`
+
+---
+
+### P1-13: Subtitle / text tracks missing
+
+**Gap**: Text `AdaptationSet`s (TTML, WebVTT, IMSC) are ignored at construction.  Mandatory for accessibility (WCAG 2.1, EU AVMSD, Ofcom, FCC).
+
+**Fix**: Add `MediaType::Text`.  In `from_mpd`, create a third `TrackState` for text.  A `TextParser` trait with TTML and WebVTT implementations is needed; the scheduling path alone (without a parser) would unblock third-party text renderers.
+
+**Files**: `src/session/mod.rs`, `src/media_buffer.rs` (new `MediaType` variant), new `src/text/`
+
+---
+
 ## 🟡 P2 — Robustness and additional profiles
 
 ### P2-1: `Representation@qualityRanking` not parsed
@@ -169,11 +209,13 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-5: `<SupplementalProperty>` / `<EssentialProperty>` not parsed
+### P2-5: `<SupplementalProperty>` not parsed
 
-**Gap**: §5.8.4–5.8.5 — arbitrary descriptor extensions used by many profiles for HDR signalling, codec parameters, etc.  Unknown properties are silently ignored.
+**Gap**: §5.8.5 — `<SupplementalProperty>` elements are optional descriptor extensions used for HDR signalling, codec parameters, etc.  They are currently silently ignored.
 
 **Fix**: Parse as a generic `Vec<Descriptor>` (scheme URI + value string) on `AdaptationSet` and `Representation`.  Expose via a `descriptors()` accessor.
+
+**Note**: `<EssentialProperty>` (§5.8.4) is a stricter variant — unknown essential properties mandate playback refusal and have been promoted to P1-11.
 
 ---
 
@@ -197,7 +239,7 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ### P2-10: DVB/ISO metrics reporting missing
 
-**Gap**: `MetricsReporting.js` / `DVBReporting` — periodic HTTP posting to a `@dvb:metrics` reporting server.  Depends on P2-9 (now implemented).
+**Gap**: `MetricsReporting.js` / `DVBReporting` — periodic HTTP posting to a `@dvb:metrics` reporting server.  Requires formal metrics collection (implemented — see item 50 in Completed).
 
 ---
 
@@ -217,14 +259,11 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-13: DRM / `<ContentProtection>` missing
+### P2-13: DRM / CDM-EME integration missing
 
-**Gap**: `<ContentProtection>` elements are not exposed.  No `pssh` box extraction from init segments.
+**Gap**: CDM and EME integration (key requests, licence exchange, key-system selection) is not implemented.  Platform EME/CDM integration belongs in examples.
 
-**Fix**:
-1. Parse `ContentProtection` descriptor on `Representation` / `AdaptationSet`.
-2. Expose a `DrmKeyProvider` trait.
-3. `DashSession` calls it when a `pssh` box is found.  Platform EME/CDM integration belongs in examples.
+**Note**: `<ContentProtection>` parsing and `pssh` extraction have been promoted to P1-12 as the foundation required by all DRM-protected streams.
 
 ---
 
@@ -238,15 +277,7 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-15: Subtitle / text tracks missing
-
-**Gap**: Text `AdaptationSet`s (TTML, WebVTT, IMSC) are ignored at construction.
-
-**Fix**: Add `MediaType::Text`.  In `from_mpd`, create a third `TrackState` for text.  Need a `TextParser` trait with TTML and WebVTT implementations.
-
----
-
-### P2-16: Thumbnails / trick-play missing
+### P2-15: Thumbnails / trick-play missing
 
 **Gap**: `role=thumbnail` `AdaptationSet` not parsed.
 
@@ -254,7 +285,7 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-17: Common Access Token (CAT) missing
+### P2-16: Common Access Token (CAT) missing
 
 **Gap**: ETSI TS 103 485 `commonAccessToken` JWT not attached to segment request headers.
 
@@ -262,7 +293,7 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-18: Extended URL Query Info (`<ExtendedUrlQueryInfo>`) missing
+### P2-17: Extended URL Query Info (`<ExtendedUrlQueryInfo>`) missing
 
 **Gap**: Appends service-specific query parameters to segment URLs at fetch time (CDN token auth).
 
@@ -270,7 +301,7 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-19: `SegmentBase` byte-range `SegmentList` entries (`@mediaRange`) missing
+### P2-18: `SegmentBase` byte-range `SegmentList` entries (`@mediaRange`) missing
 
 **Gap**: `resolve_segment_url` returns `DashError::SegmentUrlUnresolvable` for `<SegmentURL mediaRange="…">` entries.
 
@@ -278,7 +309,7 @@ All Tier 1 / P0 items are now implemented. No outstanding items.
 
 ---
 
-### P2-20: Offline download not implemented
+### P2-19: Offline download not implemented
 
 **Gap**: No download coordinator that writes segments to a directory with a manifest index.
 

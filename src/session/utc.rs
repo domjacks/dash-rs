@@ -278,6 +278,10 @@ fn parse_rfc2822_date(s: &str) -> Option<f64> {
         _ => return None,
     };
     let year: u64 = parts[2].parse().ok()?;
+    let tz = parts[4];
+    if !tz.eq_ignore_ascii_case("GMT") && !tz.eq_ignore_ascii_case("UTC") {
+        return None;
+    }
     let time_parts: Vec<&str> = parts[3].split(':').collect();
     if time_parts.len() != 3 {
         return None;
@@ -374,6 +378,20 @@ mod tests {
             let _ = day;
             assert!(ts >= 0.0, "timestamp for {mon} was {ts}");
         }
+    }
+
+    #[test]
+    fn rfc2822_non_utc_timezone_returns_none() {
+        // A non-UTC offset must be rejected; silently treating it as UTC would
+        // produce a timestamp that is off by the offset amount.
+        assert!(parse_rfc2822_date("Fri, 13 Feb 2009 23:31:30 +0200").is_none());
+        assert!(parse_rfc2822_date("Fri, 13 Feb 2009 23:31:30 EST").is_none());
+    }
+
+    #[test]
+    fn rfc2822_utc_case_insensitive() {
+        let ts = parse_rfc2822_date("Fri, 13 Feb 2009 23:31:30 utc").unwrap();
+        assert!((ts - 1_234_567_890.0).abs() < 1.0, "got {ts}");
     }
 
     // ── parse_http_date ───────────────────────────────────────────────────────

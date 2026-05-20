@@ -169,8 +169,11 @@ pub fn parse_all_emsg(data: &[u8]) -> Vec<EmsgInfo> {
                     data[offset + 13],
                     data[offset + 14],
                     data[offset + 15],
-                ]) as usize;
-                (large, 16)
+                ]);
+                if large > usize::MAX as u64 {
+                    break;
+                }
+                (large as usize, 16)
             }
             0 => (data.len() - offset, 8),
             n if (n as usize) < 8 => break,
@@ -471,9 +474,12 @@ fn find_box(data: &[u8], box_type: [u8; 4]) -> Option<(&[u8], usize)> {
                     data[offset + 13],
                     data[offset + 14],
                     data[offset + 15],
-                ]) as usize;
+                ]);
+                if large > usize::MAX as u64 {
+                    return None;
+                }
                 // FullBox content starts after: 4 (size=1) + 4 (type) + 8 (largesize) = 16.
-                (large, 16)
+                (large as usize, 16)
             }
             0 => {
                 // Box extends to the end of the buffer.

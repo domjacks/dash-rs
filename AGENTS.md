@@ -513,10 +513,10 @@ is 0.0 (VOD or non-remapped live streams).
 `DashSession::live_pts_remap_offset_s()` exposes the stored offset for tests
 and callers that need to convert between coordinate spaces.
 
-`DashSession::buffered(media_type)` returns the current buffered time ranges
-from the `MediaBuffer`, delegating to `MediaBuffer::buffered(mt)`.  Used by
-the WASM player's `tick_gap` call to pass real-time buffered ranges to the gap
-controller.  Returns an empty `Vec` when the track is absent.
+`DashSession` does not store a reference to the `MediaBuffer` — the buffer is always
+passed as a parameter to each method.  Callers that need buffered time ranges for use
+with `tick_gap` should call `buf.buffered(media_type)` directly on the `MediaBuffer`
+they hold, then pass the result to `session.tick_gap(position_s, &buffered, state)`.
 
 ### `timestampOffset` formula (DASH spec §5.3.9.6)
 
