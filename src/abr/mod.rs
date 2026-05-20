@@ -106,8 +106,11 @@ impl AbrController {
     }
 
     /// Notify the controller that a quality switch has occurred.
-    /// Should be called by `DashSession` whenever it changes representations.
-    pub fn record_switch(&mut self) {
-        self.switch_history.record_switch();
+    ///
+    /// `now_ms` must be sourced from [`crate::clock::Clock::now_ms`] — the
+    /// same clock used to populate [`AbrMetrics::now_ms`] — so that elapsed
+    /// time is computed correctly on all targets, including `no_std`.
+    pub fn record_switch(&mut self, now_ms: f64) {
+        self.switch_history.record_switch(now_ms);
     }
 }

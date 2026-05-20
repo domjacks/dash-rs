@@ -103,7 +103,7 @@ impl PlaybackDriver for WasmPlaybackDriver {
             hc = s.http_request_count,
             sc = s.switch_count,
             tms = s.last_transfer_ms,
-            tbps = s.last_throughput_bps,
+            tbps = s.last_throughput_bps.unwrap_or(0.0),
             live = s.is_live,
         );
         self.bridge.report_status(&json);

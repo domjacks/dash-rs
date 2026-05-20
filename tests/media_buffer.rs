@@ -31,6 +31,15 @@ fn null_buffer_has_buffer_tracking_default_true() {
     );
 }
 
+#[test]
+fn stub_buffer_has_buffer_tracking_default_true() {
+    let buf = StubBuffer::new();
+    assert!(
+        buf.has_buffer_tracking(),
+        "StubBuffer uses the default impl which returns true"
+    );
+}
+
 #[tokio::test]
 async fn null_buffer_append_is_noop() {
     let mut buf = NullBuffer;
@@ -150,21 +159,18 @@ async fn stub_buffer_append_audio_separate_from_video() {
     assert_eq!(buf.audio_chunks.len(), 1);
 }
 
-#[test]
-fn stub_buffer_bytes_appended() {
-    let buf = tokio::runtime::Runtime::new().unwrap().block_on(async {
-        let mut b = StubBuffer::new();
-        b.append(MediaType::Video, Bytes::from(vec![0u8; 100]), true)
-            .await
-            .unwrap();
-        b.append(MediaType::Video, Bytes::from(vec![0u8; 200]), false)
-            .await
-            .unwrap();
-        b.append(MediaType::Audio, Bytes::from(vec![0u8; 50]), true)
-            .await
-            .unwrap();
-        b
-    });
+#[tokio::test]
+async fn stub_buffer_bytes_appended() {
+    let mut buf = StubBuffer::new();
+    buf.append(MediaType::Video, Bytes::from(vec![0u8; 100]), true)
+        .await
+        .unwrap();
+    buf.append(MediaType::Video, Bytes::from(vec![0u8; 200]), false)
+        .await
+        .unwrap();
+    buf.append(MediaType::Audio, Bytes::from(vec![0u8; 50]), true)
+        .await
+        .unwrap();
     assert_eq!(buf.video_bytes_appended(), 300);
     assert_eq!(buf.audio_bytes_appended(), 50);
 }

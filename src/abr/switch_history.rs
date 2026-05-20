@@ -18,8 +18,8 @@ const HISTORY_CAPACITY: usize = 4;
 pub struct SwitchHistoryRule {
     /// Minimum wall-clock time between up-switches.
     pub min_switch_interval: Duration,
-    /// Timestamps (in ms from [`crate::time::mono_ms`]) of recent quality
-    /// switches, newest first.
+    /// Timestamps (in ms, sourced from [`crate::clock::Clock::now_ms`]) of
+    /// recent quality switches, newest first.
     recent_switches: VecDeque<f64>,
 }
 
@@ -33,11 +33,13 @@ impl Default for SwitchHistoryRule {
 }
 
 impl SwitchHistoryRule {
-    /// Record that a switch just occurred. Call this whenever `DashSession`
-    /// actually changes quality.
-    pub fn record_switch(&mut self) {
-        let now = crate::time::mono_ms();
-        self.recent_switches.push_front(now);
+    /// Record that a switch just occurred.
+    ///
+    /// `now_ms` must be sourced from [`crate::clock::Clock::now_ms`] — the
+    /// same clock used to populate [`AbrMetrics::now_ms`].  Passing a value
+    /// from any other source will corrupt elapsed-time calculations.
+    pub fn record_switch(&mut self, now_ms: f64) {
+        self.recent_switches.push_front(now_ms);
         if self.recent_switches.len() > HISTORY_CAPACITY {
             self.recent_switches.pop_back();
         }
@@ -60,12 +62,10 @@ impl AbrRule for SwitchHistoryRule {
 
         let current = metrics.current_index.unwrap_or(0);
 
-        // Check whether the most recent switch was too recent.
         if let Some(&last_switch_ms) = self.recent_switches.front() {
-            let elapsed_ms = crate::time::mono_ms() - last_switch_ms;
+            let elapsed_ms = metrics.now_ms - last_switch_ms;
             let min_interval_ms = self.min_switch_interval.as_secs_f64() * 1_000.0;
             if elapsed_ms < min_interval_ms {
-                // Clamp to current quality to avoid further up-switching.
                 tracing::debug!(
                     rule = self.name(),
                     elapsed_ms = elapsed_ms as u64,

@@ -46,6 +46,18 @@ pub struct AbrMetrics {
     /// Set automatically by [`DashSession::current_metrics`] from
     /// [`TrackState::post_seek`]; callers do not need to set this manually.
     pub is_post_seek: bool,
+
+    /// Monotonic clock reading in milliseconds at the time these metrics were
+    /// sampled, sourced from [`crate::clock::Clock::now_ms`].
+    ///
+    /// Used by [`crate::abr::switch_history::SwitchHistoryRule`] to measure
+    /// how much time has elapsed since the last quality switch without calling
+    /// any platform time function directly — making the rule correct on
+    /// `no_std` targets where a bare `mono_ms()` always returns `0.0`.
+    ///
+    /// Set automatically by [`DashSession::current_metrics`]; callers building
+    /// `AbrMetrics` by hand should populate this from their own clock source.
+    pub now_ms: f64,
 }
 
 impl AbrMetrics {
@@ -59,6 +71,7 @@ impl AbrMetrics {
             total_decoded_frames: None,
             effective_download_ratio: None,
             is_post_seek: false,
+            now_ms: 0.0,
         }
     }
 }

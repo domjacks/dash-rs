@@ -1449,6 +1449,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             total_decoded_frames: None,
             effective_download_ratio: None,
             is_post_seek,
+            now_ms: self.clock.now_ms(),
         }
     }
 
@@ -2852,7 +2853,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                 track.current_index = decision.index;
             }
         }
-        self.abr.record_switch();
+        self.abr.record_switch(self.clock.now_ms());
     }
 
     // ── Fetching ──────────────────────────────────────────────────────────────
@@ -3096,7 +3097,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                     "quality switch"
                 );
                 track.current_index = decision.index;
-                self.abr.record_switch();
+                self.abr.record_switch(self.clock.now_ms());
                 Some(from_index)
             } else {
                 None

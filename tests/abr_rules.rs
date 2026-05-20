@@ -150,11 +150,10 @@ fn switch_history_clamps_after_recent_switch() {
     let reps = reps();
     let mut metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
     metrics.current_index = Some(1); // currently at "mid"
+    // Both record and check at t=0; elapsed = 0 < 8 000 ms → must clamp.
+    metrics.now_ms = 0.0;
+    rule.record_switch(0.0);
 
-    // Record a switch right now.
-    rule.record_switch();
-
-    // Should clamp to current index because the switch was too recent.
     assert_eq!(rule.max_index(&reps, &metrics), Some(1));
 }
 
@@ -300,17 +299,14 @@ fn controller_drops_frames_overrides_throughput() {
 #[test]
 fn switch_history_abstains_after_cooldown_elapsed() {
     let mut rule = SwitchHistoryRule::default();
-    // Set a very short cooldown so the test doesn't take seconds.
     rule.min_switch_interval = std::time::Duration::from_millis(5);
     let reps = reps();
-    let metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
 
-    rule.record_switch();
+    // Record a switch at t=0 ms; check at t=10 ms (past the 5 ms cooldown).
+    rule.record_switch(0.0);
+    let mut metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
+    metrics.now_ms = 10.0;
 
-    // Let the cooldown expire.
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    // After the interval has elapsed the rule should abstain (return None).
     assert_eq!(rule.max_index(&reps, &metrics), None);
 }
 
@@ -322,7 +318,7 @@ fn controller_record_switch_then_select_respects_history() {
     let reps = reps();
 
     // Record a switch right now — switch history should clamp to current_index.
-    controller.record_switch();
+    controller.record_switch(0.0);
 
     // With 10 Mbps + 20 s buffer, ThroughputRule alone would return index 2.
     // But the switch-history cooldown (8 s) should clamp the result to current_index.
@@ -380,7 +376,7 @@ fn switch_history_capacity_capped_at_4() {
 
     // Record 6 switches — only the last 4 should be retained (HISTORY_CAPACITY=4).
     for _ in 0..6 {
-        rule.record_switch();
+        rule.record_switch(0.0);
     }
 
     // Should not panic, and the most-recent switch is fresh → clamp active.
