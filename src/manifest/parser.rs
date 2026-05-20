@@ -1,7 +1,6 @@
 //! MPD XML parser.
 //!
 //! Uses `roxmltree` to walk the element tree and populate the [`MPD`] struct.
-//! Follows the same conventions as the rest of the TARDIS XML parsing code.
 
 use crate::manifest::mpd_types::{
     AdaptationSet, BaseURL, Initialization, Latency, Location, Period, PlaybackRate,

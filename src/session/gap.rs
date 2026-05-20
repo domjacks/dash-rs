@@ -378,9 +378,13 @@ impl GapController {
             if position_s < range.start {
                 // End of the preceding buffered range (or stream start).
                 let prev_end = if i > 0 { buffered[i - 1].end } else { 0.0 };
-                // Only jump when the player is at or past the edge of the
-                // previous range (within `threshold_s` of its end).
-                if prev_end - position_s < self.settings.threshold_s {
+                // Only jump when the player is at or near the edge of the
+                // previous range (within `threshold_s`).  Using the absolute
+                // difference handles both directions:
+                // · position just past  prev_end → small positive delta → jump
+                // · position just before prev_end → small negative delta → jump
+                // · position far past   prev_end → large positive delta → no jump
+                if (position_s - prev_end).abs() < self.settings.threshold_s {
                     return Some((prev_end, range.start));
                 }
             }
@@ -420,7 +424,7 @@ mod tests {
         // Player fell off the end of [0, 3]; next range starts at 4.
         let mut gc = GapController::new();
         let buf = ranges(&[(0.0, 3.0), (4.0, 8.0)]);
-        // position_s = 3.05 → just past range end; prev_end (3.0) - pos (3.05) = -0.05 < threshold
+        // position_s = 3.05 → just past range end; |pos (3.05) − prev_end (3.0)| = 0.05 < threshold
         let target = gc.tick(3.05, &buf, false);
         assert!(target.is_some());
         let t = target.unwrap();
@@ -440,16 +444,28 @@ mod tests {
         // Player at 2.0 s; range ends at 3.1 s — not near the edge yet.
         let mut gc = GapController::new();
         let buf = ranges(&[(0.0, 3.1), (4.0, 8.0)]);
-        // prev_end (3.1) - position (2.0) = 1.1 ≥ threshold → no jump
+        // |position (2.0) − prev_end (3.1)| = 1.1 ≥ threshold → no jump
         assert!(gc.tick(2.0, &buf, false).is_none());
+    }
+
+    #[test]
+    fn no_gap_jump_when_far_past_previous_range_end() {
+        // Player is 15 s past the end of the first buffered range — the
+        // threshold guard must prevent a spurious jump to the next range.
+        // The old formula (prev_end − position_s < threshold) was always true
+        // for negative differences, making this case incorrectly trigger a jump.
+        let mut gc = GapController::new();
+        let buf = ranges(&[(0.0, 5.0), (100.0, 110.0)]);
+        // |position (20.0) − prev_end (5.0)| = 15.0 ≥ threshold → no jump
+        assert!(gc.tick(20.0, &buf, false).is_none());
     }
 
     #[test]
     fn no_gap_jump_when_paused() {
         let mut gc = GapController::new();
         let buf = ranges(&[(0.0, 3.0), (4.0, 8.0)]);
-        // Position is in the gap, but paused — no jump.
-        assert!(gc.tick(3.5, &buf, true).is_none());
+        // Position is just past the range end and within threshold, but paused — no jump.
+        assert!(gc.tick(3.05, &buf, true).is_none());
     }
 
     #[test]
@@ -457,10 +473,12 @@ mod tests {
         let mut gc = GapController::new();
         gc.on_track_switch_started();
         let buf = ranges(&[(0.0, 3.0), (4.0, 8.0)]);
-        assert!(gc.tick(3.5, &buf, false).is_none());
+        // Position 3.05 is within threshold (0.05 < 0.1) so a jump would normally
+        // fire, but is suppressed while a track switch is in progress.
+        assert!(gc.tick(3.05, &buf, false).is_none());
         gc.on_track_switch_ended();
-        // Now the jump should fire.
-        assert!(gc.tick(3.5, &buf, false).is_some());
+        // Now the suppression is lifted — the jump must fire.
+        assert!(gc.tick(3.05, &buf, false).is_some());
     }
 
     // ── small / large gap threshold ───────────────────────────────────────────

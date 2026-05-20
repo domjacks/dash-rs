@@ -1839,8 +1839,12 @@ impl<F: SegmentFetcher> DashSession<F> {
                         reason  = ?target.reason,
                         "gap controller: seeking"
                     );
-                    self.seek_to(target.position_s);
-                    drv.on_gap_seek(target).await;
+                    // seek_to returns the snapped segment-boundary position;
+                    // forward that to the driver so the renderer targets the
+                    // exact position the session fetch cursor is now at.
+                    let snapped_s = self.seek_to(target.position_s);
+                    drv.on_gap_seek(GapSeekTarget { position_s: snapped_s, reason: target.reason })
+                        .await;
                     self.notify_playing();
                 }
             }
@@ -2907,11 +2911,22 @@ impl<F: SegmentFetcher> DashSession<F> {
                     );
                     #[cfg(feature = "std")]
                     Delay::new(core::time::Duration::from_millis(seg_dur_ms as u64)).await;
-                    // Single retry: if still 404, propagate the underlying error.
-                    return self
+                    // Do NOT use a bare `return` here: the retry may itself
+                    // return EndOfStream (period boundary), which must be
+                    // caught by try_advance_period just like the first attempt.
+                    match self
                         .fetch_next_segment_inner(media_type, metrics, buf)
                         .await
-                        .map(FetchOutcome::Fetched);
+                    {
+                        Err(DashError::EndOfStream { .. }) => {
+                            if self.try_advance_period(buf).await? {
+                                continue;
+                            }
+                            return Ok(FetchOutcome::EndOfStream);
+                        }
+                        Ok(decision) => return Ok(FetchOutcome::Fetched(decision)),
+                        Err(e) => return Err(e),
+                    }
                 }
                 Ok(decision) => return Ok(FetchOutcome::Fetched(decision)),
                 Err(e) => return Err(e),

@@ -145,6 +145,13 @@ impl Clock for SystemClock {
     }
 
     async fn set_timeout(&self, ms: f64) {
-        futures_timer::Delay::new(Duration::from_millis(ms as u64)).await;
+        // Guard against NaN, negative values, and infinity before casting.
+        // All three would produce an incorrect Duration with a bare `as u64`.
+        let millis = if ms.is_finite() && ms >= 0.0 {
+            ms.round() as u64
+        } else {
+            0
+        };
+        futures_timer::Delay::new(Duration::from_millis(millis)).await;
     }
 }

@@ -714,6 +714,12 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 ---
 
+### Code comments
+
+Only include comments that explain the high-level business logic or non-obvious edge cases. Do not write comments explaining what basic code does.
+Do not add inline comments to the right of code.
+
+
 ## Documentation
 
 - Ensure you keep the AGENTS.md, README.md and COMPLIANCE.md documents up to date whenever changes are made

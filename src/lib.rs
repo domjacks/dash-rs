@@ -3,32 +3,6 @@
 //! A Rust implementation of MPEG-DASH playback logic, inspired by
 //! [dash.js](https://github.com/Dash-Industry-Forum/dash.js).
 //!
-//! ## Quick start
-//!
-//! ```rust,ignore
-//! use async_trait::async_trait;
-//! use dash_rs::{
-//!     fetch::stub::StubSegmentFetcher, media_buffer::NullBuffer,
-//!     session::driver::PlaybackDriver, DashError, FetchOutcome, MediaType, Player,
-//! };
-//! use url::Url;
-//!
-//! struct MyDriver;
-//!
-//! #[async_trait(?Send)]
-//! impl PlaybackDriver for MyDriver {
-//!     fn position_s(&self) -> f64 { 0.0 }
-//! }
-//!
-//! # async fn example() -> Result<(), DashError> {
-//! let url = Url::parse("https://example.com/manifest.mpd")?;
-//! Player::from_url(&url, StubSegmentFetcher, NullBuffer, MyDriver)
-//!     .await?
-//!     .run()
-//!     .await?;
-//! # Ok(())
-//! # }
-//! ```
 
 #![cfg_attr(not(feature = "std"), no_std)]
 
