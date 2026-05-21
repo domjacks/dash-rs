@@ -1,4 +1,4 @@
-use crate::abr::metrics::AbrMetrics;
+use crate::abr::{decision::AbrDecisionReason, metrics::AbrMetrics};
 
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
@@ -25,9 +25,15 @@ pub struct RepresentationInfo {
 /// and the current playback metrics, and returns the *maximum* quality index
 /// it is comfortable allowing. The [`crate::abr::AbrController`] takes the
 /// minimum across all rules.
-pub trait AbrRule: Send + Sync {
+pub trait AbrRule {
     /// Returns the name of this rule, used in logging.
     fn name(&self) -> &str;
+
+    /// Returns the decision reason to report when this rule constrains
+    /// selection.
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::ThroughputBased
+    }
 
     /// Returns the highest representation index this rule permits, or `None`
     /// if the rule has no opinion (abstain).

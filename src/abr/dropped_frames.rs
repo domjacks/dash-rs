@@ -2,6 +2,7 @@
 //! too many frames, indicating the current bitrate exceeds decoding capacity.
 
 use crate::abr::{
+    decision::AbrDecisionReason,
     metrics::AbrMetrics,
     rule::{AbrRule, RepresentationInfo},
 };
@@ -27,6 +28,10 @@ pub struct DroppedFramesRule;
 impl AbrRule for DroppedFramesRule {
     fn name(&self) -> &str {
         "DroppedFramesRule"
+    }
+
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::DroppedFrames
     }
 
     fn max_index(

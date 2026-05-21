@@ -1,4 +1,5 @@
 use crate::abr::{
+    decision::AbrDecisionReason,
     metrics::AbrMetrics,
     rule::{AbrRule, RepresentationInfo},
 };
@@ -26,6 +27,10 @@ impl Default for InsufficientBufferRule {
 impl AbrRule for InsufficientBufferRule {
     fn name(&self) -> &str {
         "InsufficientBufferRule"
+    }
+
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::InsufficientBuffer
     }
 
     fn max_index(

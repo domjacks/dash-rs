@@ -13,7 +13,7 @@ pub use metrics::AbrMetrics;
 pub use rule::{AbrRule, RepresentationInfo};
 
 #[cfg(not(feature = "std"))]
-use alloc::{boxed::Box, vec::Vec};
+use alloc::{boxed::Box, vec, vec::Vec};
 
 use crate::abr::{
     abandon_requests::AbandonRequestsRule, buffer::BufferOccupancyRule,
@@ -30,7 +30,7 @@ pub struct AbrController {
     rules: Vec<Box<dyn AbrRule>>,
     /// Separate mutable handle to the switch-history rule so it can be notified
     /// when a switch actually occurs.
-    switch_history: SwitchHistoryRule,
+    switch_history: Option<SwitchHistoryRule>,
 }
 
 impl Default for AbrController {
@@ -44,17 +44,27 @@ impl Default for AbrController {
                 Box::new(DroppedFramesRule),
                 Box::new(AbandonRequestsRule),
             ],
-            switch_history: SwitchHistoryRule::default(),
+            switch_history: Some(SwitchHistoryRule::default()),
         }
     }
 }
 
 impl AbrController {
-    /// Create a controller with a custom set of rules.
+    /// Create a controller with a custom set of rules and default switch
+    /// history throttling.
     pub fn with_rules(rules: Vec<Box<dyn AbrRule>>) -> Self {
+        Self::with_rules_and_switch_history(rules, Some(SwitchHistoryRule::default()))
+    }
+
+    /// Create a controller with custom rules and optional switch-history
+    /// throttling.
+    pub fn with_rules_and_switch_history(
+        rules: Vec<Box<dyn AbrRule>>,
+        switch_history: Option<SwitchHistoryRule>,
+    ) -> Self {
         Self {
             rules,
-            switch_history: SwitchHistoryRule::default(),
+            switch_history,
         }
     }
 
@@ -74,10 +84,12 @@ impl AbrController {
         let mut reason = AbrDecisionReason::ThroughputBased;
 
         // Check switch history first (it can clamp up-switches).
-        if let Some(idx) = self.switch_history.max_index(representations, metrics) {
-            if idx < max_index {
-                max_index = idx;
-                reason = AbrDecisionReason::SwitchHistoryThrottle;
+        if let Some(switch_history) = &self.switch_history {
+            if let Some(idx) = switch_history.max_index(representations, metrics) {
+                if idx < max_index {
+                    max_index = idx;
+                    reason = AbrDecisionReason::SwitchHistoryThrottle;
+                }
             }
         }
 
@@ -85,13 +97,7 @@ impl AbrController {
             if let Some(idx) = rule.max_index(representations, metrics) {
                 if idx < max_index {
                     max_index = idx;
-                    reason = match rule.name() {
-                        "InsufficientBufferRule" => AbrDecisionReason::InsufficientBuffer,
-                        "BufferOccupancyRule" => AbrDecisionReason::BufferOccupancyBased,
-                        "DroppedFramesRule" => AbrDecisionReason::DroppedFrames,
-                        "AbandonRequestsRule" => AbrDecisionReason::RequestAbandoned,
-                        _ => AbrDecisionReason::ThroughputBased,
-                    };
+                    reason = rule.reason();
                 }
             }
         }
@@ -111,6 +117,8 @@ impl AbrController {
     /// same clock used to populate [`AbrMetrics::now_ms`] — so that elapsed
     /// time is computed correctly on all targets, including `no_std`.
     pub fn record_switch(&mut self, now_ms: f64) {
-        self.switch_history.record_switch(now_ms);
+        if let Some(switch_history) = self.switch_history.as_mut() {
+            switch_history.record_switch(now_ms);
+        }
     }
 }

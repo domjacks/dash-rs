@@ -2,6 +2,7 @@
 //! progressing too slowly to finish before its playback deadline.
 
 use crate::abr::{
+    decision::AbrDecisionReason,
     metrics::AbrMetrics,
     rule::{AbrRule, RepresentationInfo},
 };
@@ -34,6 +35,10 @@ pub struct AbandonRequestsRule;
 impl AbrRule for AbandonRequestsRule {
     fn name(&self) -> &str {
         "AbandonRequestsRule"
+    }
+
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::RequestAbandoned
     }
 
     fn max_index(

@@ -4,6 +4,7 @@ use alloc::collections::VecDeque;
 use crate::math::FloatExt as _;
 
 use crate::abr::{
+    decision::AbrDecisionReason,
     metrics::AbrMetrics,
     rule::{AbrRule, RepresentationInfo},
 };
@@ -61,9 +62,11 @@ const MAX_SAMPLES: usize = 4;
 pub struct ThroughputTracker {
     /// Ring buffer of the most recent raw throughput measurements (bits/s).
     samples: VecDeque<f64>,
-    /// Fast EWMA estimate (bits/s).  `0.0` until the first sample.
+    /// `true` once the first sample has seeded both EWMAs.
+    seeded: bool,
+    /// Fast EWMA estimate (bits/s).
     fast_ema: f64,
-    /// Slow EWMA estimate (bits/s).  `0.0` until the first sample.
+    /// Slow EWMA estimate (bits/s).
     slow_ema: f64,
 }
 
@@ -78,6 +81,7 @@ impl ThroughputTracker {
     pub fn new() -> Self {
         Self {
             samples: VecDeque::with_capacity(MAX_SAMPLES),
+            seeded: false,
             fast_ema: 0.0,
             slow_ema: 0.0,
         }
@@ -102,8 +106,9 @@ impl ThroughputTracker {
         let alpha_fast = (1.0 - (-elapsed / FAST_HALFLIFE_S).exp()).clamp(0.0, 1.0);
         let alpha_slow = (1.0 - (-elapsed / SLOW_HALFLIFE_S).exp()).clamp(0.0, 1.0);
 
-        if self.fast_ema == 0.0 {
+        if !self.seeded {
             // First sample: seed directly to avoid a long warm-up from zero.
+            self.seeded = true;
             self.fast_ema = bps;
             self.slow_ema = bps;
         } else {
@@ -131,7 +136,7 @@ impl ThroughputTracker {
     /// view of the available bandwidth, reducing the chance of buffering
     /// stalls caused by over-optimistic quality selections.
     pub fn estimate(&self) -> f64 {
-        if self.fast_ema == 0.0 {
+        if !self.seeded {
             return 0.0;
         }
 
@@ -152,7 +157,7 @@ impl ThroughputTracker {
 
     /// Returns `true` when no samples have been recorded yet.
     pub fn is_empty(&self) -> bool {
-        self.fast_ema == 0.0
+        !self.seeded
     }
 }
 
@@ -164,7 +169,7 @@ impl ThroughputTracker {
 /// Mirrors `ThroughputRule.js` from dash.js.
 pub struct ThroughputRule {
     /// Fraction of measured throughput to treat as usable. Default: 0.9.
-    pub safety_factor: f64,
+    safety_factor: f64,
 }
 
 impl Default for ThroughputRule {
@@ -178,6 +183,10 @@ impl Default for ThroughputRule {
 impl AbrRule for ThroughputRule {
     fn name(&self) -> &str {
         "ThroughputRule"
+    }
+
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::ThroughputBased
     }
 
     fn max_index(
@@ -210,6 +219,20 @@ impl AbrRule for ThroughputRule {
         );
 
         Some(selected)
+    }
+}
+
+impl ThroughputRule {
+    pub fn with_safety_factor(safety_factor: f64) -> Self {
+        Self { safety_factor }
+    }
+
+    pub fn safety_factor(&self) -> f64 {
+        self.safety_factor
+    }
+
+    pub fn set_safety_factor(&mut self, safety_factor: f64) {
+        self.safety_factor = safety_factor;
     }
 }
 

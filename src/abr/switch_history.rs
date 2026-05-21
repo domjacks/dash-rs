@@ -2,6 +2,7 @@ use alloc::collections::VecDeque;
 use core::time::Duration;
 
 use crate::abr::{
+    decision::AbrDecisionReason,
     metrics::AbrMetrics,
     rule::{AbrRule, RepresentationInfo},
 };
@@ -49,6 +50,10 @@ impl SwitchHistoryRule {
 impl AbrRule for SwitchHistoryRule {
     fn name(&self) -> &str {
         "SwitchHistoryRule"
+    }
+
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::SwitchHistoryThrottle
     }
 
     fn max_index(

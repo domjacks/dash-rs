@@ -1,4 +1,5 @@
 use crate::abr::{
+    decision::AbrDecisionReason,
     metrics::AbrMetrics,
     rule::{AbrRule, RepresentationInfo},
 };
@@ -12,7 +13,7 @@ const TARGET_BUFFER_MS: f64 = 12_000.0;
 const MAX_BUFFER_MS: f64 = 30_000.0;
 /// Lyapunov parameter. Higher values weight throughput more; lower values
 /// weight buffer occupancy more. Typical range: 5–20.
-const GAMA: f64 = 5.0;
+const GAMMA: f64 = 5.0;
 
 /// Buffer-occupancy-based ABR rule, inspired by the BOLA (Buffer Occupancy
 /// based Lyapunov Algorithm) approach used in `BolaRule.js` from dash.js.
@@ -32,7 +33,7 @@ pub struct BufferOccupancyRule {
     /// Buffer level (ms) above which we are free to use the highest quality.
     pub max_buffer_ms: f64,
     /// Lyapunov tuning parameter V.
-    pub gama: f64,
+    pub gamma: f64,
 }
 
 impl Default for BufferOccupancyRule {
@@ -40,7 +41,7 @@ impl Default for BufferOccupancyRule {
         Self {
             target_buffer_ms: TARGET_BUFFER_MS,
             max_buffer_ms: MAX_BUFFER_MS,
-            gama: GAMA,
+            gamma: GAMMA,
         }
     }
 }
@@ -48,6 +49,10 @@ impl Default for BufferOccupancyRule {
 impl AbrRule for BufferOccupancyRule {
     fn name(&self) -> &str {
         "BufferOccupancyRule"
+    }
+
+    fn reason(&self) -> AbrDecisionReason {
+        AbrDecisionReason::BufferOccupancyBased
     }
 
     fn max_index(
@@ -87,7 +92,7 @@ impl AbrRule for BufferOccupancyRule {
 
             // BOLA objective: V * (utility + 1) - buffer_norm * (i + 1) as a
             // simplified variant that rewards filling the buffer.
-            let score = self.gama * (utility + 1.0) - buffer_norm * (i as f64 + 1.0);
+            let score = self.gamma * (utility + 1.0) - buffer_norm * (i as f64 + 1.0);
 
             if score > best_score {
                 best_score = score;
