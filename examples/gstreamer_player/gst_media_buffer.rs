@@ -101,7 +101,9 @@ impl GstMediaBuffer {
     ///
     /// Calls [`gst::init`] if GStreamer has not been initialised yet.
     pub fn new() -> Result<Self, DashError> {
-        gst::init().map_err(|e| DashError::AppendFailed(format!("gst::init failed: {e}")))?;
+        gst::init().map_err(|e| DashError::AppendFailed {
+            message: format!("gst::init failed: {e}"),
+        })?;
 
         // On macOS, VideoToolbox (`vtdec` / `vtdec_hw`) requires `codec_data`
         // to be present in the H.264 caps *before* its first frame.  For
@@ -177,20 +179,28 @@ impl GstMediaBuffer {
         let queue = gst::ElementFactory::make("queue")
             .name(format!("queue-{track_tag}"))
             .build()
-            .map_err(|e| DashError::AppendFailed(format!("failed to create queue: {e}")))?;
+            .map_err(|e| DashError::AppendFailed {
+                message: format!("failed to create queue: {e}"),
+            })?;
 
         let decodebin = gst::ElementFactory::make("decodebin")
             .name(format!("decodebin-{track_tag}"))
             .build()
-            .map_err(|e| DashError::AppendFailed(format!("failed to create decodebin: {e}")))?;
+            .map_err(|e| DashError::AppendFailed {
+                message: format!("failed to create decodebin: {e}"),
+            })?;
 
         // ── Add to pipeline and link the static part ─────────────────────────
         self.pipeline
             .add_many([appsrc.upcast_ref::<gst::Element>(), &queue, &decodebin])
-            .map_err(|e| DashError::AppendFailed(format!("pipeline.add_many failed: {e}")))?;
+            .map_err(|e| DashError::AppendFailed {
+                message: format!("pipeline.add_many failed: {e}"),
+            })?;
 
         gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &queue, &decodebin])
-            .map_err(|e| DashError::AppendFailed(format!("link_many failed: {e}")))?;
+            .map_err(|e| DashError::AppendFailed {
+                message: format!("link_many failed: {e}"),
+            })?;
 
         // ── Wire decodebin's dynamic pads to sinks ───────────────────────────
         let pipeline_weak = self.pipeline.downgrade();
@@ -270,7 +280,9 @@ impl MediaBuffer for GstMediaBuffer {
         {
             appsrc
                 .end_of_stream()
-                .map_err(|e| DashError::AppendFailed(format!("appsrc EOS failed: {e:?}")))?;
+                .map_err(|e| DashError::AppendFailed {
+                    message: format!("appsrc EOS failed: {e:?}"),
+                })?;
         }
         Ok(())
     }
@@ -324,7 +336,9 @@ impl MediaBuffer for GstMediaBuffer {
             MediaType::Video => self.video_appsrc.as_ref(),
             MediaType::Audio => self.audio_appsrc.as_ref(),
         }
-        .ok_or_else(|| DashError::AppendFailed(format!("{mt:?} track not initialised")))?;
+        .ok_or_else(|| DashError::AppendFailed {
+            message: format!("{mt:?} track not initialised"),
+        })?;
 
         let gst_buf = gst::Buffer::from_slice(data);
 
@@ -336,7 +350,9 @@ impl MediaBuffer for GstMediaBuffer {
 
         appsrc
             .push_buffer(gst_buf)
-            .map_err(|flow| DashError::AppendFailed(format!("appsrc flow error: {flow:?}")))?;
+            .map_err(|flow| DashError::AppendFailed {
+                message: format!("appsrc flow error: {flow:?}"),
+            })?;
 
         Ok(())
     }

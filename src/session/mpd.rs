@@ -17,7 +17,7 @@ use crate::abr::RepresentationInfo;
 #[cfg(not(feature = "std"))]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
 
 // ── Public helpers ────────────────────────────────────────────────────────────
 

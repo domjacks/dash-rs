@@ -289,6 +289,13 @@ impl StubBuffer {
     pub fn audio_bytes_appended(&self) -> usize {
         self.audio_chunks.iter().map(|c| c.data.len()).sum()
     }
+
+    fn set_mime(&mut self, mt: MediaType, mime_type: &str) {
+        match mt {
+            MediaType::Video => self.video_mime = mime_type.into(),
+            MediaType::Audio => self.audio_mime = mime_type.into(),
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -307,18 +314,12 @@ impl MediaBuffer for StubBuffer {
     }
 
     fn add_track(&mut self, mt: MediaType, mime_type: &str) -> bool {
-        match mt {
-            MediaType::Video => self.video_mime = mime_type.into(),
-            MediaType::Audio => self.audio_mime = mime_type.into(),
-        }
+        self.set_mime(mt, mime_type);
         true
     }
 
     async fn change_type(&mut self, mt: MediaType, mime_type: &str) -> Result<(), DashError> {
-        match mt {
-            MediaType::Video => self.video_mime = mime_type.into(),
-            MediaType::Audio => self.audio_mime = mime_type.into(),
-        }
+        self.set_mime(mt, mime_type);
         Ok(())
     }
 
@@ -347,12 +348,11 @@ impl MediaBuffer for StubBuffer {
 
     async fn remove_range(
         &mut self,
-        mt: MediaType,
+        _mt: MediaType,
         _start: f64,
         _end: f64,
     ) -> Result<(), DashError> {
         // For the stub we don't track timing, so removal is a no-op.
-        let _ = mt;
         Ok(())
     }
 

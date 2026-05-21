@@ -4,7 +4,7 @@ use thiserror::Error;
 use alloc::string::String;
 
 /// The top-level error type for dash-rs.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum DashError {
     // --- Manifest errors ---
     #[error("manifest fetch failed: {0}")]
@@ -17,11 +17,11 @@ pub enum DashError {
     EmptyManifest,
 
     // --- Media buffer errors ---
-    #[error("append failed: {0}")]
-    AppendFailed(String),
+    #[error("append failed: {message}")]
+    AppendFailed { message: String },
 
-    #[error("remove failed: {0}")]
-    RemoveFailed(String),
+    #[error("remove failed: {message}")]
+    RemoveFailed { message: String },
 
     // --- Session errors ---
     #[error("no representations available for media type: {media_type}")]

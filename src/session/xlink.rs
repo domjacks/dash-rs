@@ -18,7 +18,7 @@
 use crate::Url;
 
 #[cfg(not(feature = "std"))]
-use alloc::{borrow::ToOwned, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
 
 use crate::manifest::mpd_types::{AdaptationSet, Period, MPD};
 

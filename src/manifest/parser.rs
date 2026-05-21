@@ -22,7 +22,7 @@ const XLINK_NS: &str = "http://www.w3.org/1999/xlink";
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Error returned when an MPD manifest cannot be parsed.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, PartialEq)]
 #[error("MPD parse error: {0}")]
 pub struct MpdParseError(String);
 

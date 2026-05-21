@@ -150,7 +150,7 @@ fn switch_history_clamps_after_recent_switch() {
     let reps = reps();
     let mut metrics = AbrMetrics::new(10_000_000.0, 15_000.0);
     metrics.current_index = Some(1); // currently at "mid"
-    // Both record and check at t=0; elapsed = 0 < 8 000 ms → must clamp.
+                                     // Both record and check at t=0; elapsed = 0 < 8 000 ms → must clamp.
     metrics.now_ms = 0.0;
     rule.record_switch(0.0);
 
@@ -292,6 +292,26 @@ fn controller_drops_frames_overrides_throughput() {
 
     let decision = controller.select(&reps, &metrics);
     assert_eq!(decision.index, 0);
+    assert_eq!(decision.reason, AbrDecisionReason::DroppedFrames);
+}
+
+#[test]
+fn controller_can_disable_switch_history_with_custom_constructor() {
+    let mut controller = AbrController::with_rules_and_switch_history(
+        vec![Box::new(ThroughputRule::default())],
+        None,
+    );
+    let reps = reps();
+
+    // Should be a no-op when switch history is disabled.
+    controller.record_switch(0.0);
+
+    let mut metrics = AbrMetrics::new(10_000_000.0, 20_000.0);
+    metrics.current_index = Some(0);
+
+    let decision = controller.select(&reps, &metrics);
+    assert_eq!(decision.index, 2);
+    assert_eq!(decision.reason, AbrDecisionReason::ThroughputBased);
 }
 
 // ── SwitchHistoryRule — cooldown expiry ───────────────────────────────────────

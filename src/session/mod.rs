@@ -42,6 +42,7 @@ use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
 use alloc::{
     borrow::ToOwned,
+    format,
     string::{String, ToString},
     vec::Vec,
 };

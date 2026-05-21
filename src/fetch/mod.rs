@@ -10,7 +10,7 @@ use thiserror::Error;
 // ── Error ─────────────────────────────────────────────────────────────────────
 
 /// Errors that can occur during a fetch operation.
-#[derive(Debug, Error)]
+#[derive(Debug, Error, PartialEq)]
 pub enum FetchError {
     #[error("HTTP error {status} fetching {url}")]
     Http { status: u16, url: Url },
