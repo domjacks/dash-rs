@@ -252,7 +252,6 @@ struct TrackReinit {
     seg_dur_ms: f64,
     total_segments: Option<u64>,
     addressing_mode: AddressingMode,
-    /// MSE `SourceBuffer.timestampOffset` = `Period@start − PTO/timescale`.
     timestamp_offset_s: f64,
     /// `Period@start` in seconds (0.0 for the first/only period).
     ///
@@ -1697,7 +1696,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         let mut prev_audio_index: Option<usize> = None;
 
         // ── Startup sequence ─────────────────────────────────────────────────
-        // 1. Open the buffer (for MSE: creates MediaSource, awaits sourceopen).
+        // 1. Open the buffer
         buf.open().await?;
 
         // 2. Notify the buffer whether the stream is live.
@@ -2238,7 +2237,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             // Codec initialisation must be re-sent to the renderer after a
             // seek: GStreamer's qtdemux resets its parser state on flush and
             // requires the init segment (ftyp + moov) before any moof boxes.
-            // For MSE SourceBuffers, re-appending the init segment is a no-op.
             track.init_segment_sent = false;
         }
 

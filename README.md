@@ -563,7 +563,7 @@ An on-screen **player log** panel shows all output colour-coded by source:
 
 ```bash
 # Build the WASM module (from workspace root)
-wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player/pkg
+wasm-pack build examples/wasm_player --target web --out-dir pkg
 
 # Serve the player with any static file server
 python3 -m http.server 8080 --directory examples/wasm_player

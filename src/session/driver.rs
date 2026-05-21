@@ -258,7 +258,7 @@ pub trait PlaybackDriver {
     /// of each iteration.
     ///
     /// Default: `false`.  Enable for native renderers (e.g. GStreamer) where
-    /// the MSE append window does not automatically evict old buffer data and
+    /// the append window does not automatically evict old buffer data and
     /// memory must be managed explicitly.
     fn enable_pruning(&self) -> bool {
         false

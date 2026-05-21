@@ -694,9 +694,6 @@ traits via `dash_rs::media_buffer::{MediaBuffer, TimeRange}`.
 Only promote an implementation into `src/` if it is intended to be reusable
 by downstream crates.
 
-Do not modify `src/media_buffer.rs` (the trait definitions) unless the
-MSE spec requires a new method.
-
 ### Adding a `SegmentFetcher` implementation
 
 Concrete fetcher implementations that are only needed by a specific example
@@ -717,6 +714,9 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 ### Code comments
 
 Only include comments that explain the high-level business logic or non-obvious edge cases. Do not write comments explaining what basic code does.
+
+Keep comments short and concise.
+
 Do not add inline comments to the right of code.
 
 

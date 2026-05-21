@@ -36,7 +36,6 @@
 //! }
 //! ```
 //!
-//! [mse]: https://www.w3.org/TR/media-source/
 
 extern crate alloc;
 use alloc::boxed::Box;
@@ -85,9 +84,6 @@ pub trait MediaBuffer {
 
     /// Prepare the sink to receive media data.
     ///
-    /// For browser MSE implementations this should call
-    /// `URL.createObjectURL(new MediaSource())`, attach it to the
-    /// `<video>` element, and await the `sourceopen` event.
     /// For most native sinks this can be a no-op.
     async fn open(&mut self) -> Result<(), DashError> {
         Ok(())
@@ -126,8 +122,6 @@ pub trait MediaBuffer {
     }
 
     /// Change the codec of an existing track at a period boundary.
-    ///
-    /// Corresponds to `SourceBuffer.changeType()` in the MSE spec.
     async fn change_type(&mut self, _mt: MediaType, _mime_type: &str) -> Result<(), DashError> {
         Ok(())
     }
@@ -137,15 +131,13 @@ pub trait MediaBuffer {
     /// Set the decode-timestamp offset for `mt`.
     ///
     /// The library calls this once at session startup and again at period
-    /// boundaries when the offset changes.  Corresponds to
-    /// `SourceBuffer.timestampOffset` in the MSE spec.
+    /// boundaries when the offset changes.
     fn set_timestamp_offset(&mut self, _mt: MediaType, _offset_s: f64) {}
 
     /// Set the append window `[start, end)` for `mt`.
     ///
     /// The library calls this once at session startup and again at period
-    /// boundaries.  Corresponds to `SourceBuffer.appendWindowStart/End` in
-    /// the MSE spec.  Non-MSE sinks can ignore it.
+    /// boundaries.
     fn set_append_window(&mut self, _mt: MediaType, _start: f64, _end: f64) {}
 
     // ── Data delivery ────────────────────────────────────────────────────
