@@ -22,10 +22,12 @@
 //! input; it is not a history.  `DashMetrics` is the accumulated history that
 //! the session populates automatically.
 
+#[cfg(not(feature = "std"))]
 use alloc::collections::VecDeque;
-
 #[cfg(not(feature = "std"))]
 use alloc::string::String;
+#[cfg(feature = "std")]
+use std::{collections::VecDeque, string::String};
 
 use crate::{abr::AbrDecisionReason, session::MediaType};
 
@@ -168,6 +170,7 @@ impl DashMetrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::format;
 
     fn http_rec(seg: u64) -> HttpRequestRecord {
         HttpRequestRecord {

@@ -1,5 +1,9 @@
-use alloc::collections::VecDeque;
 use core::time::Duration;
+
+#[cfg(not(feature = "std"))]
+use alloc::collections::VecDeque;
+#[cfg(feature = "std")]
+use std::collections::VecDeque;
 
 use crate::abr::{
     decision::AbrDecisionReason,

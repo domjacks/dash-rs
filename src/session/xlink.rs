@@ -310,6 +310,7 @@ fn parse_adaptation_sets(xml: &str) -> Option<Vec<AdaptationSet>> {
 mod tests {
     use super::{check_xlink, parse_adaptation_sets, parse_periods, XLinkAction};
     use crate::Url;
+    use alloc::borrow::ToOwned;
 
     fn base() -> Url {
         Url::parse("http://example.com/").unwrap()
@@ -319,21 +320,30 @@ mod tests {
 
     #[test]
     fn check_xlink_skips_absent_href() {
-        assert!(matches!(check_xlink(&None, &None, &base()), XLinkAction::Skip));
+        assert!(matches!(
+            check_xlink(&None, &None, &base()),
+            XLinkAction::Skip
+        ));
     }
 
     #[test]
     fn check_xlink_skips_on_request_actuate() {
         let href = Some("http://example.com/period.xml".to_owned());
         let actuate = Some("onRequest".to_owned());
-        assert!(matches!(check_xlink(&href, &actuate, &base()), XLinkAction::Skip));
+        assert!(matches!(
+            check_xlink(&href, &actuate, &base()),
+            XLinkAction::Skip
+        ));
     }
 
     #[test]
     fn check_xlink_removes_resolve_to_zero_sentinel() {
         let href = Some("urn:mpeg:dash:resolve-to-zero:2013".to_owned());
         let actuate = Some("onLoad".to_owned());
-        assert!(matches!(check_xlink(&href, &actuate, &base()), XLinkAction::Remove));
+        assert!(matches!(
+            check_xlink(&href, &actuate, &base()),
+            XLinkAction::Remove
+        ));
     }
 
     #[test]

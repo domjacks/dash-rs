@@ -520,6 +520,7 @@ mod extended_tests {
         SegmentTimeline, SegmentURL, S,
     };
     use crate::session::MediaType;
+    use alloc::vec;
 
     // ── find_adaptation ───────────────────────────────────────────────────────
 

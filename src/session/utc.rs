@@ -309,7 +309,8 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
 
     let is_leap = |y: u64| (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
 
-    let max_day = DAYS_IN_MONTH[(month - 1) as usize] + if month == 2 && is_leap(year) { 1 } else { 0 };
+    let max_day =
+        DAYS_IN_MONTH[(month - 1) as usize] + if month == 2 && is_leap(year) { 1 } else { 0 };
     if day > max_day {
         return None;
     }
@@ -339,6 +340,7 @@ fn days_since_epoch(year: u64, month: u64, day: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::{parse_http_date, parse_rfc2822_date};
+    use alloc::format;
 
     // ── parse_rfc2822_date ────────────────────────────────────────────────────
 

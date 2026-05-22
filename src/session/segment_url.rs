@@ -361,7 +361,8 @@ mod tests {
 mod extended_tests {
     use super::{collect_candidate_base_urls, resolve_effective_base_url};
     use crate::manifest::mpd_types::{AdaptationSet, BaseURL, Period};
-    use url::Url;
+    use crate::Url;
+    use alloc::{borrow::ToOwned, vec};
 
     fn base_url(s: &str) -> BaseURL {
         BaseURL {

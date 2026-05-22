@@ -98,6 +98,7 @@ impl CdnBlacklist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "std")]
     use std::thread;
 
     #[test]
@@ -119,6 +120,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn blacklist_expires_after_cooldown() {
         let mut bl = CdnBlacklist::new();
         bl.set_cooldown(Duration::from_millis(5));
@@ -135,6 +137,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn record_failure_resets_expiry() {
         let mut bl = CdnBlacklist::new();
         bl.set_cooldown(Duration::from_millis(100));
@@ -150,6 +153,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn evict_expired_removes_stale_entries() {
         let mut bl = CdnBlacklist::new();
         bl.set_cooldown(Duration::from_millis(5));
@@ -175,6 +179,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "std")]
     fn set_cooldown_takes_effect_for_new_failures() {
         let mut bl = CdnBlacklist::new();
         bl.set_cooldown(Duration::from_millis(1));

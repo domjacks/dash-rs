@@ -150,7 +150,7 @@ pub trait SegmentFetcher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use url::Url;
+    use crate::Url;
 
     fn dummy_url() -> Url {
         Url::parse("http://example.com/seg.m4s").unwrap()

@@ -795,6 +795,7 @@ pub fn parse_prft(data: &[u8]) -> Option<ProducerReferenceTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec;
 
     /// Build a minimal version-0 sidx box.
     ///

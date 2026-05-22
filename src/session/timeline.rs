@@ -191,6 +191,7 @@ pub(super) fn count_timeline_segments(segments: &[S]) -> u64 {
 mod tests {
     use super::{count_timeline_segments, find_timeline_segment, snap_to_timeline_grid};
     use crate::manifest::mpd_types::S;
+    use alloc::vec;
 
     fn s(t: Option<u64>, d: u64, r: Option<i64>) -> S {
         S {

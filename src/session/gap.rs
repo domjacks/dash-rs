@@ -405,6 +405,7 @@ impl GapController {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn ranges(pairs: &[(f64, f64)]) -> Vec<TimeRange> {
         pairs.iter().map(|&(s, e)| TimeRange::new(s, e)).collect()
