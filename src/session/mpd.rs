@@ -15,6 +15,7 @@ use super::MediaType;
 use crate::abr::RepresentationInfo;
 
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
 use alloc::{borrow::ToOwned, format, string::String, vec::Vec};

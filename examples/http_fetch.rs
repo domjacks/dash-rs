@@ -12,10 +12,7 @@
 //! Override the manifest URL with a first positional argument:
 //!   cargo run --example http_fetch -- https://your-stream/manifest.mpd
 
-use std::{
-    sync::Arc,
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -46,10 +43,7 @@ impl HttpSegmentFetcher {
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("failed to build HTTP client");
-        Self {
-            client,
-            throughput,
-        }
+        Self { client, throughput }
     }
 }
 

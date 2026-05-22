@@ -17,6 +17,7 @@ use crate::manifest::mpd_types::{AdaptationSet, BaseURL, Period};
 use crate::Url;
 
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
 use alloc::{

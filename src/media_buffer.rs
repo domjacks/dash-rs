@@ -386,12 +386,18 @@ mod tests {
         // does not panic — it returns a negative duration so the ABR controller
         // and gap detector can detect the anomaly.
         let r = TimeRange::new(5.0, 1.0);
-        assert!(r.duration() < 0.0, "inverted range should yield negative duration");
+        assert!(
+            r.duration() < 0.0,
+            "inverted range should yield negative duration"
+        );
     }
 
     #[test]
     fn time_range_duration_nan_propagates() {
         let r = TimeRange::new(f64::NAN, 5.0);
-        assert!(r.duration().is_nan(), "NaN start should propagate through duration()");
+        assert!(
+            r.duration().is_nan(),
+            "NaN start should propagate through duration()"
+        );
     }
 }

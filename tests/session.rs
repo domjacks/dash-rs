@@ -2930,7 +2930,10 @@ async fn post_seek_quality_retained_after_seek() {
         .current_metrics(MediaType::Video, 0.0, &buf)
         .current_index
         .expect("index must be Some after update_metrics");
-    assert_eq!(pre_seek_index, 2, "pre-seek quality should be index 2 (high)");
+    assert_eq!(
+        pre_seek_index, 2,
+        "pre-seek quality should be index 2 (high)"
+    );
 
     // Seek to the middle of the stream.
     session.seek_to(20.0);

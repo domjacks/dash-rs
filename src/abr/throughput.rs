@@ -4,6 +4,7 @@ use alloc::collections::VecDeque;
 use std::collections::VecDeque;
 
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use crate::math::FloatExt as _;
 
 use crate::abr::{

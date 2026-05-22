@@ -38,6 +38,7 @@ use alloc::sync::Arc;
 use hashbrown::HashMap;
 
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use crate::math::FloatExt as _;
 #[cfg(not(feature = "std"))]
 use alloc::{
@@ -1413,32 +1414,33 @@ impl<F: SegmentFetcher> DashSession<F> {
             MediaType::Audio => self.audio_track.as_ref(),
         };
 
-        let (buffer_level_ms, current_index, throughput_bps, latency_ms, is_post_seek) = if let Some(t) = track {
-            let buffered = buf.buffered(media_type);
-            // When the sink reports meaningful time ranges, derive buffer level
-            // from the last range end relative to the current position.
-            // When the sink cannot report ranges (e.g. GStreamer appsrc), fall
-            // back to the session's own segment-count estimate so that
-            // buffer-occupancy ABR rules receive a realistic level rather than
-            // a permanent zero.
-            let level = if buf.has_buffer_tracking() {
-                buffered
-                    .last()
-                    .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
-                    .unwrap_or(0.0)
+        let (buffer_level_ms, current_index, throughput_bps, latency_ms, is_post_seek) =
+            if let Some(t) = track {
+                let buffered = buf.buffered(media_type);
+                // When the sink reports meaningful time ranges, derive buffer level
+                // from the last range end relative to the current position.
+                // When the sink cannot report ranges (e.g. GStreamer appsrc), fall
+                // back to the session's own segment-count estimate so that
+                // buffer-occupancy ABR rules receive a realistic level rather than
+                // a permanent zero.
+                let level = if buf.has_buffer_tracking() {
+                    buffered
+                        .last()
+                        .map(|r| (r.end - position_s).max(0.0) * 1_000.0)
+                        .unwrap_or(0.0)
+                } else {
+                    self.estimated_buffer_level_ms(&media_type)
+                };
+                (
+                    level,
+                    Some(t.current_index),
+                    t.throughput_tracker.estimate(),
+                    t.last_transfer_ms,
+                    t.post_seek,
+                )
             } else {
-                self.estimated_buffer_level_ms(&media_type)
+                (0.0, None, 0.0, 0.0, false)
             };
-            (
-                level,
-                Some(t.current_index),
-                t.throughput_tracker.estimate(),
-                t.last_transfer_ms,
-                t.post_seek,
-            )
-        } else {
-            (0.0, None, 0.0, 0.0, false)
-        };
 
         AbrMetrics {
             throughput_bps,
@@ -1844,8 +1846,11 @@ impl<F: SegmentFetcher> DashSession<F> {
                     // forward that to the driver so the renderer targets the
                     // exact position the session fetch cursor is now at.
                     let snapped_s = self.seek_to(target.position_s);
-                    drv.on_gap_seek(GapSeekTarget { position_s: snapped_s, reason: target.reason })
-                        .await;
+                    drv.on_gap_seek(GapSeekTarget {
+                        position_s: snapped_s,
+                        reason: target.reason,
+                    })
+                    .await;
                     self.notify_playing();
                 }
             }

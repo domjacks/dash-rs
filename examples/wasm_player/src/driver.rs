@@ -6,6 +6,7 @@
 //! element, and push a compact JSON status string to the JavaScript debug
 //! panel after every segment pair.
 
+use crate::bridge::JsBridge;
 use async_trait::async_trait;
 use dash_rs::{
     session::driver::{IterationSummary, PlaybackDriver, PlaybackState},
@@ -13,7 +14,6 @@ use dash_rs::{
 };
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
-use crate::bridge::JsBridge;
 
 // ── WasmPlaybackDriver ────────────────────────────────────────────────────────
 

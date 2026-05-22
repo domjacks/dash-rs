@@ -342,7 +342,8 @@ pub trait PlaybackDriver {
         _session_position_s: f64,
         _video_buffer_level_ms: f64,
         _audio_buffer_level_ms: f64,
-    ) {}
+    ) {
+    }
 
     /// Called immediately when the ABR controller switches to a different
     /// quality level during a fetch.

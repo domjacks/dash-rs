@@ -18,8 +18,8 @@ pub mod media_buffer;
 pub mod mp4;
 pub mod player;
 pub mod session;
-mod time;
 pub mod throughput_cell;
+mod time;
 pub mod util;
 
 #[cfg(not(feature = "std"))]

@@ -68,9 +68,7 @@ impl Url {
             .find('@')
             .map(|i| &after_scheme[i + 1..])
             .unwrap_or(after_scheme);
-        let host_end = host_start
-            .find(|c| c == '/' || c == ':' || c == '?')
-            .unwrap_or(host_start.len());
+        let host_end = host_start.find(['/', ':', '?']).unwrap_or(host_start.len());
         if host_end == 0 {
             None
         } else {

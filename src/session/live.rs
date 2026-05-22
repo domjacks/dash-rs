@@ -12,6 +12,7 @@
 const DEFAULT_LIVE_SAFETY_SEGMENTS: u64 = 3;
 
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use crate::math::FloatExt as _;
 
 /// Compute the segment number to start fetching for a live/dynamic stream.

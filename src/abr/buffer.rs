@@ -5,6 +5,7 @@ use crate::abr::{
 };
 
 #[cfg(not(feature = "std"))]
+#[allow(unused_imports)]
 use crate::math::FloatExt as _;
 
 /// Target buffer level in ms: the level we aim to maintain.

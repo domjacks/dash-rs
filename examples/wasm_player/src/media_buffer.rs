@@ -44,12 +44,9 @@ impl BridgeMediaBuffer {
             MediaType::Video => &self.video_sb_id,
             MediaType::Audio => &self.audio_sb_id,
         };
-        opt.as_deref()
-            .ok_or_else(|| {
-                DashError::AppendFailed {
-                    message: format!("{mt:?} track not initialised"),
-                }
-            })
+        opt.as_deref().ok_or_else(|| DashError::AppendFailed {
+            message: format!("{mt:?} track not initialised"),
+        })
     }
 }
 
@@ -62,9 +59,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         tracing::debug!("BridgeMediaBuffer: open — awaiting sourceopen");
         JsFuture::from(self.bridge.setup_media_source())
             .await
-            .map_err(|e| DashError::AppendFailed {
-                message: js_err(e),
-            })?;
+            .map_err(|e| DashError::AppendFailed { message: js_err(e) })?;
         tracing::info!("BridgeMediaBuffer: sourceopen received — MediaSource is Open");
         Ok(())
     }
@@ -77,9 +72,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         tracing::info!("BridgeMediaBuffer: endOfStream");
         self.bridge
             .end_of_stream()
-            .map_err(|e| DashError::AppendFailed {
-                message: js_err(e),
-            })
+            .map_err(|e| DashError::AppendFailed { message: js_err(e) })
     }
 
     /// Allocate a browser `SourceBuffer` for `mt`.
@@ -124,9 +117,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         tracing::debug!(?mt, new = mime_type, "BridgeMediaBuffer: changeType");
         self.bridge
             .change_type(&id, mime_type)
-            .map_err(|e| DashError::AppendFailed {
-                message: js_err(e),
-            })?;
+            .map_err(|e| DashError::AppendFailed { message: js_err(e) })?;
         // Update the stored ID in case the browser re-keyed it (rare but safe).
         Ok(())
     }
@@ -157,9 +148,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         let array = Uint8Array::from(data.as_ref());
         JsFuture::from(self.bridge.append_buffer(&id, &array))
             .await
-            .map_err(|e| DashError::AppendFailed {
-                message: js_err(e),
-            })?;
+            .map_err(|e| DashError::AppendFailed { message: js_err(e) })?;
         Ok(())
     }
 
@@ -168,9 +157,7 @@ impl MediaBuffer for BridgeMediaBuffer {
         tracing::debug!(?mt, start, end, "BridgeMediaBuffer: remove");
         JsFuture::from(self.bridge.remove_range(&id, start, end))
             .await
-            .map_err(|e| DashError::RemoveFailed {
-                message: js_err(e),
-            })?;
+            .map_err(|e| DashError::RemoveFailed { message: js_err(e) })?;
         Ok(())
     }
 
