@@ -479,8 +479,8 @@ player.run().await?;
 
 Player events are emitted by wrappers around the configured `MediaBuffer` and
 `PlaybackDriver`, so segment fetching stays independent of application event
-delivery. The `events` feature has no external dependency and works in
-`no_std` builds that provide `alloc`.
+delivery. The event API has no external dependency and works in `no_std` builds
+that provide `alloc`.
 
 ---
 

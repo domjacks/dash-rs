@@ -48,15 +48,10 @@
 //! ```
 
 use alloc::sync::Arc;
-
-#[cfg(feature = "events")]
 use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
-#[cfg(feature = "events")]
 use core::{cell::Cell, cell::RefCell};
 
-#[cfg(feature = "events")]
 use async_trait::async_trait;
-#[cfg(feature = "events")]
 use bytes::Bytes;
 
 use crate::{
@@ -70,19 +65,15 @@ use crate::{
     Url,
 };
 
-#[cfg(feature = "events")]
 use crate::{
     abr::AbrDecisionReason,
     media_buffer::TimeRange,
     session::{driver::PlaybackState, GapSeekTarget, MediaType},
 };
 
-#[cfg(feature = "events")]
 use crate::mp4::parse_all_emsg;
 
-#[cfg(feature = "events")]
 type EventHandler = Box<dyn FnMut(&PlayerEvent)>;
-#[cfg(feature = "events")]
 type EventHandlers = Rc<RefCell<Vec<EventHandler>>>;
 
 // ── PlayerEvent ───────────────────────────────────────────────────────────────
@@ -96,7 +87,6 @@ type EventHandlers = Rc<RefCell<Vec<EventHandler>>>;
 /// |---|---|
 /// | 0 | Seconds relative to the segment's earliest presentation time.  Add `sidx.start_s` (if available) to get an absolute timeline position. |
 /// | 1 | Absolute seconds from the start of the media presentation timeline. |
-#[cfg(feature = "events")]
 #[derive(Debug, Clone, PartialEq)]
 pub struct DashEvent {
     /// Which media track's segment contained this event.
@@ -116,7 +106,6 @@ pub struct DashEvent {
 }
 
 /// Events emitted by [`Player`] while it runs.
-#[cfg(feature = "events")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerEvent {
     /// In-band DASH metadata from an `emsg` box in an appended media segment.
@@ -150,14 +139,12 @@ pub enum PlayerEvent {
     EndOfStream,
 }
 
-#[cfg(feature = "events")]
 fn emit_event(handlers: &EventHandlers, event: PlayerEvent) {
     for handler in handlers.borrow_mut().iter_mut() {
         handler(&event);
     }
 }
 
-#[cfg(feature = "events")]
 fn new_event_handlers() -> EventHandlers {
     Rc::new(RefCell::new(Vec::new()))
 }
@@ -172,7 +159,6 @@ pub struct Player<F: SegmentFetcher, S: MediaBuffer, D> {
     session: DashSession<F>,
     buf: S,
     driver: D,
-    #[cfg(feature = "events")]
     event_handlers: EventHandlers,
 }
 
@@ -192,7 +178,6 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
-            #[cfg(feature = "events")]
             event_handlers: new_event_handlers(),
         })
     }
@@ -213,7 +198,6 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
-            #[cfg(feature = "events")]
             event_handlers: new_event_handlers(),
         })
     }
@@ -240,7 +224,6 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
-            #[cfg(feature = "events")]
             event_handlers: new_event_handlers(),
         })
     }
@@ -263,7 +246,6 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
-            #[cfg(feature = "events")]
             event_handlers: new_event_handlers(),
         })
     }
@@ -277,14 +259,8 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
     /// (`open` → `set_live_mode` → `add_track` → init segments → PTS remap →
     /// `on_session_started` → `notify_playing`) is performed inside `run()`
     /// before the fetch loop begins.
-    #[cfg(not(feature = "events"))]
-    pub async fn run(&mut self) -> Result<(), DashError> {
-        self.session.run(&mut self.buf, &mut self.driver).await
-    }
-
     /// Run the DASH fetch loop and emit [`PlayerEvent`] callbacks registered
     /// with [`Self::on`].
-    #[cfg(feature = "events")]
     pub async fn run(&mut self) -> Result<(), DashError> {
         if self.event_handlers.borrow().is_empty() {
             return self.session.run(&mut self.buf, &mut self.driver).await;
@@ -302,7 +278,6 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
 
     /// Register a callback for all [`PlayerEvent`] values emitted during
     /// [`run`][Self::run].
-    #[cfg(feature = "events")]
     pub fn on(&mut self, handler: impl FnMut(&PlayerEvent) + 'static) -> &mut Self {
         self.event_handlers.borrow_mut().push(Box::new(handler));
         self
@@ -401,20 +376,17 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
 
 // ── Event Wrappers ────────────────────────────────────────────────────────────
 
-#[cfg(feature = "events")]
 struct EventMediaBuffer<'a, S> {
     inner: &'a mut S,
     handlers: EventHandlers,
 }
 
-#[cfg(feature = "events")]
 impl<'a, S> EventMediaBuffer<'a, S> {
     fn new(inner: &'a mut S, handlers: EventHandlers) -> Self {
         Self { inner, handlers }
     }
 }
 
-#[cfg(feature = "events")]
 #[async_trait(?Send)]
 impl<S: MediaBuffer> MediaBuffer for EventMediaBuffer<'_, S> {
     async fn open(&mut self) -> Result<(), DashError> {
@@ -482,14 +454,12 @@ impl<S: MediaBuffer> MediaBuffer for EventMediaBuffer<'_, S> {
     }
 }
 
-#[cfg(feature = "events")]
 struct EventPlaybackDriver<'a, D> {
     inner: &'a mut D,
     handlers: EventHandlers,
     last_playback_state: Cell<PlaybackState>,
 }
 
-#[cfg(feature = "events")]
 impl<'a, D: PlaybackDriver> EventPlaybackDriver<'a, D> {
     fn new(inner: &'a mut D, handlers: EventHandlers) -> Self {
         let last_playback_state = Cell::new(inner.playback_state());
@@ -501,7 +471,6 @@ impl<'a, D: PlaybackDriver> EventPlaybackDriver<'a, D> {
     }
 }
 
-#[cfg(feature = "events")]
 #[async_trait(?Send)]
 impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
     fn position_s(&self) -> f64 {

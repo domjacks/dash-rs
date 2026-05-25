@@ -20,11 +20,7 @@ sink-gstreamer = ["dep:gstreamer", "dep:gstreamer-app"]
 ## Enable std-requiring features: real url::Url, SystemClock, Delay-based retries.
 ## Enabled by default; disable with `default-features = false` for no_std builds.
 std = ["dep:url", "dep:futures-timer"]
-## Enable Player-level events, including in-band DASH `emsg` metadata.
-## Works with no_std builds that provide alloc.
-events = []
-
-default = ["std", "events"]
+default = ["std"]
 
 [dependencies]
 roxmltree        = { version = "0.21", default-features = false }

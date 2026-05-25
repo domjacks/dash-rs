@@ -39,7 +39,7 @@ wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player
 #   python3 -m http.server 8080
 # and open http://localhost:8080
 
-# no_std build (no std; events remain alloc-only if enabled explicitly)
+# no_std build
 cargo check --no-default-features
 
 # Lint

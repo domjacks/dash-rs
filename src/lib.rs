@@ -40,11 +40,9 @@ pub use error::DashError;
 pub use fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
 pub use manifest::MPD;
 pub use media_buffer::{MediaBuffer, NullBuffer, StubBuffer, StubChunk, TimeRange};
-#[cfg(feature = "events")]
 pub use mp4::parse_all_emsg;
 pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 pub use player::Player;
-#[cfg(feature = "events")]
 pub use player::{DashEvent, PlayerEvent};
 pub use session::driver::{IterationSummary, PlaybackDriver, PlaybackState};
 pub use session::{
