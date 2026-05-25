@@ -51,7 +51,6 @@ Validated against current tree.
 | `src/lib.rs` | `#[macro_use] extern crate alloc` is pre-2018 style; prefer direct macro paths/imports in Edition 2021. | Open |
 | `src/media_buffer.rs` | `StubBuffer::add_track` and `StubBuffer::change_type` duplicate the same MIME-track `match`. Extract a private helper to reduce repetition. | Open |
 | `src/media_buffer.rs` | `let _ = mt;` in `remove_range` is less idiomatic than naming the parameter `_mt`. | Open |
-| `src/session/mod.rs` | Prior duplication between `estimated_buffer_level_ms` and `estimated_playback_position_s` pause-accounting is already extracted into `effective_elapsed_ms()`. | Fixed |
 
 ---
 
@@ -99,12 +98,6 @@ would make all four call sites uniform.
 | Location | Missing case |
 |---|---|
 | `src/session/mod.rs` | `wait_for_buffer_capacity` interrupt path: pending seek fires and unblocks the gate within ≤ 500 ms. Non-trivial to test without a fake clock that can inject a seek mid-sleep. |
-
-### `InsufficientBufferRule` boundary: `<=` vs `<`
-
-✅ Documented by `insufficient_buffer_at_exact_threshold_fires` — the test asserts that the rule
-fires (returns `Some(0)`) when `buffer_level_ms == critical_threshold_ms`, confirming the `<=`
-behaviour deliberately differs from dash.js's strict `<`.
 
 ---
 
