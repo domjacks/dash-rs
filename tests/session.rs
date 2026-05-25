@@ -18,7 +18,7 @@ use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     media_buffer::{MediaBuffer, NullBuffer, TimeRange},
     session::{driver::PlaybackState, DashSession, FetchOutcome, MediaType},
-    GapSeekReason,
+    GapSeekReason, IterationSummary, PlaybackDriver, Player, PlayerEvent,
 };
 
 // ── MPD XML fixtures ──────────────────────────────────────────────────────────
@@ -1186,11 +1186,47 @@ impl SegmentFetcher for EmsgMockFetcher {
     fn abort(&self) {}
 }
 
-/// A v1 emsg embedded in a media segment is delivered to a subscriber of
-/// `subscribe_events` when `fetch_next_segment` processes that segment.
+#[derive(Default)]
+struct OneIterationDriver {
+    iterations: usize,
+}
+
+#[async_trait(?Send)]
+impl PlaybackDriver for OneIterationDriver {
+    fn position_s(&self) -> f64 {
+        0.0
+    }
+
+    fn should_continue(&self) -> bool {
+        self.iterations == 0
+    }
+
+    fn on_iteration(&mut self, _summary: &IterationSummary<'_>) {
+        self.iterations += 1;
+    }
+}
+
+async fn collect_player_events(segment_data: Vec<u8>) -> Vec<PlayerEvent> {
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, segment_data);
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut player = Player::from_url(&url, fetcher, NullBuffer, OneIterationDriver::default())
+        .await
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    player.on(move |event| {
+        captured.lock().unwrap().push(event.clone());
+    });
+    player.run().await.unwrap();
+
+    let collected = events.lock().unwrap().clone();
+    collected
+}
+
+/// A v1 emsg embedded in a media segment is delivered as a `PlayerEvent` when
+/// the segment is appended through the Player-owned media-buffer wrapper.
 #[tokio::test]
-async fn emsg_v1_event_delivered_to_subscriber() {
-    let mut buf = NullBuffer;
+async fn emsg_v1_event_delivered_to_player_callback() {
     let emsg_bytes = make_emsg_v1(
         "urn:scte:scte35:2014:xml+bin",
         "1",
@@ -1201,20 +1237,14 @@ async fn emsg_v1_event_delivered_to_subscriber() {
         b"splice-info",
     );
 
-    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
-    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
-
-    // Subscribe before the fetch so no events are missed.
-    let mut events = session.subscribe_events();
-
-    let metrics = default_metrics();
-    session
-        .fetch_next_segment(MediaType::Video, &metrics, &mut buf)
-        .await
-        .unwrap();
-
-    let ev = events.try_recv().expect("expected one emsg event");
+    let events = collect_player_events(emsg_bytes).await;
+    let ev = events
+        .iter()
+        .find_map(|event| match event {
+            PlayerEvent::InbandDash(ev) => Some(ev),
+            _ => None,
+        })
+        .expect("expected one emsg event");
     assert_eq!(ev.scheme_id_uri, "urn:scte:scte35:2014:xml+bin");
     assert_eq!(ev.value, "1");
     assert!(
@@ -1229,25 +1259,20 @@ async fn emsg_v1_event_delivered_to_subscriber() {
 }
 
 /// A v0 emsg preserves `scheme_id_uri`, `value`, and the time fields through
-/// the full `fetch_next_segment` → broadcast path.
+/// the Player event path.
 #[tokio::test]
-async fn emsg_v0_fields_preserved_through_broadcast() {
-    let mut buf = NullBuffer;
+async fn emsg_v0_fields_preserved_through_player_event() {
     // timescale=1000, pt_delta=2000 → 2.0 s; event_duration=3000 → 3.0 s
     let emsg_bytes = make_emsg_v0("urn:example:v0", "myval", 1000, 2000, 3000, 99, b"v0data");
 
-    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
-    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
-
-    let mut events = session.subscribe_events();
-
-    session
-        .fetch_next_segment(MediaType::Video, &default_metrics(), &mut buf)
-        .await
-        .unwrap();
-
-    let ev = events.try_recv().expect("expected v0 emsg event");
+    let events = collect_player_events(emsg_bytes).await;
+    let ev = events
+        .iter()
+        .find_map(|event| match event {
+            PlayerEvent::InbandDash(ev) => Some(ev),
+            _ => None,
+        })
+        .expect("expected v0 emsg event");
     assert_eq!(ev.scheme_id_uri, "urn:example:v0");
     assert_eq!(ev.value, "myval");
     assert!(
@@ -1260,53 +1285,43 @@ async fn emsg_v0_fields_preserved_through_broadcast() {
     assert_eq!(&ev.message_data[..], b"v0data");
 }
 
-/// When there are no subscribers, `fetch_next_segment` must not panic or
-/// return an error — discarding the event silently is correct behaviour.
+/// When there are no Player event handlers, playback still succeeds.
 #[tokio::test]
-async fn emsg_no_subscriber_does_not_panic() {
-    let mut buf = NullBuffer;
+async fn emsg_no_handler_does_not_panic() {
     let emsg_bytes = make_emsg_v1("urn:x", "", 1000, 0, 1000, 1, b"");
 
     let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
     let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
+    let mut player = Player::from_url(&url, fetcher, NullBuffer, OneIterationDriver::default())
+        .await
+        .unwrap();
 
-    // Deliberately do NOT call subscribe_events().
-    let result = session
-        .fetch_next_segment(MediaType::Video, &default_metrics(), &mut buf)
-        .await;
-    assert!(
-        result.is_ok(),
-        "fetch_next_segment must succeed with no emsg subscribers"
-    );
+    let result = player.run().await;
+    assert!(result.is_ok(), "Player::run must succeed with no handlers");
 }
 
 /// Multiple `emsg` boxes in a single segment each produce an independent event.
 #[tokio::test]
 async fn emsg_two_events_in_one_segment() {
-    let mut buf = NullBuffer;
     let mut emsg_bytes = make_emsg_v1("urn:a", "", 1000, 1000, 500, 1, b"first");
     emsg_bytes.extend_from_slice(&make_emsg_v1("urn:b", "", 1000, 2000, 500, 2, b"second"));
 
-    let fetcher = EmsgMockFetcher::new(STATIC_MPD, emsg_bytes);
-    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
-    let mut session = DashSession::from_url(&url, fetcher).await.unwrap();
+    let events = collect_player_events(emsg_bytes).await;
+    let inband_events: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            PlayerEvent::InbandDash(ev) => Some(ev),
+            _ => None,
+        })
+        .collect();
 
-    let mut events = session.subscribe_events();
-
-    session
-        .fetch_next_segment(MediaType::Video, &default_metrics(), &mut buf)
-        .await
-        .unwrap();
-
-    let ev1 = events.try_recv().expect("expected first emsg event");
-    let ev2 = events.try_recv().expect("expected second emsg event");
+    let ev1 = inband_events.first().expect("expected first emsg event");
+    let ev2 = inband_events.get(1).expect("expected second emsg event");
     assert_eq!(ev1.scheme_id_uri, "urn:a");
     assert_eq!(&ev1.message_data[..], b"first");
     assert_eq!(ev2.scheme_id_uri, "urn:b");
     assert_eq!(&ev2.message_data[..], b"second");
-    // No third event.
-    assert!(events.try_recv().is_err());
+    assert_eq!(inband_events.len(), 2);
 }
 
 // ── current_metrics() throughput tests ───────────────────────────────────────

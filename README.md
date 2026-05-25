@@ -452,30 +452,35 @@ fn on_iteration(&mut self, s: &IterationSummary<'_>) {
 
 ---
 
-## Subscribing to events
+## Player events
 
 ```rust
-use dash_rs::session::DashEvent;
+use dash_rs::PlayerEvent;
 
-let mut events = session.subscribe_events();
-tokio::spawn(async move {
-    while let Ok(event) = events.recv().await {
-        match event {
-            DashEvent::RepresentationSwitch { media_type, from_index, to_index, .. } => {
-                println!("{media_type:?} switched {from_index} → {to_index}");
-            }
-            DashEvent::InbandEvent { scheme_id_uri, value, data, .. } => {
-                // DASH emsg events (e.g. splice cues, ID3 metadata).
-                println!("emsg {scheme_id_uri} {value:?}: {} bytes", data.len());
-            }
-            _ => {}
+let mut player = Player::from_url(&url, fetcher, buffer, driver).await?;
+player.on(|event| {
+    match event {
+        PlayerEvent::InbandDash(ev) => {
+            // DASH emsg events (e.g. splice cues, ID3 metadata).
+            println!("emsg {} {:?}: {} bytes", ev.scheme_id_uri, ev.value, ev.message_data.len());
         }
+        PlayerEvent::PlaybackStateChanged { from, to } => {
+            println!("playback state {from:?} -> {to:?}");
+        }
+        PlayerEvent::QualityChange { media_type, old_index, new_index, .. } => {
+            println!("{media_type:?} switched {old_index} -> {new_index}");
+        }
+        _ => {}
     }
 });
+
+player.run().await?;
 ```
 
-`subscribe_events` returns a `broadcast::Receiver`; events are dispatched by
-`fetch_next_segment` from within the fetch loop.
+Player events are emitted by wrappers around the configured `MediaBuffer` and
+`PlaybackDriver`, so segment fetching stays independent of application event
+delivery. The `events` feature has no external dependency and works in
+`no_std` builds that provide `alloc`.
 
 ---
 

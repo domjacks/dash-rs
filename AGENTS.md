@@ -39,7 +39,7 @@ wasm-pack build examples/wasm_player --target web --out-dir examples/wasm_player
 #   python3 -m http.server 8080
 # and open http://localhost:8080
 
-# no_std build (no std or events features)
+# no_std build (no std; events remain alloc-only if enabled explicitly)
 cargo check --no-default-features
 
 # Lint
@@ -739,7 +739,8 @@ Do not add inline comments to the right of code.
 | `SegmentFetcher` trait | `src/fetch/mod.rs` |
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
- | Session coordinator (`DashSession`, `TrackState`, `MediaType`, `DashEvent`) | `src/session/mod.rs` |
+ | Session coordinator (`DashSession`, `TrackState`, `MediaType`) | `src/session/mod.rs` |
+| Player-owned event API (`PlayerEvent`, `DashEvent`, `Player::on`) | `src/player.rs` |
  | `PlaybackDriver` trait + `IterationSummary` (`DashSession::run`) | `src/session/driver.rs` |
  | `PlaybackState` enum (`Playing`, `Paused`, `Buffering`) | `src/session/driver.rs` |
  | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
@@ -798,7 +799,7 @@ Do not add inline comments to the right of code.
 | `MediaPlayer.js` event loop | `session::driver::PlaybackDriver` + `DashSession::run()` |
 | `StreamController.js` / `Stream.js` | `session::DashSession::try_advance_period` (called automatically inside `fetch_next_segment`) |
 | `ScheduleController.js` | `session::DashSession::estimated_buffer_level_ms` + `notify_playing` + `buffer_target_ms` (all managed internally by `DashSession::run()`) |
-| `EventController.js` | `session::DashEvent` + `DashSession::subscribe_events` (broadcast channel; events dispatched by `fetch_next_segment`) |
+| `EventController.js` | `PlayerEvent` + `Player::on` (events emitted by Player media-buffer / driver wrappers) |
 | `ServiceDescriptionController.js` | `DashSession::target_latency_ms()` + `playback_rate_range()` |
 | `AbrController.setMaxAllowedBitrateFor()` | `DashSession::set_max_bitrate(media_type, bps)` / `clear_max_bitrate` / `max_bitrate` |
 | `BlacklistController.js` | `DashSession::set_cdn_blacklist_cooldown_ms` / `cdn_blacklist_cooldown_ms`; blacklist logic in `src/session/blacklist.rs` |

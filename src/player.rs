@@ -49,6 +49,16 @@
 
 use alloc::sync::Arc;
 
+#[cfg(feature = "events")]
+use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
+#[cfg(feature = "events")]
+use core::{cell::Cell, cell::RefCell};
+
+#[cfg(feature = "events")]
+use async_trait::async_trait;
+#[cfg(feature = "events")]
+use bytes::Bytes;
+
 use crate::{
     abr::rule::RepresentationInfo,
     clock::Clock,
@@ -60,6 +70,98 @@ use crate::{
     Url,
 };
 
+#[cfg(feature = "events")]
+use crate::{
+    abr::AbrDecisionReason,
+    media_buffer::TimeRange,
+    session::{driver::PlaybackState, GapSeekTarget, MediaType},
+};
+
+#[cfg(feature = "events")]
+use crate::mp4::parse_all_emsg;
+
+#[cfg(feature = "events")]
+type EventHandler = Box<dyn FnMut(&PlayerEvent)>;
+#[cfg(feature = "events")]
+type EventHandlers = Rc<RefCell<Vec<EventHandler>>>;
+
+// ── PlayerEvent ───────────────────────────────────────────────────────────────
+
+/// An in-band DASH event extracted from a `DASHEventMessageBox` (`emsg`) in a
+/// media segment appended through [`Player`].
+///
+/// # Presentation time semantics
+///
+/// | `emsg` version | `presentation_time_s` meaning |
+/// |---|---|
+/// | 0 | Seconds relative to the segment's earliest presentation time.  Add `sidx.start_s` (if available) to get an absolute timeline position. |
+/// | 1 | Absolute seconds from the start of the media presentation timeline. |
+#[cfg(feature = "events")]
+#[derive(Debug, Clone, PartialEq)]
+pub struct DashEvent {
+    /// Which media track's segment contained this event.
+    pub media_type: MediaType,
+    /// URI identifying the event scheme (e.g. `"urn:scte:scte35:2014:xml+bin"`).
+    pub scheme_id_uri: String,
+    /// Optional value qualifying the scheme (empty string when absent).
+    pub value: String,
+    /// Presentation time in seconds.
+    pub presentation_time_s: f64,
+    /// Duration of the event in seconds.
+    pub duration_s: f64,
+    /// Unique identifier for this event within its scheme.
+    pub id: u32,
+    /// Raw event message payload bytes.
+    pub message_data: Bytes,
+}
+
+/// Events emitted by [`Player`] while it runs.
+#[cfg(feature = "events")]
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlayerEvent {
+    /// In-band DASH metadata from an `emsg` box in an appended media segment.
+    InbandDash(DashEvent),
+    /// The renderer playback state changed between observed run-loop samples.
+    PlaybackStateChanged {
+        /// Previous observed playback state.
+        from: PlaybackState,
+        /// New observed playback state.
+        to: PlaybackState,
+    },
+    /// The ABR controller switched to a different representation.
+    QualityChange {
+        /// Track whose quality changed.
+        media_type: MediaType,
+        /// Previous representation index.
+        old_index: usize,
+        /// Newly selected representation index.
+        new_index: usize,
+        /// Why the ABR controller selected the new index.
+        reason: AbrDecisionReason,
+    },
+    /// The gap controller requested a renderer seek.
+    GapSeek(GapSeekTarget),
+    /// The session startup sequence completed.
+    SessionStarted {
+        /// Initial presentation position in seconds.
+        start_s: f64,
+    },
+    /// The run loop ended successfully and signalled end-of-stream to the buffer.
+    EndOfStream,
+}
+
+#[cfg(feature = "events")]
+fn emit_event(handlers: &EventHandlers, event: PlayerEvent) {
+    for handler in handlers.borrow_mut().iter_mut() {
+        handler(&event);
+    }
+}
+
+#[cfg(feature = "events")]
+fn new_event_handlers() -> EventHandlers {
+    Rc::new(RefCell::new(Vec::new()))
+}
+
 // ── Player ────────────────────────────────────────────────────────────────────
 
 /// A single owned value that combines a [`DashSession`], a [`MediaBuffer`],
@@ -70,6 +172,8 @@ pub struct Player<F: SegmentFetcher, S: MediaBuffer, D> {
     session: DashSession<F>,
     buf: S,
     driver: D,
+    #[cfg(feature = "events")]
+    event_handlers: EventHandlers,
 }
 
 impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
@@ -88,6 +192,8 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
+            #[cfg(feature = "events")]
+            event_handlers: new_event_handlers(),
         })
     }
 
@@ -107,6 +213,8 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
+            #[cfg(feature = "events")]
+            event_handlers: new_event_handlers(),
         })
     }
 
@@ -132,6 +240,8 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
+            #[cfg(feature = "events")]
+            event_handlers: new_event_handlers(),
         })
     }
 
@@ -153,6 +263,8 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             session,
             buf,
             driver,
+            #[cfg(feature = "events")]
+            event_handlers: new_event_handlers(),
         })
     }
 
@@ -165,8 +277,35 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
     /// (`open` → `set_live_mode` → `add_track` → init segments → PTS remap →
     /// `on_session_started` → `notify_playing`) is performed inside `run()`
     /// before the fetch loop begins.
+    #[cfg(not(feature = "events"))]
     pub async fn run(&mut self) -> Result<(), DashError> {
         self.session.run(&mut self.buf, &mut self.driver).await
+    }
+
+    /// Run the DASH fetch loop and emit [`PlayerEvent`] callbacks registered
+    /// with [`Self::on`].
+    #[cfg(feature = "events")]
+    pub async fn run(&mut self) -> Result<(), DashError> {
+        if self.event_handlers.borrow().is_empty() {
+            return self.session.run(&mut self.buf, &mut self.driver).await;
+        }
+
+        let handlers = Rc::clone(&self.event_handlers);
+        let mut buf = EventMediaBuffer::new(&mut self.buf, Rc::clone(&handlers));
+        let mut driver = EventPlaybackDriver::new(&mut self.driver, Rc::clone(&handlers));
+        let result = self.session.run(&mut buf, &mut driver).await;
+        if result.is_ok() {
+            emit_event(&handlers, PlayerEvent::EndOfStream);
+        }
+        result
+    }
+
+    /// Register a callback for all [`PlayerEvent`] values emitted during
+    /// [`run`][Self::run].
+    #[cfg(feature = "events")]
+    pub fn on(&mut self, handler: impl FnMut(&PlayerEvent) + 'static) -> &mut Self {
+        self.event_handlers.borrow_mut().push(Box::new(handler));
+        self
     }
 
     // ── Accessors ─────────────────────────────────────────────────────────────
@@ -257,5 +396,206 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
     /// Useful when ownership of all three halves is needed after playback ends.
     pub fn into_parts(self) -> (DashSession<F>, S, D) {
         (self.session, self.buf, self.driver)
+    }
+}
+
+// ── Event Wrappers ────────────────────────────────────────────────────────────
+
+#[cfg(feature = "events")]
+struct EventMediaBuffer<'a, S> {
+    inner: &'a mut S,
+    handlers: EventHandlers,
+}
+
+#[cfg(feature = "events")]
+impl<'a, S> EventMediaBuffer<'a, S> {
+    fn new(inner: &'a mut S, handlers: EventHandlers) -> Self {
+        Self { inner, handlers }
+    }
+}
+
+#[cfg(feature = "events")]
+#[async_trait(?Send)]
+impl<S: MediaBuffer> MediaBuffer for EventMediaBuffer<'_, S> {
+    async fn open(&mut self) -> Result<(), DashError> {
+        self.inner.open().await
+    }
+
+    fn set_duration(&mut self, secs: f64) {
+        self.inner.set_duration(secs);
+    }
+
+    fn set_live_mode(&mut self, live: bool) {
+        self.inner.set_live_mode(live);
+    }
+
+    async fn end_of_stream(&mut self) -> Result<(), DashError> {
+        self.inner.end_of_stream().await
+    }
+
+    fn add_track(&mut self, mt: MediaType, mime_type: &str) -> bool {
+        self.inner.add_track(mt, mime_type)
+    }
+
+    async fn change_type(&mut self, mt: MediaType, mime_type: &str) -> Result<(), DashError> {
+        self.inner.change_type(mt, mime_type).await
+    }
+
+    fn set_timestamp_offset(&mut self, mt: MediaType, offset_s: f64) {
+        self.inner.set_timestamp_offset(mt, offset_s);
+    }
+
+    fn set_append_window(&mut self, mt: MediaType, start: f64, end: f64) {
+        self.inner.set_append_window(mt, start, end);
+    }
+
+    async fn append(&mut self, mt: MediaType, data: Bytes, is_init: bool) -> Result<(), DashError> {
+        if !is_init {
+            for emsg in parse_all_emsg(&data) {
+                emit_event(
+                    &self.handlers,
+                    PlayerEvent::InbandDash(DashEvent {
+                        media_type: mt,
+                        scheme_id_uri: emsg.scheme_id_uri,
+                        value: emsg.value,
+                        presentation_time_s: emsg.presentation_time_s,
+                        duration_s: emsg.duration_s,
+                        id: emsg.id,
+                        message_data: emsg.message_data,
+                    }),
+                );
+            }
+        }
+        self.inner.append(mt, data, is_init).await
+    }
+
+    async fn remove_range(&mut self, mt: MediaType, start: f64, end: f64) -> Result<(), DashError> {
+        self.inner.remove_range(mt, start, end).await
+    }
+
+    fn buffered(&self, mt: MediaType) -> Vec<TimeRange> {
+        self.inner.buffered(mt)
+    }
+
+    fn has_buffer_tracking(&self) -> bool {
+        self.inner.has_buffer_tracking()
+    }
+}
+
+#[cfg(feature = "events")]
+struct EventPlaybackDriver<'a, D> {
+    inner: &'a mut D,
+    handlers: EventHandlers,
+    last_playback_state: Cell<PlaybackState>,
+}
+
+#[cfg(feature = "events")]
+impl<'a, D: PlaybackDriver> EventPlaybackDriver<'a, D> {
+    fn new(inner: &'a mut D, handlers: EventHandlers) -> Self {
+        let last_playback_state = Cell::new(inner.playback_state());
+        Self {
+            inner,
+            handlers,
+            last_playback_state,
+        }
+    }
+}
+
+#[cfg(feature = "events")]
+#[async_trait(?Send)]
+impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
+    fn position_s(&self) -> f64 {
+        self.inner.position_s()
+    }
+
+    fn playback_state(&self) -> PlaybackState {
+        let state = self.inner.playback_state();
+        let previous = self.last_playback_state.get();
+        if previous != state {
+            self.last_playback_state.set(state);
+            emit_event(
+                &self.handlers,
+                PlayerEvent::PlaybackStateChanged {
+                    from: previous,
+                    to: state,
+                },
+            );
+        }
+        state
+    }
+
+    async fn on_gap_seek(&mut self, target: GapSeekTarget) {
+        self.inner.on_gap_seek(target.clone()).await;
+        emit_event(&self.handlers, PlayerEvent::GapSeek(target));
+    }
+
+    fn throughput_override_bps(&self) -> Option<f64> {
+        self.inner.throughput_override_bps()
+    }
+
+    fn audio_gate_target_ms(&self, video_buffer_ms: f64, default_ms: f64) -> f64 {
+        self.inner.audio_gate_target_ms(video_buffer_ms, default_ms)
+    }
+
+    fn enable_pruning(&self) -> bool {
+        self.inner.enable_pruning()
+    }
+
+    fn should_continue(&self) -> bool {
+        self.inner.should_continue()
+    }
+
+    fn pending_seek_s(&mut self) -> Option<f64> {
+        self.inner.pending_seek_s()
+    }
+
+    fn has_pending_seek(&self) -> bool {
+        self.inner.has_pending_seek()
+    }
+
+    fn on_iteration_start(
+        &mut self,
+        session_position_s: f64,
+        video_buffer_level_ms: f64,
+        audio_buffer_level_ms: f64,
+    ) {
+        self.inner.on_iteration_start(
+            session_position_s,
+            video_buffer_level_ms,
+            audio_buffer_level_ms,
+        );
+    }
+
+    fn on_quality_change(
+        &mut self,
+        media_type: MediaType,
+        old_index: usize,
+        new_index: usize,
+        reason: AbrDecisionReason,
+    ) {
+        self.inner
+            .on_quality_change(media_type, old_index, new_index, reason.clone());
+        emit_event(
+            &self.handlers,
+            PlayerEvent::QualityChange {
+                media_type,
+                old_index,
+                new_index,
+                reason,
+            },
+        );
+    }
+
+    fn on_iteration(&mut self, summary: &crate::session::driver::IterationSummary<'_>) {
+        self.inner.on_iteration(summary);
+    }
+
+    fn wants_pts_remap(&self) -> bool {
+        self.inner.wants_pts_remap()
+    }
+
+    async fn on_session_started(&mut self, start_s: f64) {
+        self.inner.on_session_started(start_s).await;
+        emit_event(&self.handlers, PlayerEvent::SessionStarted { start_s });
     }
 }

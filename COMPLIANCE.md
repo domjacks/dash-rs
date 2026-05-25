@@ -45,7 +45,7 @@ All items below are implemented and covered by tests.
 | 23 | Multiple audio `AdaptationSet`s: highest-bandwidth tier wins | DASH-IF IOP §4.3 |
 | 24 | CDN blacklisting with configurable cooldown; all-blacklisted override | DASH-IF IOP §6.7 |
 | 25 | Gap / stall detection and jump via `GapController` | — |
-| 26 | In-band DASH `emsg` events broadcast via `subscribe_events` | §5.10.3 |
+| 26 | In-band DASH `emsg` events emitted as `PlayerEvent::InbandDash` from the Player media-buffer wrapper | §5.10.3 |
 | 27 | `ServiceDescription` target latency and playback rate range parsed | §5.14 |
 | 28 | Live-edge snapping from `availabilityStartTime` + `suggestedPresentationDelay` | §5.3.1.2 |
 | 29 | BaseURL multi-level resolution (MPD → Period → AdaptationSet → Representation) | §5.10.1.3 |

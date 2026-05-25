@@ -63,9 +63,9 @@ Omitting `?Send` produces "associated type not found" — one of Rust's most cry
 A re-exported proc-macro alias `#[dash_rs::async_impl]` that bakes in `?Send` would eliminate
 the entire class of confusion and remove the lengthy warning from every doc comment.
 
-**2. `subscribe_events` / `DashEvent` has no example**  
-It is a completed, tested feature but entirely invisible to new consumers because no example
-demonstrates it. A `session.subscribe_events()` call with a printed handler in `http_fetch.rs`
+**2. `Player::on` examples are limited**  
+The Player-owned event API is documented in README, but no runnable example demonstrates
+handling `PlayerEvent::InbandDash` or playback-state changes. A printed handler in `http_fetch.rs`
 or `basic.rs` would make it discoverable.
 
 **3. WASM `lib.rs` bridge cloning is non-obvious**  
