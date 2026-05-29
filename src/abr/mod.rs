@@ -110,12 +110,6 @@ impl AbrController {
             }
         }
 
-        tracing::debug!(
-            selected_index = max_index,
-            reason = ?reason,
-            "ABR controller decision"
-        );
-
         QualityDecision::new(max_index, reason)
     }
 

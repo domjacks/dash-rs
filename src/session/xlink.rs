@@ -75,31 +75,13 @@ async fn resolve_period_xlinks<F: SegmentFetcher>(
             XLinkAction::Skip => {
                 out.push(period);
             }
-            XLinkAction::Remove => {
-                tracing::debug!(
-                    href = period.href.as_deref().unwrap_or(""),
-                    "xlink: resolve-to-zero — removing Period"
-                );
-            }
+            XLinkAction::Remove => {}
             XLinkAction::Fetch(url) => {
-                tracing::debug!(%url, "xlink: fetching remote Period(s)");
                 match fetch_text(fetcher, &url).await {
-                    Err(e) => {
-                        tracing::warn!(%url, error = %e, "xlink: Period fetch failed — skipping");
-                    }
+                    Err(_) => {}
                     Ok(xml) => match parse_periods(&xml) {
-                        None => {
-                            tracing::warn!(
-                                %url,
-                                "xlink: could not parse remote resource as Period(s) — skipping"
-                            );
-                        }
+                        None => {}
                         Some(remote_periods) => {
-                            tracing::info!(
-                                %url,
-                                count = remote_periods.len(),
-                                "xlink: inlined remote Period(s)"
-                            );
                             for mut rp in remote_periods {
                                 // Merge placeholder attributes into the remote
                                 // period where they are absent (DASH-IF XLink spec §4).
@@ -138,31 +120,13 @@ async fn resolve_adaptation_xlinks<F: SegmentFetcher>(
             XLinkAction::Skip => {
                 out.push(adaptation);
             }
-            XLinkAction::Remove => {
-                tracing::debug!(
-                    href = adaptation.href.as_deref().unwrap_or(""),
-                    "xlink: resolve-to-zero — removing AdaptationSet"
-                );
-            }
+            XLinkAction::Remove => {}
             XLinkAction::Fetch(url) => {
-                tracing::debug!(%url, "xlink: fetching remote AdaptationSet(s)");
                 match fetch_text(fetcher, &url).await {
-                    Err(e) => {
-                        tracing::warn!(%url, error = %e, "xlink: AdaptationSet fetch failed — skipping");
-                    }
+                    Err(_) => {}
                     Ok(xml) => match parse_adaptation_sets(&xml) {
-                        None => {
-                            tracing::warn!(
-                                %url,
-                                "xlink: could not parse remote resource as AdaptationSet(s) — skipping"
-                            );
-                        }
+                        None => {}
                         Some(remote_adaptations) => {
-                            tracing::info!(
-                                %url,
-                                count = remote_adaptations.len(),
-                                "xlink: inlined remote AdaptationSet(s)"
-                            );
                             for mut ra in remote_adaptations {
                                 // Propagate inherited attributes from the placeholder.
                                 if ra.id.is_none() {
@@ -229,13 +193,7 @@ fn check_xlink(href: &Option<String>, actuate: &Option<String>, base_url: &Url) 
 
     match url {
         Some(u) => XLinkAction::Fetch(u),
-        None => {
-            tracing::warn!(
-                href = href_str,
-                "xlink: could not resolve href to a URL — skipping"
-            );
-            XLinkAction::Skip
-        }
+        None => XLinkAction::Skip,
     }
 }
 

@@ -76,11 +76,6 @@ impl CdnBlacklist {
     pub(super) fn record_failure(&mut self, key: &str) {
         let expiry = crate::time::mono_ms() + self.cooldown.as_secs_f64() * 1_000.0;
         self.entries.insert(key.to_owned(), expiry);
-        tracing::debug!(
-            key,
-            cooldown_s = self.cooldown.as_secs_f64(),
-            "CDN blacklisted"
-        );
     }
 
     /// Remove entries whose cooldown has already elapsed.

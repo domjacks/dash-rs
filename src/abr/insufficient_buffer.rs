@@ -49,12 +49,6 @@ impl AbrRule for InsufficientBufferRule {
         }
 
         if metrics.buffer_level_ms <= self.critical_threshold_ms {
-            tracing::warn!(
-                rule = self.name(),
-                buffer_level_ms = metrics.buffer_level_ms,
-                threshold_ms = self.critical_threshold_ms,
-                "buffer critically low — forcing lowest quality"
-            );
             return Some(0);
         }
 

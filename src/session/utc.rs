@@ -60,60 +60,18 @@ pub(crate) async fn resolve_utc_timing<F: SegmentFetcher>(
                 if let Some(value) = &entry.value {
                     if let Some(server_s) = parse_xs_datetime(value) {
                         let offset = server_s - client_now_s;
-                        tracing::info!(
-                            scheme = SCHEME_DIRECT,
-                            offset_s = offset,
-                            "UTCTiming: clock offset resolved"
-                        );
                         return offset;
                     }
-                    tracing::warn!(
-                        scheme = SCHEME_DIRECT,
-                        value = %value,
-                        "UTCTiming: failed to parse direct value — trying next element"
-                    );
-                } else {
-                    tracing::warn!(
-                        scheme = SCHEME_DIRECT,
-                        "UTCTiming: direct element has no @value — trying next element"
-                    );
                 }
             }
 
             SCHEME_HTTP_XSDATE | SCHEME_HTTP_ISO => {
                 if let Some(url_str) = &entry.value {
-                    match Url::parse(url_str) {
-                        Ok(url) => {
-                            if let Some(offset) = query_http_utc(&url, fetcher, client_now_s).await
-                            {
-                                tracing::info!(
-                                    scheme,
-                                    url = %url_str,
-                                    offset_s = offset,
-                                    "UTCTiming: clock offset resolved"
-                                );
-                                return offset;
-                            }
-                            tracing::warn!(
-                                scheme,
-                                url = %url_str,
-                                "UTCTiming: HTTP query failed — trying next element"
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                scheme,
-                                url = %url_str,
-                                error = %e,
-                                "UTCTiming: invalid URL — trying next element"
-                            );
+                    if let Ok(url) = Url::parse(url_str) {
+                        if let Some(offset) = query_http_utc(&url, fetcher, client_now_s).await {
+                            return offset;
                         }
                     }
-                } else {
-                    tracing::warn!(
-                        scheme,
-                        "UTCTiming: HTTP element has no @value URL — trying next element"
-                    );
                 }
             }
 
@@ -124,81 +82,28 @@ pub(crate) async fn resolve_utc_timing<F: SegmentFetcher>(
                 // by the concrete fetcher; the default returns `Ok(None)` (not
                 // supported), causing this element to be skipped.
                 if let Some(url_str) = &entry.value {
-                    match Url::parse(url_str) {
-                        Ok(url) => {
-                            match fetcher.head_date(&url).await {
-                                Ok(Some(date_str)) => {
-                                    // The Date: header is RFC 2822 / HTTP-date format
-                                    // (e.g. "Sat, 09 May 2026 12:00:00 GMT").
-                                    // Our parser also accepts XS dateTime strings — try
-                                    // both formats by attempting the parse directly.
-                                    if let Some(server_s) = parse_http_date(&date_str) {
-                                        let offset = server_s - client_now_s;
-                                        tracing::info!(
-                                            scheme = SCHEME_HTTP_HEAD,
-                                            url = %url_str,
-                                            offset_s = offset,
-                                            "UTCTiming: clock offset resolved via http-head"
-                                        );
-                                        return offset;
-                                    }
-                                    tracing::warn!(
-                                        scheme = SCHEME_HTTP_HEAD,
-                                        url = %url_str,
-                                        date_header = %date_str,
-                                        "UTCTiming: http-head Date header could not be parsed \
-                                         — trying next element"
-                                    );
-                                }
-                                Ok(None) => {
-                                    tracing::warn!(
-                                        scheme = SCHEME_HTTP_HEAD,
-                                        url = %url_str,
-                                        "UTCTiming: http-head not supported by this fetcher \
-                                         (head_date returned None) — trying next element"
-                                    );
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        scheme = SCHEME_HTTP_HEAD,
-                                        url = %url_str,
-                                        error = %e,
-                                        "UTCTiming: http-head request failed — trying next element"
-                                    );
+                    if let Ok(url) = Url::parse(url_str) {
+                        match fetcher.head_date(&url).await {
+                            Ok(Some(date_str)) => {
+                                // The Date: header is RFC 2822 / HTTP-date format
+                                // (e.g. "Sat, 09 May 2026 12:00:00 GMT").
+                                // Our parser also accepts XS dateTime strings — try
+                                // both formats by attempting the parse directly.
+                                if let Some(server_s) = parse_http_date(&date_str) {
+                                    let offset = server_s - client_now_s;
+                                    return offset;
                                 }
                             }
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                scheme = SCHEME_HTTP_HEAD,
-                                url = %url_str,
-                                error = %e,
-                                "UTCTiming: invalid URL for http-head — trying next element"
-                            );
+                            Ok(None) => {}
+                            Err(_) => {}
                         }
                     }
-                } else {
-                    tracing::warn!(
-                        scheme = SCHEME_HTTP_HEAD,
-                        "UTCTiming: http-head element has no @value URL — trying next element"
-                    );
                 }
             }
 
-            SCHEME_NTP => {
-                tracing::warn!(
-                    scheme = SCHEME_NTP,
-                    "UTCTiming: NTP scheme requires raw UDP and is not yet \
-                     supported — trying next element"
-                );
-            }
+            SCHEME_NTP => {}
 
-            other => {
-                tracing::warn!(
-                    scheme = other,
-                    "UTCTiming: unrecognised scheme — trying next element"
-                );
-            }
+            _ => {}
         }
     }
 

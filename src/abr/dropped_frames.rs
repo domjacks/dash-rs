@@ -50,11 +50,6 @@ impl AbrRule for DroppedFramesRule {
 
         let drop_ratio = dropped / total;
         if drop_ratio > DROP_THRESHOLD {
-            tracing::debug!(
-                drop_ratio,
-                threshold = DROP_THRESHOLD,
-                "DroppedFramesRule — forcing lowest quality"
-            );
             Some(0)
         } else {
             None

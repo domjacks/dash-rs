@@ -5,34 +5,8 @@
 //!
 
 #![cfg_attr(not(feature = "std"), no_std)]
-#![allow(unused_variables)]
 
 extern crate alloc;
-extern crate self as tracing;
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! debug {
-    ($($tt:tt)*) => {{}};
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! error {
-    ($($tt:tt)*) => {{}};
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! info {
-    ($($tt:tt)*) => {{}};
-}
-
-#[doc(hidden)]
-#[macro_export]
-macro_rules! warn {
-    ($($tt:tt)*) => {{}};
-}
 
 pub mod abr;
 pub mod clock;

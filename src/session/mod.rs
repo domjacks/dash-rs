@@ -64,7 +64,7 @@ use crate::{
     fetch::{FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     manifest::ManifestLoader,
     media_buffer::MediaBuffer,
-    mp4::{parse_prft, parse_sidx, parse_sidx_entries, ProducerReferenceTime, SidxEntry},
+    mp4::{parse_prft, parse_sidx_entries, ProducerReferenceTime, SidxEntry},
 };
 
 use self::{
@@ -222,16 +222,6 @@ fn compute_track_reinit(
         .as_ref()
         .and_then(|t| t.availabilityTimeOffset)
         .unwrap_or(0.0);
-
-    // Warn when @availabilityTimeComplete=false is present — chunked segment
-    // delivery is not yet supported (P1-4).
-    if tmpl.as_ref().and_then(|t| t.availabilityTimeComplete) == Some(false) {
-        tracing::warn!(
-            "SegmentTemplate@availabilityTimeComplete=false detected; \
-             chunked (partial) segment delivery is not yet supported — \
-             fetching will wait for complete segments (P1-4)"
-        );
-    }
 
     // DASH spec §5.3.9.6: timestampOffset = Period@start − PTO/timescale.
     // Period@start is the presentation-timeline start of this period (0 for the
@@ -883,12 +873,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                         spd_s,
                         track.availability_time_offset_s,
                     );
-                    tracing::info!(
-                        media_type = "video",
-                        segment_number = seg,
-                        utc_offset_s = utc_clock_offset_s,
-                        "live stream: snapped to live-edge segment"
-                    );
                     track.segment_number = seg;
                     track.initial_segment_number = seg;
                 }
@@ -900,12 +884,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                         track.start_number,
                         spd_s,
                         track.availability_time_offset_s,
-                    );
-                    tracing::info!(
-                        media_type = "audio",
-                        segment_number = seg,
-                        utc_offset_s = utc_clock_offset_s,
-                        "live stream: snapped to live-edge segment"
                     );
                     track.segment_number = seg;
                     track.initial_segment_number = seg;
@@ -940,26 +918,9 @@ impl<F: SegmentFetcher> DashSession<F> {
                                 .initial_segment_number
                                 .saturating_sub(track.start_number)
                                 * seg_dur_ticks;
-                            match snap_to_timeline_grid(&tl.segments, target_ticks) {
-                                Some(snapped) => {
-                                    tracing::info!(
-                                        media_type = "video",
-                                        snapped_t = snapped,
-                                        target_ticks,
-                                        "live-edge snap: next_segment_time set for \
-                                         SegmentTimeline track"
-                                    );
-                                    track.next_segment_time = Some(snapped);
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        media_type = "video",
-                                        target_ticks,
-                                        "live-edge snap: could not snap next_segment_time \
-                                         to SegmentTimeline grid — starting from beginning \
-                                         of live window"
-                                    );
-                                }
+                            if let Some(snapped) = snap_to_timeline_grid(&tl.segments, target_ticks)
+                            {
+                                track.next_segment_time = Some(snapped);
                             }
                         }
                     }
@@ -979,26 +940,9 @@ impl<F: SegmentFetcher> DashSession<F> {
                                 .initial_segment_number
                                 .saturating_sub(track.start_number)
                                 * seg_dur_ticks;
-                            match snap_to_timeline_grid(&tl.segments, target_ticks) {
-                                Some(snapped) => {
-                                    tracing::info!(
-                                        media_type = "audio",
-                                        snapped_t = snapped,
-                                        target_ticks,
-                                        "live-edge snap: next_segment_time set for \
-                                         SegmentTimeline track"
-                                    );
-                                    track.next_segment_time = Some(snapped);
-                                }
-                                None => {
-                                    tracing::warn!(
-                                        media_type = "audio",
-                                        target_ticks,
-                                        "live-edge snap: could not snap next_segment_time \
-                                         to SegmentTimeline grid — starting from beginning \
-                                         of live window"
-                                    );
-                                }
+                            if let Some(snapped) = snap_to_timeline_grid(&tl.segments, target_ticks)
+                            {
+                                track.next_segment_time = Some(snapped);
                             }
                         }
                     }
@@ -1040,13 +984,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             .iter()
             .filter_map(|loc| base_url.join(&loc.url).ok())
             .collect();
-        if !location_urls.is_empty() {
-            tracing::debug!(
-                count = location_urls.len(),
-                "manifest contains Location elements"
-            );
-        }
-
         Ok(Self {
             mpd,
             base_url,
@@ -1606,10 +1543,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 buf.set_timestamp_offset(MediaType::Video, ts_off);
                 buf.set_append_window(MediaType::Video, aw.0, aw.1);
             } else {
-                tracing::warn!(
-                    mime = %mime,
-                    "video MIME type not supported — video track skipped (audio-only fallback)"
-                );
                 self.video_track = None;
             }
         }
@@ -1621,10 +1554,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 buf.set_timestamp_offset(MediaType::Audio, ts_off);
                 buf.set_append_window(MediaType::Audio, aw.0, aw.1);
             } else {
-                tracing::warn!(
-                    mime = %mime,
-                    "audio MIME type not supported — audio track skipped"
-                );
                 self.audio_track = None;
             }
         }
@@ -1688,7 +1617,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             // Check before any position/buffer reads so the new cursor is in
             // effect for the entire iteration (gap controller, ABR, fetches).
             if let Some(pos) = drv.pending_seek_s() {
-                tracing::info!(pos, "run: user-initiated seek");
                 self.seek_to(pos);
                 // Unconditionally reset the wall-clock so estimated_buffer_level_ms
                 // starts from a clean zero baseline at the new position,
@@ -1721,12 +1649,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let pos = drv.position_s();
                 let buffered = buf.buffered(gate);
                 if let Some(target) = self.tick_gap(pos, &buffered, drv.playback_state()) {
-                    tracing::info!(
-                        pos,
-                        seek_to = target.position_s,
-                        reason  = ?target.reason,
-                        "gap controller: seeking"
-                    );
                     // seek_to returns the snapped segment-boundary position;
                     // forward that to the driver so the renderer targets the
                     // exact position the session fetch cursor is now at.
@@ -1760,7 +1682,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 }
                 match self.fetch_next_segment(MediaType::Video, &m, buf).await {
                     Ok(FetchOutcome::Fetched(d)) => {
-                        tracing::debug!(index = d.index, reason = ?d.reason, "video segment fetched");
                         if let Some(prev) = prev_video_index {
                             if prev != d.index {
                                 drv.on_quality_change(
@@ -1775,7 +1696,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                         video_decision = Some(d);
                     }
                     Ok(FetchOutcome::EndOfStream) => {
-                        tracing::info!("video: end of stream");
                         video_done = true;
                     }
                     Err(e) => return Err(e),
@@ -1793,11 +1713,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                     if drv.has_pending_seek() {
                         break;
                     }
-                    tracing::debug!(
-                        buf_ms = self.estimated_buffer_level_ms(&MediaType::Audio) as u64,
-                        target_ms = audio_target as u64,
-                        "audio buffer gate: waiting"
-                    );
                     clock.set_timeout(500.0).await;
                     // Check again after the sleep.
                     if drv.has_pending_seek() {
@@ -1817,7 +1732,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 }
                 match self.fetch_next_segment(MediaType::Audio, &m, buf).await {
                     Ok(FetchOutcome::Fetched(d)) => {
-                        tracing::debug!(index = d.index, reason = ?d.reason, "audio segment fetched");
                         if let Some(prev) = prev_audio_index {
                             if prev != d.index {
                                 drv.on_quality_change(
@@ -1832,7 +1746,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                         audio_decision = Some(d);
                     }
                     Ok(FetchOutcome::EndOfStream) => {
-                        tracing::info!("audio: end of stream");
                         audio_done = true;
                     }
                     Err(e) => return Err(e),
@@ -2143,8 +2056,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 snapped_offset as f64 * seg_dur_s + t.period_start_s - remap_offset
             })
             .unwrap_or(position_s);
-
-        tracing::info!(requested_s = position_s, snapped_s, "DashSession::seek_to");
         self.gap_controller.on_seek();
         snapped_s
     }
@@ -2283,14 +2194,8 @@ impl<F: SegmentFetcher> DashSession<F> {
         };
 
         if offset_s == 0.0 {
-            tracing::debug!("apply_live_pts_remap: offset is 0 — nothing to do");
             return;
         }
-
-        tracing::info!(
-            offset_s,
-            "apply_live_pts_remap: shifting timestampOffset by -{offset_s:.3} s on all sinks"
-        );
 
         if let Some(track) = self.video_track.as_mut() {
             let current = track.timestamp_offset_s;
@@ -2450,13 +2355,7 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// `true`. Called automatically by [`Self::fetch_next_segment`].
     async fn refresh_manifest_if_due(&mut self) {
         if self.should_refresh_manifest() {
-            match self.refresh_manifest().await {
-                Ok(()) => tracing::info!("live manifest refreshed"),
-                Err(e) => tracing::warn!(
-                    error = %e,
-                    "manifest refresh failed; continuing with stale manifest"
-                ),
-            }
+            let _ = self.refresh_manifest().await;
         }
     }
 
@@ -2468,8 +2367,6 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// becomes the new `base_url` for all subsequent refreshes.  If every URL
     /// fails the last error is returned.
     pub async fn refresh_manifest(&mut self) -> Result<(), DashError> {
-        tracing::info!(url = %self.base_url, "refreshing live manifest");
-
         let loader = ManifestLoader::new(Arc::clone(&self.fetcher));
 
         // Try the primary URL, then fall back through any <Location> alternatives.
@@ -2481,22 +2378,12 @@ impl<F: SegmentFetcher> DashSession<F> {
                     let mut last_err = primary_err;
                     let mut found: Option<(MPD, Url)> = None;
                     for location_url in &self.location_urls {
-                        tracing::warn!(
-                            primary_url = %self.base_url,
-                            location_url = %location_url,
-                            "manifest refresh: primary URL failed, trying Location fallback"
-                        );
                         match loader.load(location_url).await {
                             Ok(pair) => {
                                 found = Some(pair);
                                 break;
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    url = %location_url,
-                                    error = %e,
-                                    "manifest refresh: Location URL also failed"
-                                );
                                 last_err = e;
                             }
                         }
@@ -2527,30 +2414,12 @@ impl<F: SegmentFetcher> DashSession<F> {
                     let (new_start, _, new_total) =
                         extract_segment_timing(adaptation, period, presentation_duration);
                     if new_total != track.total_segments {
-                        tracing::info!(
-                            media_type = "video",
-                            old = ?track.total_segments,
-                            new = ?new_total,
-                            "manifest refresh: segment count updated"
-                        );
                         track.total_segments = new_total;
                     }
                     // Sliding-window: live DVR window may have moved forward.
                     if new_start > track.start_number {
-                        tracing::info!(
-                            media_type = "video",
-                            old = track.start_number,
-                            new = new_start,
-                            "manifest refresh: startNumber advanced (sliding window)"
-                        );
                         track.start_number = new_start;
                         if track.segment_number < new_start {
-                            tracing::warn!(
-                                media_type = "video",
-                                segment_number = track.segment_number,
-                                new_start_number = new_start,
-                                "segment_number behind live window — snapping to new startNumber"
-                            );
                             track.segment_number = new_start;
                         }
                     }
@@ -2561,30 +2430,12 @@ impl<F: SegmentFetcher> DashSession<F> {
                     let (new_start, _, new_total) =
                         extract_segment_timing(adaptation, period, presentation_duration);
                     if new_total != track.total_segments {
-                        tracing::info!(
-                            media_type = "audio",
-                            old = ?track.total_segments,
-                            new = ?new_total,
-                            "manifest refresh: segment count updated"
-                        );
                         track.total_segments = new_total;
                     }
                     // Sliding-window: live DVR window may have moved forward.
                     if new_start > track.start_number {
-                        tracing::info!(
-                            media_type = "audio",
-                            old = track.start_number,
-                            new = new_start,
-                            "manifest refresh: startNumber advanced (sliding window)"
-                        );
                         track.start_number = new_start;
                         if track.segment_number < new_start {
-                            tracing::warn!(
-                                media_type = "audio",
-                                segment_number = track.segment_number,
-                                new_start_number = new_start,
-                                "segment_number behind live window — snapping to new startNumber"
-                            );
                             track.segment_number = new_start;
                         }
                     }
@@ -2628,7 +2479,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             let spd_s: Option<f64> = self.mpd.suggestedPresentationDelay.map(|d| d.as_secs_f64());
             if let Some(ast) = ast_s {
                 let now_s = self.clock.unix_s() + self.utc_clock_offset_s;
-                for (label, track_opt) in [
+                for (_label, track_opt) in [
                     ("video", self.video_track.as_mut()),
                     ("audio", self.audio_track.as_mut()),
                 ] {
@@ -2642,12 +2493,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                             track.availability_time_offset_s,
                         );
                         if track.segment_number < new_live_edge {
-                            tracing::info!(
-                                media_type = label,
-                                old_segment = track.segment_number,
-                                new_live_edge,
-                                "manifest refresh: segment_number behind live edge — snapping"
-                            );
                             track.segment_number = new_live_edge;
                             track.initial_segment_number = new_live_edge;
                         }
@@ -2686,12 +2531,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                             {
                                 if let Some(tl) = &tmpl.SegmentTimeline {
                                     if find_timeline_segment(&tl.segments, Some(nst)).is_none() {
-                                        tracing::warn!(
-                                            media_type = %media_type_ref,
-                                            next_segment_time = nst,
-                                            "manifest refresh: next_segment_time expired \
-                                             from new timeline — resetting to oldest available"
-                                        );
                                         track.next_segment_time = None;
                                     }
                                 }
@@ -2701,11 +2540,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 }
             }
         }
-
-        tracing::info!(
-            minimum_update_period_ms = ?self.minimum_update_period_ms,
-            "manifest refreshed successfully"
-        );
         Ok(())
     }
 
@@ -2732,13 +2566,6 @@ impl<F: SegmentFetcher> DashSession<F> {
 
         if let Ok(track) = self.track_mut(media_type) {
             if decision.index != track.current_index {
-                tracing::info!(
-                    media_type = %media_type,
-                    old_index = track.current_index,
-                    new_index = decision.index,
-                    reason = ?decision.reason,
-                    "quality switch"
-                );
                 track.current_index = decision.index;
             }
         }
@@ -2781,17 +2608,14 @@ impl<F: SegmentFetcher> DashSession<F> {
                 // Live segment not yet generated: wait one segment duration then
                 // retry once.  If still unavailable, propagate as AllBaseUrlsFailed.
                 Err(DashError::SegmentNotYetAvailable { .. }) => {
-                    let seg_dur_ms = self
-                        .track(&media_type)
-                        .map(|t| t.segment_duration_ms)
-                        .unwrap_or(2_000.0);
-                    tracing::info!(
-                        media_type = %media_type,
-                        wait_ms = seg_dur_ms as u64,
-                        "live segment not yet available — waiting one segment duration before retry"
-                    );
                     #[cfg(feature = "std")]
-                    Delay::new(core::time::Duration::from_millis(seg_dur_ms as u64)).await;
+                    {
+                        let seg_dur_ms = self
+                            .track(&media_type)
+                            .map(|t| t.segment_duration_ms)
+                            .unwrap_or(2_000.0);
+                        Delay::new(core::time::Duration::from_millis(seg_dur_ms as u64)).await;
+                    }
                     // Do NOT use a bare `return` here: the retry may itself
                     // return EndOfStream (period boundary), which must be
                     // caught by try_advance_period just like the first attempt.
@@ -2836,12 +2660,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             if let Some(aet_s) = self.mpd.availabilityEndTime {
                 let now_s = self.clock.unix_s() + self.utc_clock_offset_s;
                 if now_s > aet_s {
-                    tracing::info!(
-                        media_type = %media_type,
-                        availability_end_time_s = aet_s,
-                        now_s,
-                        "availabilityEndTime passed — signalling EndOfStream"
-                    );
                     return Err(DashError::EndOfStream {
                         media_type: media_type.to_string(),
                     });
@@ -2855,11 +2673,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             if let Some(total) = track.total_segments {
                 let fetched = track.segment_number.saturating_sub(track.start_number);
                 if fetched >= total {
-                    tracing::info!(
-                        media_type = %media_type,
-                        total_segments = total,
-                        "all segments fetched — signalling EndOfStream"
-                    );
                     return Err(DashError::EndOfStream {
                         media_type: media_type.to_string(),
                     });
@@ -2880,12 +2693,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let time_to_stream_end_s = (presentation_end_s - current_time_s).max(0.0);
                 let buffer_level_s = self.estimated_buffer_level_ms(&media_type) / 1000.0;
                 if time_to_stream_end_s - buffer_level_s < EOS_EPSILON {
-                    tracing::info!(
-                        media_type = %media_type,
-                        time_to_stream_end_s,
-                        buffer_level_s,
-                        "buffer covers end of stream — signalling EndOfStream"
-                    );
                     return Err(DashError::EndOfStream {
                         media_type: media_type.to_string(),
                     });
@@ -2921,13 +2728,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                     .saturating_sub(window_segments)
                     .max(track.start_number);
                 if track.segment_number < dvr_floor {
-                    tracing::warn!(
-                        media_type = %media_type,
-                        segment_number = track.segment_number,
-                        dvr_floor,
-                        live_edge,
-                        "segment outside DVR window — advancing to floor"
-                    );
                     let track = self.track_mut(&media_type)?;
                     track.segment_number = dvr_floor;
                 }
@@ -2953,13 +2753,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                     .rposition(|r| r.bandwidth <= cap)
                     .unwrap_or(0);
                 if capped_idx < uncapped.index {
-                    tracing::debug!(
-                        media_type = %media_type,
-                        uncapped_index = uncapped.index,
-                        capped_index = capped_idx,
-                        cap_bps = cap,
-                        "bitrate cap applied"
-                    );
                     QualityDecision {
                         index: capped_idx,
                         reason: uncapped.reason,
@@ -2978,13 +2771,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             let track = self.track_mut(&media_type)?;
             if decision.index != track.current_index {
                 let from_index = track.current_index;
-                tracing::info!(
-                    media_type = %media_type,
-                    old = from_index,
-                    new = decision.index,
-                    reason = ?decision.reason,
-                    "quality switch"
-                );
                 track.current_index = decision.index;
                 self.abr.record_switch(self.clock.now_ms());
                 Some(from_index)
@@ -3032,18 +2818,8 @@ impl<F: SegmentFetcher> DashSession<F> {
             let cache_key = format!("{}/{}", mt_str, new_rep_id);
             let cached = self.init_cache.get(&cache_key).cloned();
             if let Some(data) = cached {
-                tracing::debug!(
-                    media_type = %media_type,
-                    rep_id = %new_rep_id,
-                    "quality switch: re-appending init segment from cache"
-                );
                 buf.append(media_type, data, true).await?;
             } else {
-                tracing::debug!(
-                    media_type = %media_type,
-                    rep_id = %new_rep_id,
-                    "quality switch: init segment not cached, fetching"
-                );
                 self.fetch_init_segment(media_type, buf).await?;
             }
         }
@@ -3083,12 +2859,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                     .as_ref()
                     .expect("populated by fetch_base_sidx above");
                 if seg_idx >= ranges.len() {
-                    tracing::info!(
-                        media_type = %media_type,
-                        seg_idx,
-                        total = ranges.len(),
-                        "SegmentBase index exhausted — signalling EndOfStream"
-                    );
                     return Err(DashError::EndOfStream {
                         media_type: media_type.to_string(),
                     });
@@ -3143,24 +2913,15 @@ impl<F: SegmentFetcher> DashSession<F> {
                 // `seg_num − start_number` gives the 0-based index into segment_urls.
                 // (start_number defaults to 0 so this is backwards-compatible.)
                 let seg_idx = seg_num.saturating_sub(track.start_number) as usize;
-                let seg_url_entry = sl.segment_urls.get(seg_idx).ok_or_else(|| {
-                    tracing::info!(
-                        media_type = %media_type,
-                        seg_idx,
-                        "SegmentList exhausted — signalling EndOfStream"
-                    );
-                    DashError::EndOfStream {
-                        media_type: media_type.to_string(),
-                    }
-                })?;
+                let seg_url_entry =
+                    sl.segment_urls
+                        .get(seg_idx)
+                        .ok_or_else(|| DashError::EndOfStream {
+                            media_type: media_type.to_string(),
+                        })?;
 
                 // `mediaRange` (byte-range SegmentList) is not yet supported.
                 if seg_url_entry.mediaRange.is_some() {
-                    tracing::warn!(
-                        media_type = %media_type,
-                        seg_idx,
-                        "SegmentList entry uses mediaRange (byte-range); not yet supported"
-                    );
                     return Err(DashError::SegmentUrlUnresolvable);
                 }
 
@@ -3193,15 +2954,8 @@ impl<F: SegmentFetcher> DashSession<F> {
                         .as_ref()
                         .ok_or(DashError::SegmentUrlUnresolvable)?;
                     let (seg_time, seg_dur) = find_timeline_segment(&tl.segments, next_seg_time)
-                        .ok_or_else(|| {
-                            tracing::info!(
-                                media_type = %media_type,
-                                next_time = ?next_seg_time,
-                                "SegmentTimeline exhausted — signalling EndOfStream"
-                            );
-                            DashError::EndOfStream {
-                                media_type: media_type.to_string(),
-                            }
+                        .ok_or_else(|| DashError::EndOfStream {
+                            media_type: media_type.to_string(),
                         })?;
                     let p = expand_template(
                         media_tmpl,
@@ -3250,10 +3004,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 })
                 .collect();
             if non_bl.is_empty() {
-                tracing::warn!(
-                    media_type = %media_type,
-                    "all CDN candidates are currently blacklisted — retrying all"
-                );
                 (0..candidates.len()).collect()
             } else {
                 non_bl
@@ -3271,14 +3021,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 .url
                 .join(&expanded_path)
                 .map_err(|_| DashError::SegmentUrlUnresolvable)?;
-
-            tracing::debug!(
-                media_type = %media_type,
-                segment_number = seg_number,
-                url = %segment_url,
-                service_location = %candidate.service_location,
-                "fetching segment"
-            );
 
             let request = {
                 let req = FetchRequest::new(segment_url.clone(), RequestType::MediaSegment);
@@ -3329,21 +3071,10 @@ impl<F: SegmentFetcher> DashSession<F> {
                             })
                         );
                     if is_live_404 {
-                        tracing::debug!(
-                            url = %segment_url,
-                            segment_number = seg_number,
-                            "live segment not yet available (HTTP 404) — will wait and retry"
-                        );
                         last_err = DashError::SegmentNotYetAvailable {
                             media_type: mt_str.clone(),
                         };
                     } else {
-                        tracing::warn!(
-                            url = %segment_url,
-                            service_location = %candidate.service_location,
-                            error = %e,
-                            "segment fetch failed — blacklisting CDN and trying next base URL"
-                        );
                         self.cdn_blacklist
                             .record_failure(&candidate.service_location);
                         last_err = DashError::AllBaseUrlsFailed {
@@ -3364,13 +3095,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 let elapsed_s = response.transfer_duration_ms as f64 / 1_000.0;
                 track.throughput_tracker.record(bps, elapsed_s);
             }
-            tracing::debug!(
-                media_type = %media_type,
-                segment_number = seg_number,
-                throughput_bps = track.throughput_tracker.estimate(),
-                transfer_ms = track.last_transfer_ms,
-                "throughput updated"
-            );
         }
 
         // Record HTTP request metrics and a buffer-level sample.
@@ -3403,27 +3127,8 @@ impl<F: SegmentFetcher> DashSession<F> {
             });
         }
 
-        let sidx = parse_sidx(&response.data);
-        if sidx.is_some() {
-            tracing::debug!(
-                media_type = %media_type,
-                segment_number = seg_number,
-                start_s = sidx.map(|s| s.start_s).unwrap_or(0.0),
-                end_s   = sidx.map(|s| s.end_s).unwrap_or(0.0),
-                "sidx timing extracted"
-            );
-        }
-
         // Parse ProducerReferenceTime (prft) box for latency measurement.
         if let Some(prft) = parse_prft(&response.data) {
-            tracing::debug!(
-                media_type = %media_type,
-                segment_number = seg_number,
-                wall_clock_s = prft.wall_clock_s,
-                media_time = prft.media_time,
-                reference_track_id = prft.reference_track_id,
-                "prft: producer reference time extracted"
-            );
             let track = self.track_mut(&media_type)?;
             track.last_prft = Some(prft);
         }
@@ -3456,12 +3161,6 @@ impl<F: SegmentFetcher> DashSession<F> {
         if next_idx >= self.mpd.periods.len() {
             return Ok(false);
         }
-
-        tracing::info!(
-            from = self.current_period_index,
-            to = next_idx,
-            "period boundary: advancing to next MPD period"
-        );
         self.current_period_index = next_idx;
 
         // Clear init-segment cache: the new period may have different codec
@@ -3562,14 +3261,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             .join(&media_url_str)
             .map_err(|_| DashError::SegmentUrlUnresolvable)?;
 
-        tracing::debug!(
-            media_type = %media_type,
-            url = %sidx_url,
-            range_start = index_range.0,
-            range_end = index_range.1,
-            "SegmentBase: fetching sidx index"
-        );
-
         let request = FetchRequest::new(sidx_url, RequestType::InitializationSegment)
             .with_byte_range(index_range.0, index_range.1);
         let response = self.fetcher.fetch(request).await?;
@@ -3580,11 +3271,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             .ok_or(DashError::SegmentUrlUnresolvable)?;
 
         let n = entries.len() as u64;
-        tracing::info!(
-            media_type = %media_type,
-            total_segments = n,
-            "SegmentBase: sidx parsed, subsegment table populated"
-        );
 
         let track = self.track_mut(media_type)?;
         track.total_segments = Some(n);
@@ -3614,13 +3300,6 @@ impl<F: SegmentFetcher> DashSession<F> {
             (path, cands, br, rep.id.clone())
         };
 
-        tracing::debug!(
-            media_type = %media_type,
-            init_path = %init_path,
-            byte_range = ?byte_range,
-            "fetching init segment"
-        );
-
         // CDN blacklist-aware candidate loop — mirrors the media segment loop.
         self.cdn_blacklist.evict_expired();
         let effective: Vec<usize> = {
@@ -3632,10 +3311,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 })
                 .collect();
             if non_bl.is_empty() {
-                tracing::warn!(
-                    media_type = %media_type,
-                    "all CDN candidates blacklisted for init segment — retrying all"
-                );
                 (0..candidates.len()).collect()
             } else {
                 non_bl
@@ -3655,13 +3330,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                 .join(&init_path)
                 .map_err(|_| DashError::SegmentUrlUnresolvable)?;
 
-            tracing::debug!(
-                media_type = %media_type,
-                url = %init_url,
-                service_location = %candidate.service_location,
-                "fetching init segment from candidate"
-            );
-
             let req = FetchRequest::new(init_url.clone(), RequestType::InitializationSegment);
             let req = if let Some((start, end)) = byte_range {
                 req.with_byte_range(start, end)
@@ -3675,12 +3343,6 @@ impl<F: SegmentFetcher> DashSession<F> {
                     break;
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        url = %init_url,
-                        service_location = %candidate.service_location,
-                        error = %e,
-                        "init segment fetch failed — blacklisting CDN and trying next"
-                    );
                     self.cdn_blacklist
                         .record_failure(&candidate.service_location);
                     last_err = DashError::AllBaseUrlsFailed {
@@ -3704,18 +3366,11 @@ impl<F: SegmentFetcher> DashSession<F> {
             track.init_segment_sent = true;
         }
 
-        tracing::info!(
-            media_type = %media_type,
-            bytes = bytes_received,
-            "init segment appended"
-        );
-
         Ok(bytes_received)
     }
 
     /// Signal that no more segments will be appended.
     pub async fn end_of_stream(&mut self, buf: &mut impl MediaBuffer) -> Result<(), DashError> {
-        tracing::info!("signalling end of stream");
         buf.end_of_stream().await
     }
 

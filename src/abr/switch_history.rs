@@ -75,13 +75,6 @@ impl AbrRule for SwitchHistoryRule {
             let elapsed_ms = metrics.now_ms - last_switch_ms;
             let min_interval_ms = self.min_switch_interval.as_secs_f64() * 1_000.0;
             if elapsed_ms < min_interval_ms {
-                tracing::debug!(
-                    rule = self.name(),
-                    elapsed_ms = elapsed_ms as u64,
-                    min_interval_ms = min_interval_ms as u64,
-                    current_index = current,
-                    "switch too recent — clamping to current quality"
-                );
                 return Some(current);
             }
         }

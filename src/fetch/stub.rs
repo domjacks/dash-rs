@@ -7,8 +7,8 @@ use alloc::boxed::Box;
 
 use crate::fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher};
 
-/// A stub [`SegmentFetcher`] that logs every call and immediately returns
-/// empty bytes without making any real network requests.
+/// A stub [`SegmentFetcher`] that immediately returns empty bytes without
+/// making any real network requests.
 ///
 /// Useful for unit tests, offline tooling, and as a placeholder while
 /// integrating the library into a larger system.
@@ -20,13 +20,6 @@ pub struct StubSegmentFetcher;
 #[async_trait(?Send)]
 impl SegmentFetcher for StubSegmentFetcher {
     async fn fetch(&self, request: FetchRequest) -> Result<FetchResponse, FetchError> {
-        tracing::debug!(
-            url = %request.url,
-            request_type = ?request.request_type,
-            byte_range = ?request.byte_range,
-            "StubSegmentFetcher: fetch (returning empty bytes)"
-        );
-
         Ok(FetchResponse {
             final_url: request.url,
             data: Bytes::new(),
@@ -35,12 +28,9 @@ impl SegmentFetcher for StubSegmentFetcher {
         })
     }
 
-    async fn check_existence(&self, url: &Url) -> Result<bool, FetchError> {
-        tracing::debug!(url = %url, "StubSegmentFetcher: check_existence (returning true)");
+    async fn check_existence(&self, _url: &Url) -> Result<bool, FetchError> {
         Ok(true)
     }
 
-    fn abort(&self) {
-        tracing::debug!("StubSegmentFetcher: abort (no-op)");
-    }
+    fn abort(&self) {}
 }

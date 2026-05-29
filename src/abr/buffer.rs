@@ -101,14 +101,6 @@ impl AbrRule for BufferOccupancyRule {
             }
         }
 
-        tracing::debug!(
-            rule = self.name(),
-            buffer_level_ms = metrics.buffer_level_ms,
-            buffer_norm,
-            selected_index = best_index,
-            "buffer occupancy rule decision"
-        );
-
         Some(best_index)
     }
 }

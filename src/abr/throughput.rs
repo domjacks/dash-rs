@@ -217,15 +217,6 @@ impl AbrRule for ThroughputRule {
             .map(|(i, _)| i)
             .unwrap_or(0); // always fall back to the lowest quality
 
-        tracing::debug!(
-            rule = self.name(),
-            throughput_bps = metrics.throughput_bps,
-            usable_bps,
-            selected_index = selected,
-            selected_bandwidth = representations[selected].bandwidth,
-            "throughput rule decision"
-        );
-
         Some(selected)
     }
 }

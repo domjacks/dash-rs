@@ -187,10 +187,6 @@ pub(super) fn extract_segment_timing(
         for r in adaptation.representations.iter().skip(1) {
             match (first_dur, effective_dur_s(r)) {
                 (Some(fd), Some(rd)) if (fd - rd).abs() > 1e-9 => {
-                    tracing::warn!(
-                        "AdaptationSet representations have inconsistent segment durations \
-                         ({fd} s vs {rd} s); using first representation as representative"
-                    );
                     break;
                 }
                 _ => {}

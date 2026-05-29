@@ -720,8 +720,10 @@ Do not add inline comments to the right of code.
 
 ## Documentation
 
-- Ensure you keep the AGENTS.md, README.md and COMPLIANCE.md documents up to date whenever changes are made
-- COMPLIANCE.md is used to track compliance against the DASH specs and Dash.js features. It should also be used to track behavioural differences where they occur along with their reason.
+- Ensure you keep the AGENTS.md, README.md and documents in docs/ folder up to date whenever changes are made
+- dash-compliance.md is used to track compliance against the DASH specs and Dash.js features. It should also be used to track behavioural differences where they occur along with their reason.
+- getting-started.md should help developers that want to use the library in their applications get started.
+- review.md is a review of the codebase for improvements. 
 
 ## Where to look
 

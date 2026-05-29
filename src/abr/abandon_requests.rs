@@ -52,11 +52,6 @@ impl AbrRule for AbandonRequestsRule {
 
         let ratio = metrics.effective_download_ratio?;
         if ratio < ABANDON_MULTIPLIER {
-            tracing::debug!(
-                ratio,
-                threshold = ABANDON_MULTIPLIER,
-                "AbandonRequestsRule — forcing lowest quality"
-            );
             Some(0)
         } else {
             None

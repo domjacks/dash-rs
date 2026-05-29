@@ -346,12 +346,6 @@ impl GapController {
             if self.last_jump_position_s == Some(pos) {
                 return None;
             }
-            tracing::warn!(
-                position_s,
-                target_s = pos,
-                reason = ?reason,
-                "GapController: recommending seek to escape gap/stall"
-            );
             self.last_jump_position_s = Some(pos);
             self.stall_ticks = 0;
             Some(GapSeekTarget {

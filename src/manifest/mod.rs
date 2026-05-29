@@ -43,8 +43,6 @@ impl<F: SegmentFetcher> ManifestLoader<F> {
     /// resolved base URL (the final URL after any redirects, used for
     /// resolving relative segment URLs later).
     pub async fn load(&self, url: &Url) -> Result<(MPD, Url), DashError> {
-        tracing::info!(url = %url, "loading manifest");
-
         let request = FetchRequest::new(url.clone(), RequestType::Manifest);
         let response = self.fetcher.fetch(request).await?;
 
@@ -52,19 +50,7 @@ impl<F: SegmentFetcher> ManifestLoader<F> {
 
         let text = String::from_utf8_lossy(&response.data);
 
-        tracing::debug!(
-            url = %base_url,
-            bytes = response.data.len(),
-            "manifest fetched, parsing"
-        );
-
         let mpd = parse(&text)?;
-
-        tracing::info!(
-            url = %base_url,
-            periods = mpd.periods.len(),
-            "manifest parsed successfully"
-        );
 
         Ok((mpd, base_url))
     }
