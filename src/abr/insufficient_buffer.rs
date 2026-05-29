@@ -5,7 +5,7 @@ use crate::abr::{
 };
 
 /// Buffer level below which this rule forces the lowest quality, in ms.
-const CRITICAL_BUFFER_THRESHOLD_MS: f64 = 2_000.0;
+pub(crate) const CRITICAL_BUFFER_THRESHOLD_MS: f64 = 2_000.0;
 
 /// Emergency rule: if the buffer drops below a critical threshold, always
 /// select the lowest-quality representation.

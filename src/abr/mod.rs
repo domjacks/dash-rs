@@ -79,6 +79,14 @@ impl AbrController {
             return QualityDecision::new(0, AbrDecisionReason::Initial);
         }
 
+        if metrics.is_post_seek {
+            let index = metrics
+                .current_index
+                .unwrap_or(0)
+                .min(representations.len() - 1);
+            return QualityDecision::new(index, AbrDecisionReason::ThroughputBased);
+        }
+
         // Collect opinions from all stateless rules.
         let mut max_index = representations.len() - 1;
         let mut reason = AbrDecisionReason::ThroughputBased;

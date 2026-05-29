@@ -5,8 +5,6 @@ error handling, DASH spec compliance, and no_std compliance.
 
 ---
 
-## Contents
-
 - [Code Review — dash-rs](#code-review--dash-rs)
   - [Contents](#contents)
   - [1. no\_std Compliance Issues](#1-no_std-compliance-issues)
@@ -30,31 +28,10 @@ error handling, DASH spec compliance, and no_std compliance.
 |---|---|---|
 | Low | `src/session/blacklist.rs` | `use std::thread` in `#[cfg(test)]` without a `#[cfg(feature = "std")]` guard. |
 | Low | Various | `alloc::collections::VecDeque` is imported unconditionally in `abr/throughput.rs` and `abr/switch_history.rs`; other files gate it with `#[cfg(not(feature = "std"))]`. Inconsistent convention throughout the codebase. |
-| Low | `src/clock.rs` | `use alloc::boxed::Box` imported unconditionally but `Box` is not directly used in the file. Dead import. |
 
 ---
 
-## 2. Idiomatic Rust
-
-Validated against current tree.
-
-| Location | Issue | Status |
-|---|---|---|
-| `src/abr/mod.rs` | Rule-to-reason mapping dispatches on `rule.name()` (untyped string). A new rule that does not match a case silently returns `ThroughputBased`. Add `fn reason(&self) -> AbrDecisionReason` to the `AbrRule` trait and remove the match. | Open |
-| `src/abr/mod.rs` | `SwitchHistoryRule` is a named field evaluated separately from `Vec<Box<dyn AbrRule>>`. `with_rules()` cannot exclude or replace it, reducing test isolation of the rule pipeline. | Open |
-| `src/abr/rule.rs` | `AbrRule: Send + Sync` can block WASM-hosted rule impls that carry `!Send` state (for example `JsValue`). Consider relaxing this bound to match the crate's `?Send` integration style. | Open |
-| `src/abr/buffer.rs` | `const GAMA` and public field `pub gama` are misspellings of "gamma". API rename is semver-breaking, so it needs a deprecation path. | Open |
-| `src/abr/throughput.rs` | `ThroughputRule::safety_factor` is `pub`. Prefer encapsulation (`pub(crate)` + setter/new constructor) to avoid unconstrained mutation from callers. | Open |
-| `src/abr/throughput.rs` | EMA seed guard uses `if self.fast_ema == 0.0`; a dedicated `seeded: bool` avoids float-sentinel coupling. | Open |
-| `src/error.rs` | Error variants mix tuple-style (`AppendFailed(String)`) and struct-style (`NoRepresentations { media_type: String }`). Standardise variant shape for consistency. | Open |
-| `src/error.rs` | `DashError` does not derive `PartialEq`, forcing tests to rely on `matches!` or string checks. | Open |
-| `src/lib.rs` | `#[macro_use] extern crate alloc` is pre-2018 style; prefer direct macro paths/imports in Edition 2021. | Open |
-| `src/media_buffer.rs` | `StubBuffer::add_track` and `StubBuffer::change_type` duplicate the same MIME-track `match`. Extract a private helper to reduce repetition. | Open |
-| `src/media_buffer.rs` | `let _ = mt;` in `remove_range` is less idiomatic than naming the parameter `_mt`. | Open |
-
----
-
-## 3. API Ergonomics
+## 2. API Ergonomics
 
 Ordered by consumer impact.
 
@@ -75,7 +52,7 @@ would make all four call sites uniform.
 
 ---
 
-## 4. Documentation Gaps
+## 3. Documentation Gaps
 
 | Location | Gap |
 |---|---|
@@ -92,16 +69,7 @@ would make all four call sites uniform.
 
 ---
 
-
-### Still genuinely open
-
-| Location | Missing case |
-|---|---|
-| `src/session/mod.rs` | `wait_for_buffer_capacity` interrupt path: pending seek fires and unblocks the gate within ≤ 500 ms. Non-trivial to test without a fake clock that can inject a seek mid-sleep. |
-
----
-
-## 5. Error Handling
+## 4. Error Handling
 
 | Location | Issue |
 |---|---|

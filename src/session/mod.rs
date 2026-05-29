@@ -2994,10 +2994,16 @@ impl<F: SegmentFetcher> DashSession<F> {
         };
         let quality_switched = switched_from.is_some();
 
-        // Clear post-seek flag now that ABR has made its first post-seek decision.
-        // The flag is consumed once per track per seek, so buffer-occupancy rules
-        // resume normal operation from the next fetch onwards.
-        self.track_mut(&media_type)?.post_seek = false;
+        // Keep the post-seek guard active while the measured buffer is still
+        // critical.  A seek near the end of a segment can leave less than two
+        // seconds buffered after the first append; clearing the guard too early
+        // lets InsufficientBufferRule immediately clamp to the lowest quality.
+        if !metrics.is_post_seek
+            || metrics.buffer_level_ms
+                > crate::abr::insufficient_buffer::CRITICAL_BUFFER_THRESHOLD_MS
+        {
+            self.track_mut(&media_type)?.post_seek = false;
+        }
 
         // Record a representation-switch metric when a quality change occurred.
         if let Some(from_index) = switched_from {

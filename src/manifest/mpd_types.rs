@@ -57,6 +57,11 @@ pub struct MPD {
     /// `@timeShiftBufferDepth` — maximum DVR window depth for live streams
     /// (ISO 8601 duration, DASH spec §5.3.1.2).
     ///
+    /// Example:
+    /// availabilityStartTime is 14:00
+    /// it's now 15:00
+    /// timeShiftBufferDepth is 2 hours
+    /// The DVR window is from 13:00 to 15:00, so segments with presentation time before 13:00 may no longer be available on the CDN.
     /// The presentation time of segments older than
     /// `availabilityStartTime + (now - timeShiftBufferDepth)` is outside the
     /// DVR window and those segments may no longer be available on the CDN.

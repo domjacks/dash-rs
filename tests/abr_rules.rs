@@ -64,6 +64,27 @@ fn throughput_rule_empty_representations() {
     assert_eq!(rule.max_index(&[], &metrics), None);
 }
 
+#[test]
+fn throughput_rule_retains_current_index_without_measurement() {
+    let rule = ThroughputRule::default();
+    let reps = reps();
+
+    let mut metrics = AbrMetrics::new(0.0, 15_000.0);
+    metrics.current_index = Some(2);
+    assert_eq!(
+        rule.max_index(&reps, &metrics),
+        Some(2),
+        "missing throughput should retain the current representation"
+    );
+
+    metrics.throughput_bps = f64::NAN;
+    assert_eq!(
+        rule.max_index(&reps, &metrics),
+        Some(2),
+        "invalid throughput should retain the current representation"
+    );
+}
+
 // ── BufferOccupancyRule ───────────────────────────────────────────────────────
 
 #[test]
@@ -188,6 +209,22 @@ fn controller_selects_high_with_good_conditions() {
     let metrics = AbrMetrics::new(10_000_000.0, 20_000.0);
     let decision = controller.select(&reps, &metrics);
     assert_eq!(decision.index, 2);
+}
+
+#[test]
+fn controller_retains_current_quality_while_post_seek() {
+    let controller = AbrController::default();
+    let reps = reps();
+    let mut metrics = AbrMetrics::new(100_000.0, 0.0);
+    metrics.current_index = Some(2);
+    metrics.is_post_seek = true;
+
+    let decision = controller.select(&reps, &metrics);
+
+    assert_eq!(
+        decision.index, 2,
+        "post-seek ABR must retain current quality until buffer recovers"
+    );
 }
 
 #[test]

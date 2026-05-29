@@ -2978,12 +2978,28 @@ async fn post_seek_quality_retained_after_seek() {
         "quality must be retained at index 2 on the first post-seek fetch"
     );
 
-    // After that fetch the flag is cleared: a second metrics snapshot shows
-    // is_post_seek=false.
+    // The guard remains active while the measured buffer is still critical.
+    // This protects seeks near the end of a segment, where one appended
+    // segment can still leave too little playable buffer.
     let after_metrics = session.current_metrics(MediaType::Video, 0.0, &buf);
     assert!(
-        !after_metrics.is_post_seek,
-        "is_post_seek must be cleared after the first post-seek fetch"
+        after_metrics.is_post_seek,
+        "is_post_seek must remain active while the buffer is still critical"
+    );
+
+    let mut healthy_metrics = after_metrics;
+    healthy_metrics.buffer_level_ms = 3_000.0;
+    healthy_metrics.throughput_bps = 100_000_000.0;
+
+    session
+        .fetch_next_segment(MediaType::Video, &healthy_metrics, &mut buf)
+        .await
+        .expect("second post-seek fetch must succeed");
+
+    let recovered_metrics = session.current_metrics(MediaType::Video, 0.0, &buf);
+    assert!(
+        !recovered_metrics.is_post_seek,
+        "is_post_seek must clear once the measured buffer is healthy"
     );
 }
 

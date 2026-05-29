@@ -202,6 +202,10 @@ impl AbrRule for ThroughputRule {
             return None;
         }
 
+        if metrics.throughput_bps <= 0.0 || !metrics.throughput_bps.is_finite() {
+            return Some(metrics.current_index.unwrap_or(0));
+        }
+
         let usable_bps = metrics.throughput_bps * self.safety_factor;
 
         // Walk representations from highest to lowest; pick the first that fits.
