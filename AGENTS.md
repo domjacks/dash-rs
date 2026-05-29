@@ -661,14 +661,12 @@ All public functions return `Result<_, DashError>`.  Add new variants to
 
 ### Logging
 
-Use `tracing` macros — never `println!` or `eprintln!` in library code.
+The published library must not depend on a logging backend. Consumer-facing logs
+belong in `PlayerEvent::Log`; applications and examples decide how to route them
+(`tracing`, `log`, browser UI, stdout, etc.). Avoid `println!` / `eprintln!` in
+library code.
 
-| Level | When to use |
-|---|---|
-| `tracing::error!` | Unrecoverable conditions that will propagate as errors |
-| `tracing::warn!` | Recoverable conditions the caller should know about (e.g. buffer critically low) |
-| `tracing::info!` | State transitions (quality switch, end of stream, manifest loaded) |
-| `tracing::debug!` | Per-operation details (every append, every fetch, every ABR decision) |
+Examples may use `tracing` or standard output for their own diagnostics.
 
 ### ABR rules
 
@@ -740,7 +738,7 @@ Do not add inline comments to the right of code.
 | No-op stub fetcher | `src/fetch/stub.rs` |
 | Manifest loading | `src/manifest/mod.rs` |
  | Session coordinator (`DashSession`, `TrackState`, `MediaType`) | `src/session/mod.rs` |
-| Player-owned event API (`PlayerEvent`, `DashEvent`, `Player::on`) | `src/player.rs` |
+| Player-owned event API (`PlayerEvent`, `PlayerIterationEvent`, `DashEvent`, `Player::on`) | `src/player.rs` |
  | `PlaybackDriver` trait + `IterationSummary` (`DashSession::run`) | `src/session/driver.rs` |
  | `PlaybackState` enum (`Playing`, `Paused`, `Buffering`) | `src/session/driver.rs` |
  | Multi-period management (`try_advance_period`, `period_count`, `current_period_index`) | `src/session/mod.rs` |
@@ -770,6 +768,7 @@ Do not add inline comments to the right of code.
 | WASM player `MediaBuffer` (`BridgeMediaBuffer`) | `examples/wasm_player/src/media_buffer.rs` |
 | WASM player fetcher (`FetchResult` extern, `BridgeFetcher`) | `examples/wasm_player/src/fetcher.rs` |
 | WASM player driver (`WasmPlaybackDriver`) | `examples/wasm_player/src/driver.rs` |
+| WASM player status UI (`Player::on` event handling) | `examples/wasm_player/src/lib.rs` |
 | WASM player entry points (`init`, `play`) | `examples/wasm_player/src/lib.rs` |
 | WASM player MSE bridge (`createBridge`) — all browser Web API calls | `examples/wasm_player/player.js` |
 | WASM player UI wiring — on-screen logger, WASM init, form handler | `examples/wasm_player/app.js` |

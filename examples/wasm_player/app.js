@@ -6,7 +6,7 @@
  *   - WASM module initialisation (init())
  *   - URL input pre-fill from the ?url= query parameter
  *   - Form submit handler — creates a fresh bridge per session and calls play()
- *   - Debug panel — updated every 500 ms via bridge.getLatestStatus()
+ *   - Debug panel — updated every 500 ms from Player event status snapshots
  *
  * MSE bridge logic (all browser Web API calls made by dash-rs) lives in
  * player.js and is kept entirely separate from this file.
@@ -103,7 +103,7 @@ export function log(category, msg) {
 // ── Debug panel ────────────────────────────────────────────────────────────────
 //
 // updateDebugPanel() is called by a setInterval every 500 ms.  It reads:
-//   • bridge.getLatestStatus() — the last JSON snapshot pushed from Rust.
+//   • bridge.getLatestStatus() — the last Player event snapshot pushed from Rust.
 //   • video.* — live browser properties for playback state and position.
 //
 // All DOM element references are looked up once here and reused each tick.
@@ -124,6 +124,7 @@ const dp = {
   url:       document.getElementById('dp-url'),
   tms:       document.getElementById('dp-tms'),
   tbps:      document.getElementById('dp-tbps'),
+  event:     document.getElementById('dp-event'),
 };
 
 // Current bridge — set when a session starts, cleared when it ends.
@@ -142,23 +143,39 @@ function fmtMs(ms) {
 }
 
 function updateDebugPanel() {
-  // ── Playback state from the video element ────────────────────────────────
-  let stateLabel, dotClass;
+  const s = activeBridge ? activeBridge.getLatestStatus() : null;
+
+  // ── Playback state from Player events, falling back to the video element ──
+  let stateLabel = s?.state;
+  let dotClass;
+  if (!stateLabel) {
+    if (video.ended) {
+      stateLabel = 'Ended';
+    } else if (video.paused) {
+      stateLabel = 'Paused';
+    } else if (video.readyState < 3) {
+      stateLabel = 'Buffering';
+    } else {
+      stateLabel = 'Playing';
+    }
+  }
+
   if (video.ended) {
-    stateLabel = 'Ended';     dotClass = 'dot-ended';
-  } else if (video.paused) {
-    stateLabel = 'Paused';    dotClass = 'dot-paused';
-  } else if (video.readyState < 3) {
-    stateLabel = 'Buffering'; dotClass = 'dot-buffering';
+    dotClass = 'dot-ended';
+  } else if (stateLabel === 'Paused') {
+    dotClass = 'dot-paused';
+  } else if (stateLabel === 'Buffering') {
+    dotClass = 'dot-buffering';
+  } else if (stateLabel === 'Ended') {
+    dotClass = 'dot-ended';
   } else {
-    stateLabel = 'Playing';   dotClass = 'dot-playing';
+    dotClass = 'dot-playing';
   }
   dp.dot.className       = `dot ${dotClass}`;
   dp.stateText.textContent = stateLabel;
   dp.pos.textContent     = `${video.currentTime.toFixed(2)} s`;
 
   // ── Rust session status ──────────────────────────────────────────────────
-  const s = activeBridge ? activeBridge.getLatestStatus() : null;
   if (!s) return;  // no tick yet — leave remaining rows as '—'
 
   dp.live.textContent  = s.live  ? 'Live'  : 'VOD';
@@ -174,6 +191,7 @@ function updateDebugPanel() {
   dp.url.textContent   = s.url ? s.url.split('/').pop() || s.url : '—';
   dp.tms.textContent   = s.tms > 0 ? fmtMs(s.tms)  : '—';
   dp.tbps.textContent  = s.tbps > 0 ? fmtBps(s.tbps) : '—';
+  dp.event.textContent = s.event || '—';
 }
 
 // Start the panel refresh loop immediately (it is safe to call before playback).

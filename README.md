@@ -460,6 +460,12 @@ use dash_rs::PlayerEvent;
 let mut player = Player::from_url(&url, fetcher, buffer, driver).await?;
 player.on(|event| {
     match event {
+        PlayerEvent::Log(log) => {
+            println!("[{:?}] {}: {}", log.level, log.target, log.message);
+        }
+        PlayerEvent::Iteration(s) => {
+            println!("buffer={:.1}s throughput={:.0}kbps", s.video_buffer_ms / 1_000.0, s.last_throughput_bps.unwrap_or(0.0) / 1_000.0);
+        }
         PlayerEvent::InbandDash(ev) => {
             // DASH emsg events (e.g. splice cues, ID3 metadata).
             println!("emsg {} {:?}: {} bytes", ev.scheme_id_uri, ev.value, ev.message_data.len());
@@ -514,12 +520,6 @@ access or external dependencies are required.
 cargo run --example basic
 ```
 
-Enable `tracing` debug output:
-
-```bash
-RUST_LOG=debug cargo run --example basic
-```
-
 ### `http_fetch` — real HTTP, no media output
 
 Fetches the BBC R&D Big Buck Bunny stream over HTTP and prints per-segment ABR
@@ -562,7 +562,7 @@ complete set of Web APIs involved in MPEG-DASH playback.
 
 An on-screen **player log** panel shows all output colour-coded by source:
 - Bridge calls: coloured by Web API category (MSE = blue, Fetch = green, …)
-- Rust `tracing` output from WASM: coloured by severity level (warn = amber, error = red, …)
+- `PlayerEvent::Log` messages and example-side Rust diagnostics.
 
 **Prerequisites:** `wasm-pack` (`cargo install wasm-pack`)
 
@@ -633,21 +633,11 @@ Done.
 
 ---
 
-## Enabling tracing
+## Logging
 
-dash-rs emits structured `tracing` events at `DEBUG` and `INFO` levels from
-every subsystem. To see them in your application, add a subscriber:
-
-```toml
-[dev-dependencies]
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-```
-
-```rust
-tracing_subscriber::fmt()
-    .with_env_filter("dash_rs=debug")
-    .init();
-```
+dash-rs does not require a logging backend. Subscribe to `Player::on` and route
+`PlayerEvent::Log` into your own logging system (`tracing`, `log`, browser UI,
+or plain stdout).
 
 ---
 

@@ -48,7 +48,7 @@
 //! ```
 
 use alloc::sync::Arc;
-use alloc::{boxed::Box, rc::Rc, string::String, vec::Vec};
+use alloc::{boxed::Box, format, rc::Rc, string::String, vec::Vec};
 use core::{cell::Cell, cell::RefCell};
 
 use async_trait::async_trait;
@@ -105,9 +105,74 @@ pub struct DashEvent {
     pub message_data: Bytes,
 }
 
+/// Owned per-iteration playback snapshot emitted by [`PlayerEvent::Iteration`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerIterationEvent {
+    /// Session estimated playback position at iteration start (s).
+    pub position_s: f64,
+    /// Video quality decision index for this iteration, if video was fetched.
+    pub video_index: Option<usize>,
+    /// Audio quality decision index for this iteration, if audio was fetched.
+    pub audio_index: Option<usize>,
+    /// Declared bandwidth (bps) of the active video representation.
+    pub video_bandwidth: u64,
+    /// Declared bandwidth (bps) of the active audio representation.
+    pub audio_bandwidth: u64,
+    /// Estimated video buffer level at iteration end (ms).
+    pub video_buffer_ms: f64,
+    /// Estimated audio buffer level at iteration end (ms).
+    pub audio_buffer_ms: f64,
+    /// Session buffer target (ms).
+    pub buffer_target_ms: f64,
+    /// Total HTTP request records accumulated by the session.
+    pub http_request_count: usize,
+    /// Total representation-switch records accumulated by the session.
+    pub switch_count: usize,
+    /// URL of the most recently completed HTTP request, or empty when absent.
+    pub last_transfer_url: String,
+    /// Transfer duration of the most recently completed HTTP request (ms).
+    pub last_transfer_ms: f64,
+    /// Measured throughput of the most recently completed HTTP request (bps).
+    pub last_throughput_bps: Option<f64>,
+    /// Total video representations available in the current period.
+    pub video_rep_count: u32,
+    /// Total audio representations available in the current period.
+    pub audio_rep_count: u32,
+    /// Whether the session is live.
+    pub is_live: bool,
+}
+
+/// Severity for [`PlayerLogEvent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerLogLevel {
+    /// Verbose diagnostics.
+    Debug,
+    /// Informational state transition.
+    Info,
+    /// Recoverable condition callers may want to surface.
+    Warn,
+    /// Error condition emitted before `run` returns an error.
+    Error,
+}
+
+/// Consumer-facing log message emitted by [`Player`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlayerLogEvent {
+    /// Message severity.
+    pub level: PlayerLogLevel,
+    /// Static subsystem name.
+    pub target: &'static str,
+    /// Human-readable message.
+    pub message: String,
+}
+
 /// Events emitted by [`Player`] while it runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerEvent {
+    /// Consumer-facing log message.
+    Log(PlayerLogEvent),
+    /// Per-iteration playback and transfer snapshot.
+    Iteration(PlayerIterationEvent),
     /// In-band DASH metadata from an `emsg` box in an appended media segment.
     InbandDash(DashEvent),
     /// The renderer playback state changed between observed run-loop samples.
@@ -143,6 +208,22 @@ fn emit_event(handlers: &EventHandlers, event: PlayerEvent) {
     for handler in handlers.borrow_mut().iter_mut() {
         handler(&event);
     }
+}
+
+fn emit_log(
+    handlers: &EventHandlers,
+    level: PlayerLogLevel,
+    target: &'static str,
+    message: impl Into<String>,
+) {
+    emit_event(
+        handlers,
+        PlayerEvent::Log(PlayerLogEvent {
+            level,
+            target,
+            message: message.into(),
+        }),
+    );
 }
 
 fn new_event_handlers() -> EventHandlers {
@@ -267,11 +348,33 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         }
 
         let handlers = Rc::clone(&self.event_handlers);
+        emit_log(
+            &handlers,
+            PlayerLogLevel::Info,
+            "player",
+            "starting playback",
+        );
         let mut buf = EventMediaBuffer::new(&mut self.buf, Rc::clone(&handlers));
         let mut driver = EventPlaybackDriver::new(&mut self.driver, Rc::clone(&handlers));
         let result = self.session.run(&mut buf, &mut driver).await;
-        if result.is_ok() {
-            emit_event(&handlers, PlayerEvent::EndOfStream);
+        match &result {
+            Ok(()) => {
+                emit_event(&handlers, PlayerEvent::EndOfStream);
+                emit_log(
+                    &handlers,
+                    PlayerLogLevel::Info,
+                    "player",
+                    "playback complete",
+                );
+            }
+            Err(e) => {
+                emit_log(
+                    &handlers,
+                    PlayerLogLevel::Error,
+                    "player",
+                    format!("playback failed: {e}"),
+                );
+            }
         }
         result
     }
@@ -424,6 +527,12 @@ impl<S: MediaBuffer> MediaBuffer for EventMediaBuffer<'_, S> {
     async fn append(&mut self, mt: MediaType, data: Bytes, is_init: bool) -> Result<(), DashError> {
         if !is_init {
             for emsg in parse_all_emsg(&data) {
+                emit_log(
+                    &self.handlers,
+                    PlayerLogLevel::Info,
+                    "player::emsg",
+                    format!("emsg {} id {}", emsg.scheme_id_uri, emsg.id),
+                );
                 emit_event(
                     &self.handlers,
                     PlayerEvent::InbandDash(DashEvent {
@@ -482,6 +591,12 @@ impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
         let previous = self.last_playback_state.get();
         if previous != state {
             self.last_playback_state.set(state);
+            emit_log(
+                &self.handlers,
+                PlayerLogLevel::Info,
+                "player::playback_state",
+                format!("playback state {previous:?} -> {state:?}"),
+            );
             emit_event(
                 &self.handlers,
                 PlayerEvent::PlaybackStateChanged {
@@ -495,6 +610,12 @@ impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
 
     async fn on_gap_seek(&mut self, target: GapSeekTarget) {
         self.inner.on_gap_seek(target.clone()).await;
+        emit_log(
+            &self.handlers,
+            PlayerLogLevel::Warn,
+            "player::gap",
+            format!("gap seek -> {:.2}s", target.position_s),
+        );
         emit_event(&self.handlers, PlayerEvent::GapSeek(target));
     }
 
@@ -544,6 +665,12 @@ impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
     ) {
         self.inner
             .on_quality_change(media_type, old_index, new_index, reason.clone());
+        emit_log(
+            &self.handlers,
+            PlayerLogLevel::Info,
+            "player::abr",
+            format!("{media_type:?} quality {old_index} -> {new_index} ({reason})"),
+        );
         emit_event(
             &self.handlers,
             PlayerEvent::QualityChange {
@@ -557,6 +684,27 @@ impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
 
     fn on_iteration(&mut self, summary: &crate::session::driver::IterationSummary<'_>) {
         self.inner.on_iteration(summary);
+        emit_event(
+            &self.handlers,
+            PlayerEvent::Iteration(PlayerIterationEvent {
+                position_s: summary.position_s,
+                video_index: summary.video_decision.map(|d| d.index),
+                audio_index: summary.audio_decision.map(|d| d.index),
+                video_bandwidth: summary.video_bandwidth,
+                audio_bandwidth: summary.audio_bandwidth,
+                video_buffer_ms: summary.video_buffer_ms,
+                audio_buffer_ms: summary.audio_buffer_ms,
+                buffer_target_ms: summary.buffer_target_ms,
+                http_request_count: summary.http_request_count,
+                switch_count: summary.switch_count,
+                last_transfer_url: summary.last_transfer_url.clone(),
+                last_transfer_ms: summary.last_transfer_ms,
+                last_throughput_bps: summary.last_throughput_bps,
+                video_rep_count: summary.video_rep_count,
+                audio_rep_count: summary.audio_rep_count,
+                is_live: summary.is_live,
+            }),
+        );
     }
 
     fn wants_pts_remap(&self) -> bool {
@@ -565,6 +713,12 @@ impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
 
     async fn on_session_started(&mut self, start_s: f64) {
         self.inner.on_session_started(start_s).await;
+        emit_log(
+            &self.handlers,
+            PlayerLogLevel::Info,
+            "player",
+            format!("session started @ {start_s:.2}s"),
+        );
         emit_event(&self.handlers, PlayerEvent::SessionStarted { start_s });
     }
 }

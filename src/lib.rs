@@ -5,8 +5,34 @@
 //!
 
 #![cfg_attr(not(feature = "std"), no_std)]
+#![allow(unused_variables)]
 
 extern crate alloc;
+extern crate self as tracing;
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! debug {
+    ($($tt:tt)*) => {{}};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! error {
+    ($($tt:tt)*) => {{}};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! info {
+    ($($tt:tt)*) => {{}};
+}
+
+#[doc(hidden)]
+#[macro_export]
+macro_rules! warn {
+    ($($tt:tt)*) => {{}};
+}
 
 pub mod abr;
 pub mod clock;
@@ -43,7 +69,7 @@ pub use media_buffer::{MediaBuffer, NullBuffer, StubBuffer, StubChunk, TimeRange
 pub use mp4::parse_all_emsg;
 pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 pub use player::Player;
-pub use player::{DashEvent, PlayerEvent};
+pub use player::{DashEvent, PlayerEvent, PlayerIterationEvent, PlayerLogEvent, PlayerLogLevel};
 pub use session::driver::{IterationSummary, PlaybackDriver, PlaybackState};
 pub use session::{
     BufferLevelSample, DashMetrics, DashSession, FetchOutcome, GapControllerSettings,

@@ -64,9 +64,9 @@ A re-exported proc-macro alias `#[dash_rs::async_impl]` that bakes in `?Send` wo
 the entire class of confusion and remove the lengthy warning from every doc comment.
 
 **2. `Player::on` examples are limited**  
-The Player-owned event API is documented in README, but no runnable example demonstrates
-handling `PlayerEvent::InbandDash` or playback-state changes. A printed handler in `http_fetch.rs`
-or `basic.rs` would make it discoverable.
+The WASM player uses `Player::on` for its status UI, but the simpler native examples do not
+demonstrate event handling. A printed handler in `http_fetch.rs` or `basic.rs` would make it
+discoverable outside the browser example.
 
 **3. WASM `lib.rs` bridge cloning is non-obvious**  
 Three of the four constructors require `JsValue::clone(bridge.as_ref()).unchecked_into()`

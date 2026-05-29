@@ -13,7 +13,7 @@
 //! | [`clock`] | `BridgeClock` — `Clock` impl via `performance.now()` / `Date.now()` |
 //! | [`media_buffer`] | `BridgeMediaBuffer` — `MediaBuffer` impl via MSE `MediaSource` + `SourceBuffer` |
 //! | [`fetcher`] | `BridgeFetcher` — `SegmentFetcher` impl via `window.fetch()` |
-//! | [`driver`] | `WasmPlaybackDriver` — `PlaybackDriver` impl; status JSON push |
+//! | [`driver`] | `WasmPlaybackDriver` — `PlaybackDriver` impl for renderer control |
 //!
 //! # API surface visible in JavaScript
 //!
@@ -65,13 +65,151 @@ use url::Url;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
-use dash_rs::Player;
+use dash_rs::{PlaybackState, Player, PlayerEvent, PlayerIterationEvent, PlayerLogLevel};
 
 use bridge::JsBridge;
 use clock::BridgeClock;
 use driver::WasmPlaybackDriver;
 use fetcher::BridgeFetcher;
 use media_buffer::BridgeMediaBuffer;
+
+// ── Status JSON ───────────────────────────────────────────────────────────────
+
+struct WasmPlayerStatus {
+    state: &'static str,
+    vi: u32,
+    vc: u32,
+    vbps: u64,
+    vbuf: f64,
+    ai: u32,
+    ac: u32,
+    abps: u64,
+    abuf: f64,
+    hc: usize,
+    sc: usize,
+    url: String,
+    tms: f64,
+    tbps: f64,
+    live: bool,
+    last_event: String,
+}
+
+impl WasmPlayerStatus {
+    fn new() -> Self {
+        Self {
+            state: "Starting",
+            vi: 0,
+            vc: 0,
+            vbps: 0,
+            vbuf: 0.0,
+            ai: 0,
+            ac: 0,
+            abps: 0,
+            abuf: 0.0,
+            hc: 0,
+            sc: 0,
+            url: String::new(),
+            tms: 0.0,
+            tbps: 0.0,
+            live: false,
+            last_event: String::new(),
+        }
+    }
+
+    fn apply_event(&mut self, event: &PlayerEvent) {
+        match event {
+            PlayerEvent::Iteration(iteration) => self.apply_iteration(iteration),
+            PlayerEvent::Log(log) => {
+                self.last_event = log.message.clone();
+            }
+            PlayerEvent::PlaybackStateChanged { to, .. } => {
+                self.state = playback_state_label(*to);
+            }
+            PlayerEvent::QualityChange {
+                media_type,
+                old_index,
+                new_index,
+                ..
+            } => {
+                self.last_event = format!("{media_type:?} quality {old_index} -> {new_index}");
+            }
+            PlayerEvent::GapSeek(target) => {
+                self.last_event = format!("gap seek -> {:.2}s", target.position_s);
+            }
+            PlayerEvent::SessionStarted { start_s } => {
+                self.state = "Playing";
+                self.last_event = format!("session started @ {start_s:.2}s");
+            }
+            PlayerEvent::InbandDash(ev) => {
+                self.last_event = format!("emsg {} id {}", ev.scheme_id_uri, ev.id);
+            }
+            PlayerEvent::EndOfStream => {
+                self.state = "Ended";
+                self.last_event = "end of stream".to_owned();
+            }
+        }
+    }
+
+    fn apply_iteration(&mut self, s: &PlayerIterationEvent) {
+        self.vi = s.video_index.unwrap_or(0) as u32;
+        self.vc = s.video_rep_count;
+        self.vbps = s.video_bandwidth;
+        self.vbuf = s.video_buffer_ms;
+        self.ai = s.audio_index.unwrap_or(0) as u32;
+        self.ac = s.audio_rep_count;
+        self.abps = s.audio_bandwidth;
+        self.abuf = s.audio_buffer_ms;
+        self.hc = s.http_request_count;
+        self.sc = s.switch_count;
+        self.url = s.last_transfer_url.clone();
+        self.tms = s.last_transfer_ms;
+        self.tbps = s.last_throughput_bps.unwrap_or(0.0);
+        self.live = s.is_live;
+    }
+
+    fn to_json(&self) -> String {
+        let url_safe = json_string_fragment(&self.url);
+        let event_safe = json_string_fragment(&self.last_event);
+        format!(
+            r#"{{"state":"{state}","vi":{vi},"vc":{vc},"vbps":{vbps},"vbuf":{vbuf:.1},"ai":{ai},"ac":{ac},"abps":{abps},"abuf":{abuf:.1},"hc":{hc},"sc":{sc},"url":"{url_safe}","tms":{tms:.1},"tbps":{tbps:.0},"live":{live},"event":"{event_safe}"}}"#,
+            state = self.state,
+            vi = self.vi,
+            vc = self.vc,
+            vbps = self.vbps,
+            vbuf = self.vbuf,
+            ai = self.ai,
+            ac = self.ac,
+            abps = self.abps,
+            abuf = self.abuf,
+            hc = self.hc,
+            sc = self.sc,
+            tms = self.tms,
+            tbps = self.tbps,
+            live = self.live,
+        )
+    }
+}
+
+fn playback_state_label(state: PlaybackState) -> &'static str {
+    match state {
+        PlaybackState::Playing => "Playing",
+        PlaybackState::Paused => "Paused",
+        PlaybackState::Buffering => "Buffering",
+    }
+}
+
+fn json_string_fragment(s: &str) -> String {
+    s.replace(['\\', '"'], "")
+}
+
+fn log_level_label(level: PlayerLogLevel) -> &'static str {
+    match level {
+        PlayerLogLevel::Debug => "debug",
+        PlayerLogLevel::Info => "info",
+        PlayerLogLevel::Warn => "warn",
+        PlayerLogLevel::Error => "error",
+    }
+}
 
 // ── WASM init ─────────────────────────────────────────────────────────────────
 
@@ -115,15 +253,27 @@ pub async fn play(mpd_url: String, bridge: JsBridge) -> Result<(), JsValue> {
     let buf = BridgeMediaBuffer::new(JsValue::clone(bridge.as_ref()).unchecked_into());
     let driver = WasmPlaybackDriver::new(&bridge);
 
-    // `Player::from_url_with_clock` fetches + parses the manifest, opens the
-    // media buffer (awaiting the `sourceopen` event), and returns a Player
-    // ready to run.  `run()` then handles the full startup sequence:
+    // `Player::from_url_with_clock` fetches + parses the manifest and returns a
+    // Player ready to run.  `run()` then handles the full startup sequence:
     //   set_live_mode → set_duration(+∞) → add_track × 2 →
     //   apply_live_pts_remap (wants_pts_remap=true) →
     //   on_session_started (seekTo live-edge ≈ 0) → notify_playing → loop.
-    Player::from_url_with_clock(&url, fetcher, buf, driver, clock)
+    let mut player = Player::from_url_with_clock(&url, fetcher, buf, driver, clock)
         .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let status_bridge: JsBridge = JsValue::clone(bridge.as_ref()).unchecked_into();
+    let mut status = WasmPlayerStatus::new();
+    status_bridge.report_status(&status.to_json());
+    player.on(move |event| {
+        if let PlayerEvent::Log(log) = event {
+            status_bridge.report_log(log_level_label(log.level), log.target, &log.message);
+        }
+        status.apply_event(event);
+        status_bridge.report_status(&status.to_json());
+    });
+
+    player
         .run()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;

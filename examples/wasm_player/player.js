@@ -21,7 +21,7 @@ export function createBridge(video, log) {
   const sourceBuffers = {};   // opaque id (string) → SourceBuffer
   let nextSbId = 0;
 
-  // Debug-panel state — latest status snapshot pushed from Rust each loop tick.
+  // Debug-panel state — latest status snapshot pushed from Rust Player events.
   let _latestStatus = null;
 
   // User-seek state — set by notifySeek() when the browser fires 'seeking'.
@@ -308,11 +308,17 @@ export function createBridge(video, log) {
 
     // ── Debug panel ────────────────────────────────────────────────────────────
 
-    // Called by Rust once per fetch-loop iteration with a compact JSON string
-    // describing the current session state (built by build_status_json in lib.rs).
+    // Called by Rust from Player::on with compact JSON describing the latest
+    // Player event-derived session state.
     // We parse it immediately so getLatestStatus() returns a plain object.
     reportStatus(json) {
       try { _latestStatus = JSON.parse(json); } catch (_) { /* ignore */ }
+    },
+
+    // Called by Rust from PlayerEvent::Log.  Routed through the existing
+    // on-screen logger so applications can choose their own log sink.
+    reportLog(level, target, message) {
+      log('Event', `[${level}] ${target}: ${message}`);
     },
 
     // Return the last parsed status object (or null before the first tick).

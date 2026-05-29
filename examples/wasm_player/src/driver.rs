@@ -3,13 +3,12 @@
 //!
 //! Wraps [`JsBridge`] so that [`DashSession::run`] can read renderer
 //! position, pause state, and gap-fill seeks from the browser `<video>`
-//! element, and push a compact JSON status string to the JavaScript debug
-//! panel after every segment pair.
+//! element. Player-level UI status is emitted from `Player::on` in `lib.rs`.
 
 use crate::bridge::JsBridge;
 use async_trait::async_trait;
 use dash_rs::{
-    session::driver::{IterationSummary, PlaybackDriver, PlaybackState},
+    session::driver::{PlaybackDriver, PlaybackState},
     GapSeekTarget,
 };
 use wasm_bindgen::JsCast;
@@ -81,31 +80,5 @@ impl PlaybackDriver for WasmPlaybackDriver {
     async fn on_session_started(&mut self, start_s: f64) {
         tracing::info!(start_s, "WasmPlaybackDriver: seeking to session start");
         self.bridge.seek_to(start_s);
-    }
-
-    fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-        // Build a compact JSON status string and push it to the JS debug panel.
-        // All values are primitive scalars — no serde dependency needed.
-        let vi = s.video_decision.map_or(0, |d| d.index) as u32;
-        let vbps = s.video_bandwidth;
-        let ai = s.audio_decision.map_or(0, |d| d.index) as u32;
-        let abps = s.audio_bandwidth;
-
-        // Strip characters that would break the JSON string value.
-        let url_safe = s.last_transfer_url.replace('"', "").replace('\\', "");
-
-        let json = format!(
-            r#"{{"vi":{vi},"vc":{vc},"vbps":{vbps},"vbuf":{vbuf:.1},"ai":{ai},"ac":{ac},"abps":{abps},"abuf":{abuf:.1},"hc":{hc},"sc":{sc},"url":"{url_safe}","tms":{tms:.1},"tbps":{tbps:.0},"live":{live}}}"#,
-            vc = s.video_rep_count,
-            vbuf = s.video_buffer_ms,
-            ac = s.audio_rep_count,
-            abuf = s.audio_buffer_ms,
-            hc = s.http_request_count,
-            sc = s.switch_count,
-            tms = s.last_transfer_ms,
-            tbps = s.last_throughput_bps.unwrap_or(0.0),
-            live = s.is_live,
-        );
-        self.bridge.report_status(&json);
     }
 }

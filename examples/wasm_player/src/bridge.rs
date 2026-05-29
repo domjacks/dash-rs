@@ -147,9 +147,13 @@ extern "C" {
     #[wasm_bindgen(method, js_name = checkExists)]
     pub(crate) fn check_exists(this: &JsBridge, url: &str) -> Promise;
 
-    // Debug panel status push — compact JSON string; JS calls JSON.parse on it.
+    // Player event status push — compact JSON string; JS calls JSON.parse on it.
     #[wasm_bindgen(method, js_name = reportStatus)]
     pub(crate) fn report_status(this: &JsBridge, json: &str);
+
+    // Player log event push — JS writes it to the on-screen log panel.
+    #[wasm_bindgen(method, js_name = reportLog)]
+    pub(crate) fn report_log(this: &JsBridge, level: &str, target: &str, message: &str);
 
     // ── User seek ─────────────────────────────────────────────────────────
     // Pending seek target in seconds, or NaN when no seek is pending.

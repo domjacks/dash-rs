@@ -7,7 +7,7 @@ default-members = ["."]
 name = "dash-rs"
 version = "0.1.0"
 edition = "2021"
-description = "A Rust implementation of MPEG-DASH playback logic: MPD parsing, ABR selection, media fetching, and an MSE-like buffer abstraction"
+description = "A Rust implementation of MPEG-DASH playback logic: MPD parsing, ABR selection, media fetching, and buffer abstraction"
 license = "BSD-3-Clause"
 repository = "https://github.com/jacksd60/dash-rs"
 keywords = ["dash", "mpeg-dash", "streaming", "abr", "mpd"]
@@ -28,7 +28,6 @@ bytes            = { version = "1", default-features = false }
 url              = { version = "2", optional = true }
 thiserror        = { version = "2", default-features = false }
 async-trait      = "0.1"
-tracing          = { version = "0.1", default-features = false }
 rand             = { version = "0.8", default-features = false, features = ["small_rng"] }
 futures-timer    = { version = "3", optional = true }
 futures          = { version = "0.3", default-features = false, features = ["alloc"] }
@@ -43,6 +42,7 @@ futures-timer = { version = "3", features = ["wasm-bindgen"] }
 
 [dev-dependencies]
 tokio              = { version = "1", features = ["full"] }
+tracing            = { version = "0.1", default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 reqwest            = { version = "0.13" }
 
