@@ -1,7 +1,7 @@
 //! Basic usage example.
 //!
-//! Demonstrates constructing a `DashSession` from a pre-built MPD string,
-//! running the ABR controller, and simulating a fetch + append loop using
+//! Demonstrates constructing a `Player` from a pre-built MPD string, wiring
+//! `Player::on` event callbacks, and simulating a fetch + append loop using
 //! the stub implementations — no real network traffic occurs.
 //!
 //! Run with:
@@ -11,11 +11,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dash_rs::{
-    fetch::stub::StubSegmentFetcher,
-    manifest::MPD,
-    media_buffer::NullBuffer,
-    session::driver::{IterationSummary, PlaybackDriver},
-    DashError, Player,
+    fetch::stub::StubSegmentFetcher, manifest::MPD, media_buffer::NullBuffer,
+    session::driver::PlaybackDriver, DashError, Player, PlayerEvent,
 };
 use url::Url;
 
@@ -49,7 +46,7 @@ const EXAMPLE_MPD: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 
 #[tokio::main]
 async fn main() -> Result<(), DashError> {
-    // Initialise tracing so all debug/info events from the library are visible.
+    // Initialise tracing for example-side diagnostics.
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)
         .init();
@@ -89,27 +86,6 @@ async fn main() -> Result<(), DashError> {
         fn throughput_override_bps(&self) -> Option<f64> {
             Some(1_200_000.0 + (self.seg as f64) * 400_000.0)
         }
-
-        fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-            let vid = s
-                .video_decision
-                .map(|d| (d.index, format!("{:?}", d.reason)));
-            let aud = s
-                .audio_decision
-                .map(|d| (d.index, format!("{:?}", d.reason)));
-            println!(
-                "  seg {}: video quality={} ({:?}), audio quality={} ({:?})",
-                self.seg,
-                vid.as_ref()
-                    .map(|(i, _)| i.to_string())
-                    .unwrap_or_else(|| "done".into()),
-                vid.as_ref().map(|(_, r)| r.as_str()).unwrap_or("-"),
-                aud.as_ref()
-                    .map(|(i, _)| i.to_string())
-                    .unwrap_or_else(|| "done".into()),
-                aud.as_ref().map(|(_, r)| r.as_str()).unwrap_or("-"),
-            );
-        }
     }
 
     let fetcher = Arc::new(StubSegmentFetcher);
@@ -142,9 +118,41 @@ async fn main() -> Result<(), DashError> {
     }
 
     println!("\n=== Fetching segments ===");
+    player.on(|event| match event {
+        PlayerEvent::Iteration(s) => {
+            let vid = s
+                .video_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "done".into());
+            let aud = s
+                .audio_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "done".into());
+            println!(
+                "  pos={:>5.1}s video={} audio={} throughput={:.0}kbps",
+                s.position_s,
+                vid,
+                aud,
+                s.last_throughput_bps.unwrap_or(0.0) / 1_000.0,
+            );
+        }
+        PlayerEvent::QualityChange {
+            media_type,
+            old_index,
+            new_index,
+            reason,
+        } => {
+            println!("  {media_type:?} quality {old_index} -> {new_index} ({reason})");
+        }
+        PlayerEvent::RunEnded { reason } => {
+            println!("\nRun ended: {reason:?}");
+        }
+        PlayerEvent::Log(log) => {
+            println!("  [{:?}] {}: {}", log.level, log.target, log.message);
+        }
+        _ => {}
+    });
     player.run().await?;
-
-    println!("\nEnd of stream signalled. Done.");
 
     Ok(())
 }

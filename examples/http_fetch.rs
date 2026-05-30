@@ -12,15 +12,15 @@
 //! Override the manifest URL with a first positional argument:
 //!   cargo run --example http_fetch -- https://your-stream/manifest.mpd
 
-use std::{sync::Arc, time::Instant};
+use std::{cell::Cell, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, SegmentFetcher},
     media_buffer::NullBuffer,
-    session::driver::{IterationSummary, PlaybackDriver},
-    DashError, Player, ThroughputCell,
+    session::driver::PlaybackDriver,
+    DashError, Player, PlayerEvent, ThroughputCell,
 };
 use url::Url;
 
@@ -130,7 +130,6 @@ const SEGMENTS_TO_FETCH: u32 = 4;
 struct HttpPlaybackDriver {
     throughput: Arc<ThroughputCell>,
     segments_fetched: u32,
-    last_transfer_ms: f64,
     cached_pos_s: f64,
 }
 
@@ -151,30 +150,6 @@ impl PlaybackDriver for HttpPlaybackDriver {
 
     fn throughput_override_bps(&self) -> Option<f64> {
         self.throughput.get()
-    }
-
-    fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-        self.last_transfer_ms = s.last_transfer_ms;
-
-        let (vid_idx, vid_reason) = s
-            .video_decision
-            .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
-            .unwrap_or_else(|| ("done".into(), "-".into()));
-        let (aud_idx, aud_reason) = s
-            .audio_decision
-            .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
-            .unwrap_or_else(|| ("done".into(), "-".into()));
-
-        println!(
-            "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>4} ms  ({:.0} kbps measured)",
-            self.segments_fetched,
-            vid_idx,
-            vid_reason,
-            aud_idx,
-            aud_reason,
-            s.last_transfer_ms as u64,
-            s.last_throughput_bps.unwrap_or(0.0) / 1_000.0,
-        );
     }
 }
 
@@ -207,7 +182,6 @@ async fn main() -> Result<(), DashError> {
     let driver = HttpPlaybackDriver {
         throughput: Arc::clone(&throughput),
         segments_fetched: 0,
-        last_transfer_ms: 0.0,
         cached_pos_s: 0.0,
     };
 
@@ -248,12 +222,48 @@ async fn main() -> Result<(), DashError> {
     //    end_of_stream() and returns.
     println!("=== Fetching {SEGMENTS_TO_FETCH} segments ===");
     println!(
-        "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {}",
-        "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "fetch ms"
+        "  {:<4}  {:<8}  {:<8}  {:>4} ms  {}",
+        "seg", "vid-idx", "aud-idx", "fetch", "throughput"
     );
+    let rows = Cell::new(0u32);
+    player.on(move |event| match event {
+        PlayerEvent::Iteration(s) => {
+            let row = rows.get() + 1;
+            rows.set(row);
+            let vid_idx = s
+                .video_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "done".into());
+            let aud_idx = s
+                .audio_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "done".into());
+            println!(
+                "  {:<4}  {:<8}  {:<8}  {:>4} ms  {:.0} kbps measured",
+                row,
+                vid_idx,
+                aud_idx,
+                s.last_transfer_ms as u64,
+                s.last_throughput_bps.unwrap_or(0.0) / 1_000.0,
+            );
+        }
+        PlayerEvent::QualityChange {
+            media_type,
+            old_index,
+            new_index,
+            reason,
+        } => {
+            println!("  {media_type:?} quality {old_index} -> {new_index} ({reason})");
+        }
+        PlayerEvent::RunEnded { reason } => {
+            println!("\nRun ended: {reason:?}");
+        }
+        PlayerEvent::Log(log) => {
+            println!("  [{:?}] {}: {}", log.level, log.target, log.message);
+        }
+        _ => {}
+    });
     player.run().await?;
-
-    println!("\nEnd of stream. Done.");
 
     Ok(())
 }

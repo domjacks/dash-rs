@@ -43,7 +43,10 @@ pub use media_buffer::{MediaBuffer, NullBuffer, StubBuffer, StubChunk, TimeRange
 pub use mp4::parse_all_emsg;
 pub use mp4::{parse_prft, parse_sidx, EmsgInfo, ProducerReferenceTime, SidxInfo};
 pub use player::Player;
-pub use player::{DashEvent, PlayerEvent, PlayerIterationEvent, PlayerLogEvent, PlayerLogLevel};
+pub use player::{
+    DashEvent, PlayerEvent, PlayerIterationEvent, PlayerLogEvent, PlayerLogLevel,
+    PlayerRunEndReason,
+};
 pub use session::driver::{IterationSummary, PlaybackDriver, PlaybackState};
 pub use session::{
     BufferLevelSample, DashMetrics, DashSession, FetchOutcome, GapControllerSettings,

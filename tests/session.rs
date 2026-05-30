@@ -18,7 +18,7 @@ use dash_rs::{
     fetch::{FetchError, FetchRequest, FetchResponse, RequestType, SegmentFetcher},
     media_buffer::{MediaBuffer, NullBuffer, TimeRange},
     session::{driver::PlaybackState, DashSession, FetchOutcome, MediaType},
-    GapSeekReason, IterationSummary, PlaybackDriver, Player, PlayerEvent,
+    GapSeekReason, IterationSummary, PlaybackDriver, Player, PlayerEvent, PlayerRunEndReason,
 };
 
 // ── MPD XML fixtures ──────────────────────────────────────────────────────────
@@ -1191,6 +1191,9 @@ struct OneIterationDriver {
     iterations: usize,
 }
 
+#[derive(Default)]
+struct RunToEosDriver;
+
 #[async_trait(?Send)]
 impl PlaybackDriver for OneIterationDriver {
     fn position_s(&self) -> f64 {
@@ -1203,6 +1206,13 @@ impl PlaybackDriver for OneIterationDriver {
 
     fn on_iteration(&mut self, _summary: &IterationSummary<'_>) {
         self.iterations += 1;
+    }
+}
+
+#[async_trait(?Send)]
+impl PlaybackDriver for RunToEosDriver {
+    fn position_s(&self) -> f64 {
+        0.0
     }
 }
 
@@ -1221,6 +1231,60 @@ async fn collect_player_events(segment_data: Vec<u8>) -> Vec<PlayerEvent> {
 
     let collected = events.lock().unwrap().clone();
     collected
+}
+
+#[tokio::test]
+async fn player_run_ended_reports_natural_eos() {
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, Vec::new());
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut player = Player::from_url(&url, fetcher, NullBuffer, RunToEosDriver)
+        .await
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    player.on(move |event| {
+        captured.lock().unwrap().push(event.clone());
+    });
+
+    player.run().await.unwrap();
+    let events = events.lock().unwrap().clone();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        PlayerEvent::RunEnded {
+            reason: PlayerRunEndReason::EndOfStream
+        }
+    )));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, PlayerEvent::EndOfStream)));
+}
+
+#[tokio::test]
+async fn player_run_ended_reports_driver_stop() {
+    let fetcher = EmsgMockFetcher::new(STATIC_MPD, Vec::new());
+    let url = Url::parse("http://example.com/manifest.mpd").unwrap();
+    let mut player = Player::from_url(&url, fetcher, NullBuffer, OneIterationDriver::default())
+        .await
+        .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&events);
+    player.on(move |event| {
+        captured.lock().unwrap().push(event.clone());
+    });
+
+    player.run().await.unwrap();
+    let events = events.lock().unwrap().clone();
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        PlayerEvent::RunEnded {
+            reason: PlayerRunEndReason::StoppedByDriver
+        }
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, PlayerEvent::EndOfStream)));
 }
 
 /// A v1 emsg embedded in a media segment is delivered as a `PlayerEvent` when

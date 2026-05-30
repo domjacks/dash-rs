@@ -143,6 +143,10 @@ impl WasmPlayerStatus {
             PlayerEvent::InbandDash(ev) => {
                 self.last_event = format!("emsg {} id {}", ev.scheme_id_uri, ev.id);
             }
+            PlayerEvent::RunEnded { reason } => {
+                self.state = "Ended";
+                self.last_event = format!("run ended: {reason:?}");
+            }
             PlayerEvent::EndOfStream => {
                 self.state = "Ended";
                 self.last_event = "end of stream".to_owned();

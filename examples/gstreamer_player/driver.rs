@@ -7,7 +7,7 @@
 //! - Enables buffer pruning so old data is evicted from GStreamer's `appsrc`.
 //! - Transitions the pipeline to `Playing` in `on_session_started` — after
 //!   init segments have been appended and `set_live_mode` has been called.
-//! - Pushes a console progress row after every segment pair.
+//! - Leaves console progress reporting to `Player::on` in `main.rs`.
 
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -16,7 +16,7 @@ use std::sync::{
 
 use async_trait::async_trait;
 use dash_rs::{
-    session::driver::{IterationSummary, PlaybackDriver, PlaybackState},
+    session::driver::{PlaybackDriver, PlaybackState},
     ThroughputCell,
 };
 use gst::prelude::*;
@@ -110,41 +110,5 @@ impl PlaybackDriver for GstPlaybackDriver {
             Ok(_) => tracing::info!("GstPlaybackDriver: pipeline set to Playing"),
             Err(e) => tracing::error!("GstPlaybackDriver: set_state(Playing) failed: {e}"),
         }
-    }
-
-    fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-        let measured_kbps = self.throughput.get().unwrap_or(0.0) / 1_000.0;
-        let buf_ms = if s.video_buffer_ms > 0.0 {
-            s.video_buffer_ms
-        } else {
-            s.audio_buffer_ms
-        };
-
-        let (vid_idx, vid_reason, video_ms) = s
-            .video_decision
-            .map(|d| {
-                (
-                    d.index.to_string(),
-                    format!("{:?}", d.reason),
-                    s.last_transfer_ms as u128,
-                )
-            })
-            .unwrap_or_else(|| ("done".into(), "-".into(), 0));
-        let (aud_idx, aud_reason) = s
-            .audio_decision
-            .map(|d| (d.index.to_string(), format!("{:?}", d.reason)))
-            .unwrap_or_else(|| ("done".into(), "-".into()));
-
-        println!(
-            "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:>7.1} s   {:>4} ms  ({:.0} kbps)",
-            self.seg,
-            vid_idx,
-            vid_reason,
-            aud_idx,
-            aud_reason,
-            buf_ms / 1_000.0,
-            video_ms,
-            measured_kbps,
-        );
     }
 }

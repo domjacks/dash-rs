@@ -166,6 +166,16 @@ pub struct PlayerLogEvent {
     pub message: String,
 }
 
+/// Why a [`Player`] run loop ended successfully.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlayerRunEndReason {
+    /// All active tracks reached natural end-of-stream.
+    EndOfStream,
+    /// The playback driver requested loop termination via
+    /// [`PlaybackDriver::should_continue`].
+    StoppedByDriver,
+}
+
 /// Events emitted by [`Player`] while it runs.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlayerEvent {
@@ -200,7 +210,12 @@ pub enum PlayerEvent {
         /// Initial presentation position in seconds.
         start_s: f64,
     },
-    /// The run loop ended successfully and signalled end-of-stream to the buffer.
+    /// The run loop ended successfully.
+    RunEnded {
+        /// Why the loop ended.
+        reason: PlayerRunEndReason,
+    },
+    /// The run loop ended after all active tracks reached natural EOS.
     EndOfStream,
 }
 
@@ -355,16 +370,29 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
             "starting playback",
         );
         let mut buf = EventMediaBuffer::new(&mut self.buf, Rc::clone(&handlers));
-        let mut driver = EventPlaybackDriver::new(&mut self.driver, Rc::clone(&handlers));
+        let stopped_by_driver = Rc::new(Cell::new(false));
+        let mut driver = EventPlaybackDriver::new(
+            &mut self.driver,
+            Rc::clone(&handlers),
+            Rc::clone(&stopped_by_driver),
+        );
         let result = self.session.run(&mut buf, &mut driver).await;
         match &result {
             Ok(()) => {
-                emit_event(&handlers, PlayerEvent::EndOfStream);
+                let reason = if stopped_by_driver.get() {
+                    PlayerRunEndReason::StoppedByDriver
+                } else {
+                    PlayerRunEndReason::EndOfStream
+                };
+                emit_event(&handlers, PlayerEvent::RunEnded { reason });
+                if reason == PlayerRunEndReason::EndOfStream {
+                    emit_event(&handlers, PlayerEvent::EndOfStream);
+                }
                 emit_log(
                     &handlers,
                     PlayerLogLevel::Info,
                     "player",
-                    "playback complete",
+                    format!("playback complete: {reason:?}"),
                 );
             }
             Err(e) => {
@@ -567,15 +595,17 @@ struct EventPlaybackDriver<'a, D> {
     inner: &'a mut D,
     handlers: EventHandlers,
     last_playback_state: Cell<PlaybackState>,
+    stopped_by_driver: Rc<Cell<bool>>,
 }
 
 impl<'a, D: PlaybackDriver> EventPlaybackDriver<'a, D> {
-    fn new(inner: &'a mut D, handlers: EventHandlers) -> Self {
+    fn new(inner: &'a mut D, handlers: EventHandlers, stopped_by_driver: Rc<Cell<bool>>) -> Self {
         let last_playback_state = Cell::new(inner.playback_state());
         Self {
             inner,
             handlers,
             last_playback_state,
+            stopped_by_driver,
         }
     }
 }
@@ -632,7 +662,11 @@ impl<D: PlaybackDriver> PlaybackDriver for EventPlaybackDriver<'_, D> {
     }
 
     fn should_continue(&self) -> bool {
-        self.inner.should_continue()
+        let should_continue = self.inner.should_continue();
+        if !should_continue {
+            self.stopped_by_driver.set(true);
+        }
+        should_continue
     }
 
     fn pending_seek_s(&mut self) -> Option<f64> {

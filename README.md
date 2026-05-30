@@ -29,17 +29,13 @@ The `AbrController` runs all six rules and takes the most conservative result.
 
 ### Spec compliance and missing features
 
-For a full breakdown of DASH spec compliance, behavioural differences relative
-to dash.js, and the prioritised list of unimplemented features, see
-[/dash-compliance.md](docs/dash-compliance.md).
+For a full breakdown of DASH spec compliance, behavioural differences relative to dash.js, and the prioritised list of unimplemented features, see [/dash-compliance.md](docs/dash-compliance.md).
 
 ## Running the examples
 
 ### `basic` — no network required
 
-Parses a synthetic multi-bitrate MPD, simulates 5 fetch iterations with
-improving network conditions, and prints each quality decision. No network
-access or external dependencies are required.
+Parses a synthetic multi-bitrate MPD, simulates 5 fetch iterations with improving network conditions, and prints each quality decision. No network access or external dependencies are required.
 
 ```bash
 cargo run --example basic
@@ -60,7 +56,7 @@ cargo run --example http_fetch -- https://your-stream/manifest.mpd
 Expected output (excerpt):
 
 ```
-Loaded manifest: https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
+Loaded manifest: https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd 
 Video representations (sorted by bandwidth):
   [0]   256kbps  320x180
   [1]   512kbps  512x288
@@ -75,10 +71,7 @@ Video representations (sorted by bandwidth):
 
 ### `wasm_player` — browser playback via WebAssembly
 
-Runs the full MPEG-DASH session in the browser.  The architecture is a **JS-bridge**: all browser Web API calls (MSE, Fetch, clocks) live in `examples/wasm_player/player.js` as an annotated `bridge` object.  WASM calls
-bridge methods via the `JsBridge` extern type in `src/lib.rs`; Rust never
-touches browser objects directly.  Reading `player.js` top-to-bottom shows the
-complete set of Web APIs involved in MPEG-DASH playback.
+Runs the full MPEG-DASH session in the browser.  The architecture is a **JS-bridge**: all browser Web API calls (MSE, Fetch, clocks) live in `examples/wasm_player/player.js` as an annotated `bridge` object.  WASM calls bridge methods via the `JsBridge` extern type in `src/lib.rs`; Rust never touches browser objects directly.  Reading `player.js` top-to-bottom shows the complete set of Web APIs involved in MPEG-DASH playback.
 
 An on-screen **player log** panel shows all output colour-coded by source:
 - Bridge calls: coloured by Web API category (MSE = blue, Fetch = green, …)
@@ -171,42 +164,3 @@ cargo test --doc
 ```
 
 ---
-
-
-
----
-
-## Architecture
-
-```
-DashSession
-├── ManifestLoader ──── SegmentFetcher (trait) ←── StubSegmentFetcher
-│       └── quick-xml + serde (pure-Rust MPD parser)   └── BridgeFetcher       (wasm_player)
-│                                              └── HttpSegmentFetcher  (http_fetch example)
-├── AbrController
-│   ├── ThroughputRule
-│   ├── BufferOccupancyRule
-│   ├── InsufficientBufferRule
-│   └── SwitchHistoryRule
-└── MediaBuffer (trait) ←── NullBuffer            (headless / tests)
-                         └── StubBuffer            (inspectable in-memory buffer)
-                         └── BridgeMediaBuffer     (wasm_player — MSE via JS bridge)
-                         └── GstMediaBuffer        (sink-gstreamer feature)
-                         └── (your implementation)
-
-GapController  (owned by DashSession; caller drives via session.tick_gap())
-└── tick_gap(position_s, buffered, PlaybackState) → Option<GapSeekTarget>
-    └── on gap/stall: caller seeks renderer, then calls session.seek_to()
-        └── seek_to() automatically resets the gap controller (on_seek())
-```
-
-Data flow per segment:
-
-1. `AbrController::select` picks a `QualityDecision` from `AbrMetrics`.
-2. `DashSession` resolves the segment URL from the MPD `SegmentTemplate` for the current period.
-3. `SegmentFetcher::fetch` retrieves the bytes.
-4. `MediaBuffer::append(mt, data, is_init)` forwards the bytes to the decoder.
-5. At period boundaries, `fetch_next_segment` transparently advances to the next `Period` and re-fetches init segments before continuing.
-
----
-

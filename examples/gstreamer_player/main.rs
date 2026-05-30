@@ -52,12 +52,15 @@ mod driver;
 mod fetcher;
 mod gst_media_buffer;
 
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    mpsc, Arc,
+use std::{
+    cell::Cell,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
 };
 
-use dash_rs::{DashError, Player, ThroughputCell};
+use dash_rs::{DashError, Player, PlayerEvent, ThroughputCell};
 use driver::GstPlaybackDriver;
 use fetcher::HttpSegmentFetcher;
 use gst::prelude::*;
@@ -122,10 +125,54 @@ async fn run_session(
         player.session().buffer_target_ms() / 1_000.0
     );
     println!(
-        "  {:<4}  {:<8}  {:<12}  {:<8}  {:<12}  {:<10}  {}",
-        "seg", "vid-idx", "vid-reason", "aud-idx", "aud-reason", "buf-est", "video fetch"
+        "  {:<4}  {:<8}  {:<8}  {:<10}  {:<10}  {}",
+        "seg", "vid-idx", "aud-idx", "buf-est", "fetch", "throughput"
     );
 
+    let rows = Cell::new(0u32);
+    player.on(move |event| match event {
+        PlayerEvent::Iteration(s) => {
+            let row = rows.get() + 1;
+            rows.set(row);
+            let buf_ms = if s.video_buffer_ms > 0.0 {
+                s.video_buffer_ms
+            } else {
+                s.audio_buffer_ms
+            };
+            let vid_idx = s
+                .video_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "done".into());
+            let aud_idx = s
+                .audio_index
+                .map(|i| i.to_string())
+                .unwrap_or_else(|| "done".into());
+            println!(
+                "  {:<4}  {:<8}  {:<8}  {:>7.1} s   {:>4} ms  {:.0} kbps",
+                row,
+                vid_idx,
+                aud_idx,
+                buf_ms / 1_000.0,
+                s.last_transfer_ms as u64,
+                s.last_throughput_bps.unwrap_or(0.0) / 1_000.0,
+            );
+        }
+        PlayerEvent::QualityChange {
+            media_type,
+            old_index,
+            new_index,
+            reason,
+        } => {
+            tracing::info!(%media_type, old_index, new_index, %reason, "quality changed");
+        }
+        PlayerEvent::RunEnded { reason } => {
+            println!("\nRun ended: {reason:?}");
+        }
+        PlayerEvent::Log(log) => {
+            tracing::info!(target = log.target, message = %log.message, "player event");
+        }
+        _ => {}
+    });
     player.run().await?;
 
     println!("\nAll segments fetched — waiting for pipeline EOS…");
