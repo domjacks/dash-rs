@@ -1,9 +1,8 @@
 # Getting started
 
-To play a DASH stream you need to provide three trait implementations and a
-driver struct, then call two functions. The library handles ABR, buffer gating,
-live manifest refresh, multi-period transitions, gap detection, and
-end-of-stream signalling.
+To play a DASH stream you need to provide some trait implementations that bring your own networking and player functionality.
+
+The library handles ABR, buffer gating, live manifest refresh, multi-period transitions, gap detection, and end-of-stream signalling.
 
 | What to implement | Trait | Role |
 |---|---|---|
@@ -11,7 +10,15 @@ end-of-stream signalling.
 | Media buffer | `MediaBuffer` | Receives raw fMP4/WebM bytes for both tracks and signals end-of-stream |
 | Playback driver | `PlaybackDriver` | Supplies the renderer's position and `PlaybackState` (`Playing` / `Paused` / `Buffering`) to the fetch loop |
 
-### 1. Add the dependency
+## Prerequisites
+
+| Tool | Version | Notes |
+|---|---|---|
+| Rust | stable ≥ 1.75 | Earlier versions may work but are untested |
+| wasm-pack | any recent | Required only for the `wasm_player` example. `cargo install wasm-pack` |
+
+
+## 1. Add the dependency
 
 ```toml
 [dependencies]
@@ -22,7 +29,7 @@ reqwest     = { version = "0.12", features = ["stream"] }
 tokio       = { version = "1", features = ["full"] }
 ```
 
-### 2. Implement `SegmentFetcher`
+## 2. Implement `SegmentFetcher`
 
 Called by the session to download every manifest and media segment.
 
@@ -89,7 +96,7 @@ impl SegmentFetcher for HttpFetcher {
 }
 ```
 
-### 3. Implement `MediaBuffer`
+## 3. Implement `MediaBuffer`
 
 `MediaBuffer` is the single integration point where your decoder receives media
 bytes for both the video and audio tracks.  Override `append` to forward bytes
@@ -154,7 +161,7 @@ impl MediaBuffer for MyBuffer {
 }
 ```
 
-### 4. Implement `PlaybackDriver`
+## 4. Implement `PlaybackDriver`
 
 `PlaybackDriver` is how `run()` reads your renderer's state.  `position_s` is
 the only required method — every other method has a sensible default.
@@ -201,7 +208,7 @@ Override additional methods as needed:
 | `on_iteration_start(pos)` | no-op | Advance per-iteration state before a fetch |
 | `on_iteration(summary)` | no-op | Progress reporting and UI updates after each segment pair |
 
-### 5. Start playback
+## 5. Start playback
 
 The simplest path uses the `Player` convenience wrapper, which owns both the
 session and the driver:
@@ -269,7 +276,7 @@ For platforms without `std::time::Instant` (e.g. WASM), use
 `from_url_with_clock` and pass a [`Clock`] implementation — see
 [Injecting a custom clock](#injecting-a-custom-clock) below.
 
-### Seeking
+## Seeking
 
 Gap-fill seeks (skipping over stalls or missing segments) are delivered to your
 driver via `on_gap_seek` while `run()` is active — override the method to seek
@@ -294,7 +301,7 @@ session.run(&mut driver).await?;
 `seek_to` snaps to the nearest segment boundary, returns the snapped position,
 and automatically resets the gap controller.
 
-### Injecting a custom clock (WASM / embedded)
+## Injecting a custom clock (WASM / embedded)
 
 `DashSession` accepts a pluggable [`Clock`] implementation for platforms where
 `std::time::Instant` is unavailable.  The trait has three methods:
@@ -338,7 +345,7 @@ let session = DashSession::from_url_with_clock(
 `SystemClock` (the default) uses `std::time::Instant` and `futures_timer::Delay`
 and works with any async executor without requiring tokio.
 
-### Custom ABR rules
+## Custom ABR rules
 
 ```rust
 use dash_rs::abr::{metrics::AbrMetrics, rule::{AbrRule, RepresentationInfo}, AbrController};
@@ -357,4 +364,90 @@ impl AbrRule for MyRule {
 let controller = AbrController::with_rules(vec![Box::new(MyRule)]);
 ```
 
----
+## Player events
+
+You can subscribe to Player Events that will tell you about various events happening during the stream.  
+
+```rust
+use dash_rs::PlayerEvent;
+
+let mut player = Player::from_url(&url, fetcher, buffer, driver).await?;
+player.on(|event| {
+    match event {
+        PlayerEvent::Log(log) => {
+            println!("[{:?}] {}: {}", log.level, log.target, log.message);
+        }
+        PlayerEvent::Iteration(s) => {
+            println!("buffer={:.1}s throughput={:.0}kbps", s.video_buffer_ms / 1_000.0, s.last_throughput_bps.unwrap_or(0.0) / 1_000.0);
+        }
+        PlayerEvent::InbandDash(ev) => {
+            // DASH emsg events (e.g. splice cues, ID3 metadata).
+            println!("emsg {} {:?}: {} bytes", ev.scheme_id_uri, ev.value, ev.message_data.len());
+        }
+        PlayerEvent::PlaybackStateChanged { from, to } => {
+            println!("playback state {from:?} -> {to:?}");
+        }
+        PlayerEvent::QualityChange { media_type, old_index, new_index, .. } => {
+            println!("{media_type:?} switched {old_index} -> {new_index}");
+        }
+        PlayerEvent::RunEnded { reason } => {
+            println!("run ended: {reason:?}");
+        }
+        _ => {}
+    }
+});
+
+player.run().await?;
+```
+
+Player events are emitted by wrappers around the configured `MediaBuffer` and
+`PlaybackDriver`, so segment fetching stays independent of application event
+delivery. The event API has no external dependency and works in `no_std` builds
+that provide `alloc`.
+
+## Inspecting session state
+
+Access session state at any point — before, during (via `on_iteration_start` or `on_iteration` in your `PlaybackDriver`), or after `run()`.
+
+```rust
+use dash_rs::session::MediaType;
+
+// Available representations, sorted ascending by bandwidth.
+for (i, rep) in session.video_representations().iter().enumerate() {
+    println!("[{i}] {}kbps {}×{}", rep.bandwidth / 1000,
+        rep.width.unwrap_or(0), rep.height.unwrap_or(0));
+}
+
+// Currently active representation.
+if let Some(rep) = session.current_representation(&MediaType::Video) {
+    println!("playing at {}kbps", rep.bandwidth / 1000);
+}
+
+// Estimated buffer level.
+let buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
+println!("video buffer: {:.1} s", buf_ms / 1000.0);
+
+// Cap quality, e.g. to enforce a data-saver mode.
+session.set_max_bitrate(MediaType::Video, 2_000_000);
+session.clear_max_bitrate(MediaType::Video);
+
+// Current period in a multi-period stream.
+println!("period {}/{}", session.current_period_index() + 1, session.period_count());
+```
+
+The `on_iteration` callback in `PlaybackDriver` receives an [`IterationSummary`]
+after every segment pair, which carries the same values without requiring a
+reference to the session:
+
+```rust
+fn on_iteration(&mut self, s: &IterationSummary<'_>) {
+    println!(
+        "video={:?} buf={:.1}s  audio={:?} buf={:.1}s  throughput={:.0}kbps",
+        s.video_decision.map(|d| d.index),
+        s.video_buffer_ms / 1_000.0,
+        s.audio_decision.map(|d| d.index),
+        s.audio_buffer_ms / 1_000.0,
+        s.last_throughput_bps / 1_000.0,
+    );
+}
+```

@@ -1,12 +1,8 @@
 # dash-rs
 
-A Rust implementation of MPEG-DASH playback logic, inspired by
-[dash.js](https://github.com/Dash-Industry-Forum/dash.js).
+A Rust implementation of MPEG-DASH playback logic.
 
-dash-rs provides the core building blocks needed to drive a DASH adaptive
-streaming session from native Rust code.
-
----
+dash-rs provides the core building blocks needed to drive a DASH adaptive streaming session from native Rust code.
 
 ## What's included
 
@@ -31,120 +27,11 @@ streaming session from native Rust code.
 
 The `AbrController` runs all six rules and takes the most conservative result.
 
-## Prerequisites
+### Spec compliance and missing features
 
-| Tool | Version | Notes |
-|---|---|---|
-| Rust | stable ≥ 1.75 | Earlier versions may work but are untested |
-| wasm-pack | any recent | Required only for the `wasm_player` example. `cargo install wasm-pack` |
-
----
-
-## Inspecting session state
-
-Access session state at any point — before, during (via `on_iteration_start` or
-`on_iteration` in your `PlaybackDriver`), or after `run()`.
-
-```rust
-use dash_rs::session::MediaType;
-
-// Available representations, sorted ascending by bandwidth.
-for (i, rep) in session.video_representations().iter().enumerate() {
-    println!("[{i}] {}kbps {}×{}", rep.bandwidth / 1000,
-        rep.width.unwrap_or(0), rep.height.unwrap_or(0));
-}
-
-// Currently active representation.
-if let Some(rep) = session.current_representation(&MediaType::Video) {
-    println!("playing at {}kbps", rep.bandwidth / 1000);
-}
-
-// Estimated buffer level.
-let buf_ms = session.estimated_buffer_level_ms(&MediaType::Video);
-println!("video buffer: {:.1} s", buf_ms / 1000.0);
-
-// Cap quality, e.g. to enforce a data-saver mode.
-session.set_max_bitrate(MediaType::Video, 2_000_000);
-session.clear_max_bitrate(MediaType::Video);
-
-// Current period in a multi-period stream.
-println!("period {}/{}", session.current_period_index() + 1, session.period_count());
-```
-
-The `on_iteration` callback in `PlaybackDriver` receives an [`IterationSummary`]
-after every segment pair, which carries the same values without requiring a
-reference to the session:
-
-```rust
-fn on_iteration(&mut self, s: &IterationSummary<'_>) {
-    println!(
-        "video={:?} buf={:.1}s  audio={:?} buf={:.1}s  throughput={:.0}kbps",
-        s.video_decision.map(|d| d.index),
-        s.video_buffer_ms / 1_000.0,
-        s.audio_decision.map(|d| d.index),
-        s.audio_buffer_ms / 1_000.0,
-        s.last_throughput_bps / 1_000.0,
-    );
-}
-```
-
----
-
-## Player events
-
-```rust
-use dash_rs::PlayerEvent;
-
-let mut player = Player::from_url(&url, fetcher, buffer, driver).await?;
-player.on(|event| {
-    match event {
-        PlayerEvent::Log(log) => {
-            println!("[{:?}] {}: {}", log.level, log.target, log.message);
-        }
-        PlayerEvent::Iteration(s) => {
-            println!("buffer={:.1}s throughput={:.0}kbps", s.video_buffer_ms / 1_000.0, s.last_throughput_bps.unwrap_or(0.0) / 1_000.0);
-        }
-        PlayerEvent::InbandDash(ev) => {
-            // DASH emsg events (e.g. splice cues, ID3 metadata).
-            println!("emsg {} {:?}: {} bytes", ev.scheme_id_uri, ev.value, ev.message_data.len());
-        }
-        PlayerEvent::PlaybackStateChanged { from, to } => {
-            println!("playback state {from:?} -> {to:?}");
-        }
-        PlayerEvent::QualityChange { media_type, old_index, new_index, .. } => {
-            println!("{media_type:?} switched {old_index} -> {new_index}");
-        }
-        _ => {}
-    }
-});
-
-player.run().await?;
-```
-
-Player events are emitted by wrappers around the configured `MediaBuffer` and
-`PlaybackDriver`, so segment fetching stays independent of application event
-delivery. The event API has no external dependency and works in `no_std` builds
-that provide `alloc`.
-
----
-
-## Running the tests
-
-```bash
-# Run all unit + integration + doc tests
-cargo test
-
-# Run only ABR rule tests
-cargo test --test abr_rules
-
-# Run only media buffer abstraction tests
-cargo test --test media_buffer
-
-# Run only doc-tests
-cargo test --doc
-```
-
----
+For a full breakdown of DASH spec compliance, behavioural differences relative
+to dash.js, and the prioritised list of unimplemented features, see
+[/dash-compliance.md](docs/dash-compliance.md).
 
 ## Running the examples
 
@@ -160,10 +47,7 @@ cargo run --example basic
 
 ### `http_fetch` — real HTTP, no media output
 
-Fetches the BBC R&D Big Buck Bunny stream over HTTP and prints per-segment ABR
-decisions to stdout. Requires internet access. No media sink is involved —
-segments are fetched and discarded; this example exercises `DashSession` and
-the full ABR pipeline end-to-end without any rendering dependency.
+Fetches the a DASH stream over HTTP and prints per-segment ABR decisions to stdout. Requires internet access. No media sink is involved, segments are simply fetched and discarded. This example exercises `DashSession` and the full ABR pipeline end-to-end without any rendering dependency.
 
 ```bash
 # Uses the BBC R&D Big Buck Bunny manifest by default
@@ -191,9 +75,7 @@ Video representations (sorted by bandwidth):
 
 ### `wasm_player` — browser playback via WebAssembly
 
-Runs the full MPEG-DASH session in the browser.  The architecture is a
-**JS-bridge**: all browser Web API calls (MSE, Fetch, clocks) live in
-`examples/wasm_player/player.js` as an annotated `bridge` object.  WASM calls
+Runs the full MPEG-DASH session in the browser.  The architecture is a **JS-bridge**: all browser Web API calls (MSE, Fetch, clocks) live in `examples/wasm_player/player.js` as an annotated `bridge` object.  WASM calls
 bridge methods via the `JsBridge` extern type in `src/lib.rs`; Rust never
 touches browser objects directly.  Reading `player.js` top-to-bottom shows the
 complete set of Web APIs involved in MPEG-DASH playback.
@@ -271,11 +153,26 @@ Done.
 
 ---
 
-## Logging
 
-dash-rs does not require a logging backend. Subscribe to `Player::on` and route
-`PlayerEvent::Log` into your own logging system (`tracing`, `log`, browser UI,
-or plain stdout).
+## Running the tests
+
+```bash
+# Run all unit + integration + doc tests
+cargo test
+
+# Run only ABR rule tests
+cargo test --test abr_rules
+
+# Run only media buffer abstraction tests
+cargo test --test media_buffer
+
+# Run only doc-tests
+cargo test --doc
+```
+
+---
+
+
 
 ---
 
@@ -313,8 +210,3 @@ Data flow per segment:
 
 ---
 
-## Spec compliance and missing features
-
-For a full breakdown of DASH spec compliance, behavioural differences relative
-to dash.js, and the prioritised list of unimplemented features, see
-[/dash-compliance.md](docs/dash-compliance.md).

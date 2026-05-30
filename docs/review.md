@@ -16,6 +16,8 @@ Items that were previously noted but are now resolved:
 | `async-broadcast` dependency | Removed. Events are Player-owned and dependency-free. |
 | `tracing` as a published dependency | Removed from normal dependencies. Examples may still use `tracing`. |
 | no-op `tracing` shim | Removed with the old internal `tracing::...` call sites. |
+| `PlayerEvent::EndOfStream` semantics | `RunEnded { reason: PlayerRunEndReason }` now distinguishes natural EOS from driver-requested stop. |
+| Native Player events | `basic`, `http_fetch`, and `gstreamer_player` now use `Player::on` for progress and run-end reporting. |
 | WASM status UI | Now powered by `Player::on` and `PlayerEvent::Iteration`. |
 
 ---
@@ -31,35 +33,7 @@ warn about this heavily, but a re-exported proc-macro alias such as
 `#[dash_rs::async_impl]` that bakes in `?Send` would eliminate the whole class
 of mistakes.
 
-**2. `PlayerEvent::EndOfStream` semantics are too broad**
-
-`Player::run()` currently emits `PlayerEvent::EndOfStream` whenever the inner
-`DashSession::run()` returns `Ok(())`. That includes natural EOS, but also early
-exit via `PlaybackDriver::should_continue() == false`. Consumers cannot tell
-whether the media ended or the driver stopped scheduling.
-
-Prefer replacing or complementing it with:
-
-```rust
-pub enum PlayerRunEndReason {
-    EndOfStream,
-    StoppedByDriver,
-}
-
-pub enum PlayerEvent {
-    RunEnded { reason: PlayerRunEndReason },
-    // ...
-}
-```
-
-**3. `Player::on` examples are still limited**
-
-The WASM player uses `Player::on` for its status UI, but the simpler native
-examples do not demonstrate event handling. Add a small `event_monitor` example
-or wire `Player::on` into `http_fetch.rs` so non-browser consumers see the
-recommended integration path.
-
-**4. WASM `JsBridge` cloning is non-obvious**
+**2. WASM `JsBridge` cloning is non-obvious**
 
 Most WASM components clone the bridge with
 `JsValue::clone(bridge.as_ref()).unchecked_into()`, while
@@ -67,7 +41,7 @@ Most WASM components clone the bridge with
 `clone_bridge(&JsBridge) -> JsBridge` or `JsBridgeExt::clone_ref()` would make
 the construction path easier to scan.
 
-**5. `Player::on` handler re-entrancy is undocumented**
+**3. `Player::on` handler re-entrancy is undocumented**
 
 Handlers are stored behind `Rc<RefCell<Vec<_>>>`. If a handler causes nested
 event emission, it may panic at runtime due to a `RefCell` borrow conflict. This
@@ -118,32 +92,22 @@ debug tracing. This avoids surprising users who expect every old low-level
 
 High leverage, ordered.
 
-1. **Fix `PlayerEvent::EndOfStream` semantics**
-
-   Add an explicit run-end reason so UI and automation can distinguish natural
-   EOS from driver-requested stop.
-
-2. **Add a native Player-event example**
-
-   Create `examples/event_monitor.rs` or update `examples/http_fetch.rs` to use
-   `Player::on` for `Log`, `Iteration`, `QualityChange`, and `InbandDash`.
-
-3. **Improve UTF-8 failure handling**
+1. **Improve UTF-8 failure handling**
 
    Replace lossy/silent manifest, UTC, and XLink UTF-8 handling with explicit
    errors or visible Player log events.
 
-4. **Preserve fetch error structure through CDN fallback**
+2. **Preserve fetch error structure through CDN fallback**
 
    Replace `AllBaseUrlsFailed { last_error: String }` with a structured cause
    representation.
 
-5. **Tighten docs around manual integration**
+3. **Tighten docs around manual integration**
 
    Update `Clock`, `AbrMetrics`, and `PlaybackDriver` docs. These are small
    documentation-only tasks with high consumer value.
 
-6. **Consider an `async_trait(?Send)` helper**
+4. **Consider an `async_trait(?Send)` helper**
 
    If a proc-macro alias is too much, add a prominent snippet and maybe a
    compile-fail doc test showing the correct annotation.
