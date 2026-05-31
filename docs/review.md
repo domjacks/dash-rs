@@ -1,68 +1,36 @@
 # Code Review — dash-rs
 
-Review focus: API ergonomics, documentation, error handling, no_std behaviour,
-Player-first integration, and practical next tasks.
+Review focus: API ergonomics, documentation, error handling, no_std behaviour, Player-first integration, and practical next tasks.
 
 ---
 
-## 1. Current Status
-
-Items that were previously noted but are now resolved:
-
-| Area | Status |
-|---|---|
-| no_std build | `cargo check --no-default-features` passes. |
-| `events` feature | Removed; `PlayerEvent`, `DashEvent`, and `Player::on` are always available. |
-| `async-broadcast` dependency | Removed. Events are Player-owned and dependency-free. |
-| `tracing` as a published dependency | Removed from normal dependencies. Examples may still use `tracing`. |
-| no-op `tracing` shim | Removed with the old internal `tracing::...` call sites. |
-| `PlayerEvent::EndOfStream` semantics | `RunEnded { reason: PlayerRunEndReason }` now distinguishes natural EOS from driver-requested stop. |
-| Native Player events | `basic`, `http_fetch`, and `gstreamer_player` now use `Player::on` for progress and run-end reporting. |
-| WASM status UI | Now powered by `Player::on` and `PlayerEvent::Iteration`. |
-
----
-
-## 2. API Ergonomics
+## API Ergonomics
 
 Ordered by consumer impact.
 
 **1. `async_trait(?Send)` has no guard**
 
-Omitting `?Send` still produces one of Rust's more confusing errors. The docs
-warn about this heavily, but a re-exported proc-macro alias such as
-`#[dash_rs::async_impl]` that bakes in `?Send` would eliminate the whole class
-of mistakes.
+Omitting `?Send` still produces one of Rust's more confusing errors. The docs warn about this heavily, but a re-exported proc-macro alias such as `#[dash_rs::async_impl]` that bakes in `?Send` would eliminate the whole class of mistakes.
 
 **2. WASM `JsBridge` cloning is non-obvious**
 
-Most WASM components clone the bridge with
-`JsValue::clone(bridge.as_ref()).unchecked_into()`, while
-`WasmPlaybackDriver::new` takes `&bridge`. A small helper such as
-`clone_bridge(&JsBridge) -> JsBridge` or `JsBridgeExt::clone_ref()` would make
-the construction path easier to scan.
+Most WASM components clone the bridge with `JsValue::clone(bridge.as_ref()).unchecked_into()`, while `WasmPlaybackDriver::new ` takes `&bridge`. A small helper such as `clone_bridge(&JsBridge) -> JsBridge` or `JsBridgeExt::clone_ref()` would make the construction path easier to scan.
 
 **3. `Player::on` handler re-entrancy is undocumented**
 
-Handlers are stored behind `Rc<RefCell<Vec<_>>>`. If a handler causes nested
-event emission, it may panic at runtime due to a `RefCell` borrow conflict. This
-is probably acceptable, but should be documented as "handlers must not call back
-into `Player::run`/event-emitting APIs" or made robust with a queued dispatch
-model.
+Handlers are stored behind `Rc<RefCell<Vec<_>>>`. If a handler causes nested event emission, it may panic at runtime due to a `RefCell` borrow conflict. This is probably acceptable, but should be documented as "handlers must not call back into `Player::run`/event-emitting APIs" or made robust with a queued dispatch model.
 
 ---
 
-## 3. Logging and Diagnostics
+## Logging and Diagnostics
 
 **1. `PlayerEvent::Log` should be explicitly scoped**
 
-`PlayerEvent::Log` is useful, but should be documented as high-level,
-consumer-facing diagnostics rather than a complete replacement for internal
-debug tracing. This avoids surprising users who expect every old low-level
-`tracing::debug!` to appear as a Player event.
+`PlayerEvent::Log` is useful, but should be documented as high-level, consumer-facing diagnostics rather than a complete replacement for internal debug tracing. This avoids surprising users who expect every old low-level `tracing::debug!` to appear as a Player event.
 
 ---
 
-## 4. Documentation Gaps
+## Documentation Gaps
 
 | Location | Gap |
 |---|---|
@@ -75,7 +43,7 @@ debug tracing. This avoids surprising users who expect every old low-level
 
 ---
 
-## 5. Error Handling
+## Error Handling
 
 | Location | Issue |
 |---|---|
@@ -88,7 +56,7 @@ debug tracing. This avoids surprising users who expect every old low-level
 
 ---
 
-## 6. Suggested Next Tasks
+## Suggested Next Tasks
 
 High leverage, ordered.
 

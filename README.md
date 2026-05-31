@@ -29,7 +29,7 @@ The `AbrController` runs all six rules and takes the most conservative result.
 
 ### Spec compliance and missing features
 
-For a full breakdown of DASH spec compliance, behavioural differences relative to dash.js, and the prioritised list of unimplemented features, see [/dash-compliance.md](docs/dash-compliance.md).
+For a full breakdown of DASH spec compliance, behavioural differences relative to dash.js, and the list of unimplemented features, see [/dash-compliance.md](docs/dash-compliance.md).
 
 ## Running the examples
 
@@ -46,7 +46,6 @@ cargo run --example basic
 Fetches the a DASH stream over HTTP and prints per-segment ABR decisions to stdout. Requires internet access. No media sink is involved, segments are simply fetched and discarded. This example exercises `DashSession` and the full ABR pipeline end-to-end without any rendering dependency.
 
 ```bash
-# Uses the BBC R&D Big Buck Bunny manifest by default
 cargo run --example http_fetch
 
 # Override the manifest URL
@@ -96,8 +95,7 @@ http://localhost:8080/?url=https://your-stream/manifest.mpd
 
 ### `gstreamer_player` — full AV playback (`sink-gstreamer` feature)
 
-Fetches and plays back the BBC R&D Big Buck Bunny stream using GStreamer as the
-media sink. Requires GStreamer ≥ 1.14 and a display.
+Fetches and plays back a DASH stream using GStreamer as the media sink. Requires GStreamer ≥ 1.14 and a display.
 
 **Prerequisites:**
 
@@ -111,8 +109,7 @@ apt-get install gstreamer1.0-tools gstreamer1.0-plugins-good \
                 protobuf-compiler
 ```
 
-On macOS, if `cargo build` cannot find GStreamer headers, prepend the framework
-`bin` directory so its `pkg-config` is found first:
+On macOS, if `cargo build` cannot find GStreamer headers, prepend the framework `bin` directory so its `pkg-config` is found first:
 
 ```bash
 export PATH="/Library/Frameworks/GStreamer.framework/Versions/1.0/bin:$PATH"
@@ -126,22 +123,6 @@ cargo run --features sink-gstreamer --example gstreamer_player
 
 # Override the manifest URL
 cargo run --features sink-gstreamer --example gstreamer_player -- https://your-stream/manifest.mpd
-```
-
-Expected output (excerpt):
-
-```
-Loaded manifest: https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd
-Pipeline playing.
-
-=== Fetching 8 segments (buffer target: 12 s) ===
-  seg   vid-idx  vid-reason    aud-idx  aud-reason    buf-est     video fetch
-  1     2        Throughput    0        Throughput       0.0 s     312 ms  (3842 kbps)
-  2     3        Throughput    0        Throughput       3.8 s      89 ms  (5201 kbps)
-  ...
-
-All segments fetched — waiting for pipeline EOS…
-Done.
 ```
 
 ---
@@ -162,5 +143,3 @@ cargo test --test media_buffer
 # Run only doc-tests
 cargo test --doc
 ```
-
----

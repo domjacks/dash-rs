@@ -711,11 +711,10 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 
 ### Code comments
 
-Only include comments that explain the high-level business logic or non-obvious edge cases. Do not write comments explaining what basic code does.
-
-Keep comments short and concise.
-
-Do not add inline comments to the right of code.
+- Keep comments to a minimum.
+- Only include comments for non-obvious edge cases. Do not write comments explaining what the code does.
+- Keep comments short and concise.
+- Do not add inline comments to the right of code.
 
 
 ## Documentation
