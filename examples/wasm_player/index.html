@@ -24,6 +24,38 @@
         />
         <button type="submit">Load</button>
       </form>
+      <div id="preset-buttons" aria-label="Manifest URL presets">
+        <button
+          type="button"
+          data-manifest-url="https://dash.akamaized.net/akamai/bbb_30fps/bbb_30fps.mpd"
+        >
+          BBB VOD
+        </button>
+        <button
+          type="button"
+          data-manifest-url="https://rdmedia.bbc.co.uk/testcard/vod/manifests/avc-full.mpd"
+        >
+          BBC R&amp;D VOD
+        </button>
+        <button
+          type="button"
+          data-manifest-url="https://rdmedia.bbc.co.uk/testcard/simulcast/manifests/avc-full.mpd"
+        >
+          BBC R&amp;D Live
+        </button>
+        <button
+          type="button"
+          data-manifest-url="https://rdmedia.bbc.co.uk/testcard/simulcast/manifests/radio-lc-en.mpd"
+        >
+          BBC R&amp;D AOD
+        </button>
+        <button
+          type="button"
+          data-manifest-url="https://rdmedia.bbc.co.uk/testcard/lowlatency/manifests/ll-avc-full.mpd"
+        >
+          BBC R&amp;D Live Low Latency
+        </button>
+      </div>
 
       <div id="status">Loading WASM module&hellip;</div>
     </div>

@@ -75,6 +75,16 @@
       cursor: pointer;
     }
     button:hover { background: #1569b0; }
+    #preset-buttons {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem;
+    }
+    #preset-buttons button {
+      background: #333;
+      color: #ddd;
+    }
+    #preset-buttons button:hover { background: #444; }
 
     /* ── Status line ────────────────────────────────────────────────────────── */
     #status {

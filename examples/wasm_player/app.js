@@ -22,10 +22,18 @@ const status = document.getElementById('status');
 const form   = document.getElementById('form');
 const input  = document.getElementById('url-input');
 const logEl  = document.getElementById('api-log');
+const presets = document.getElementById('preset-buttons');
 
 // Pre-fill URL from ?url= query parameter if present.
 const searchUrl = new URLSearchParams(window.location.search).get('url');
 if (searchUrl) input.value = searchUrl;
+
+presets.addEventListener('click', (e) => {
+  const button = e.target.closest('button[data-manifest-url]');
+  if (!button) return;
+  input.value = button.dataset.manifestUrl;
+  input.focus();
+});
 
 // ── On-screen logger ───────────────────────────────────────────────────────────
 //
