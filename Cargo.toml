@@ -9,7 +9,7 @@ version = "0.1.0"
 edition = "2021"
 description = "A Rust implementation of MPEG-DASH playback logic: MPD parsing, ABR selection, media fetching, and buffer abstraction"
 license = "BSD-3-Clause"
-repository = "https://github.com/jacksd60/dash-rs"
+repository = "https://github.com/domjacks/dash-rs"
 keywords = ["dash", "mpeg-dash", "streaming", "abr", "mpd"]
 categories = ["multimedia", "network-programming"]
 
