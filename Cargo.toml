@@ -31,7 +31,7 @@ async-trait      = "0.1"
 rand             = { version = "0.8", default-features = false, features = ["small_rng"] }
 futures-timer    = { version = "3", optional = true }
 futures          = { version = "0.3", default-features = false, features = ["alloc"] }
-hashbrown        = "0.16"
+hashbrown        = "0.17"
 libm             = { version = "0.2", default-features = false }
 gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
 gstreamer-app    = { version = "0.24", optional = true }
