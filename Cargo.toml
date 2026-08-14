@@ -34,7 +34,7 @@ futures          = { version = "0.3", default-features = false, features = ["all
 hashbrown        = "0.16"
 libm             = { version = "0.2", default-features = false }
 gstreamer        = { version = "0.24", optional = true, features = ["v1_22"] }
-gstreamer-app    = { version = "0.24", optional = true }
+gstreamer-app    = { version = "0.25", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys        = "0.3"
