@@ -12,7 +12,7 @@ use crate::abr::{
 };
 
 /// Minimum time between consecutive upward quality switches.
-const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(8);
+pub(crate) const MIN_SWITCH_INTERVAL: Duration = Duration::from_secs(8);
 /// Number of recent switches to remember.
 const HISTORY_CAPACITY: usize = 4;
 
@@ -30,14 +30,19 @@ pub struct SwitchHistoryRule {
 
 impl Default for SwitchHistoryRule {
     fn default() -> Self {
-        Self {
-            min_switch_interval: MIN_SWITCH_INTERVAL,
-            recent_switches: VecDeque::with_capacity(HISTORY_CAPACITY),
-        }
+        Self::with_min_switch_interval(MIN_SWITCH_INTERVAL)
     }
 }
 
 impl SwitchHistoryRule {
+    /// Create a rule with a custom minimum up-switch interval.
+    pub fn with_min_switch_interval(min_switch_interval: Duration) -> Self {
+        Self {
+            min_switch_interval,
+            recent_switches: VecDeque::with_capacity(HISTORY_CAPACITY),
+        }
+    }
+
     /// Record that a switch just occurred.
     ///
     /// `now_ms` must be sourced from [`crate::clock::Clock::now_ms`] — the

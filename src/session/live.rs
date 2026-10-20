@@ -9,7 +9,7 @@
 /// does not declare `@suggestedPresentationDelay`.  Three segments (~12 s at
 /// 4 s/seg) gives enough leeway for CDN propagation without introducing
 /// too much latency.
-const DEFAULT_LIVE_SAFETY_SEGMENTS: u64 = 3;
+pub(crate) const DEFAULT_LIVE_SAFETY_SEGMENTS: u64 = 3;
 
 #[cfg(not(feature = "std"))]
 #[allow(unused_imports)]
@@ -24,7 +24,7 @@ use crate::math::FloatExt as _;
 /// ```
 ///
 /// `suggested_delay_s` is `MPD@suggestedPresentationDelay` converted to
-/// seconds.  When present it overrides the built-in safety margin.
+/// seconds.  When present it overrides `safety_segments`.
 ///
 /// `availability_time_offset_s` is `SegmentTemplate@availabilityTimeOffset`
 /// in seconds (0.0 when absent).  A positive ATO means segments become
@@ -43,6 +43,7 @@ pub(super) fn compute_live_edge_segment(
     start_number: u64,
     suggested_delay_s: Option<f64>,
     availability_time_offset_s: f64,
+    safety_segments: u64,
 ) -> u64 {
     if seg_dur_secs <= 0.0 || now_secs <= ast_secs {
         return start_number;
@@ -53,7 +54,7 @@ pub(super) fn compute_live_edge_segment(
 
     let safety = match suggested_delay_s {
         Some(spd) => (spd / seg_dur_secs).ceil() as u64,
-        None => DEFAULT_LIVE_SAFETY_SEGMENTS,
+        None => safety_segments,
     };
 
     live_edge.saturating_sub(safety).max(start_number)
@@ -63,14 +64,15 @@ pub(super) fn compute_live_edge_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_live_edge_segment;
+    use super::{compute_live_edge_segment, DEFAULT_LIVE_SAFETY_SEGMENTS};
 
     /// Basic: 100 segments have elapsed, no SPD → snap 3 back from live edge.
     #[test]
     fn live_edge_basic_safety_margin() {
         // 4 s segments; 400 s of elapsed time → live_edge = 100 + 1 = 101
         // safety = 3 → start at 98
-        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, None, 0.0);
+        let seg =
+            compute_live_edge_segment(0.0, 400.0, 4.0, 1, None, 0.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 98);
     }
 
@@ -78,10 +80,26 @@ mod tests {
     #[test]
     fn live_edge_uses_suggested_presentation_delay() {
         // SPD = 12 s, seg_dur = 4 s → safety = ceil(12/4) = 3
-        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, Some(12.0), 0.0);
+        let seg = compute_live_edge_segment(
+            0.0,
+            400.0,
+            4.0,
+            1,
+            Some(12.0),
+            0.0,
+            DEFAULT_LIVE_SAFETY_SEGMENTS,
+        );
         assert_eq!(seg, 98);
         // SPD = 8 s → safety = 2
-        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, Some(8.0), 0.0);
+        let seg = compute_live_edge_segment(
+            0.0,
+            400.0,
+            4.0,
+            1,
+            Some(8.0),
+            0.0,
+            DEFAULT_LIVE_SAFETY_SEGMENTS,
+        );
         assert_eq!(seg, 99);
     }
 
@@ -89,7 +107,8 @@ mod tests {
     #[test]
     fn live_edge_non_zero_start_number() {
         // start_number = 5; live_edge = floor(400/4) + 5 = 105; safety=3 → 102
-        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 5, None, 0.0);
+        let seg =
+            compute_live_edge_segment(0.0, 400.0, 4.0, 5, None, 0.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 102);
     }
 
@@ -97,7 +116,8 @@ mod tests {
     #[test]
     fn live_edge_with_nonzero_ast() {
         // AST = 25 s, now = 425 s → elapsed = 400 s, live_edge = 100 + 1 = 101; safety=3 → 98
-        let seg = compute_live_edge_segment(25.0, 425.0, 4.0, 1, None, 0.0);
+        let seg =
+            compute_live_edge_segment(25.0, 425.0, 4.0, 1, None, 0.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 98);
     }
 
@@ -106,21 +126,31 @@ mod tests {
     fn live_edge_clamps_to_start_number() {
         // Only 2 segments elapsed → live_edge = 3; safety = 3 → would underflow to 0
         // clamped to start_number (1)
-        let seg = compute_live_edge_segment(0.0, 8.0, 4.0, 1, None, 0.0);
+        let seg =
+            compute_live_edge_segment(0.0, 8.0, 4.0, 1, None, 0.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 1);
     }
 
     /// `now < ast` (clock behind availability) → return `start_number`.
     #[test]
     fn live_edge_future_ast_returns_start_number() {
-        let seg = compute_live_edge_segment(1000.0, 500.0, 4.0, 1, None, 0.0);
+        let seg = compute_live_edge_segment(
+            1000.0,
+            500.0,
+            4.0,
+            1,
+            None,
+            0.0,
+            DEFAULT_LIVE_SAFETY_SEGMENTS,
+        );
         assert_eq!(seg, 1);
     }
 
     /// Degenerate `seg_dur = 0` → return `start_number` without panicking.
     #[test]
     fn live_edge_zero_duration_returns_start_number() {
-        let seg = compute_live_edge_segment(0.0, 400.0, 0.0, 1, None, 0.0);
+        let seg =
+            compute_live_edge_segment(0.0, 400.0, 0.0, 1, None, 0.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 1);
     }
 
@@ -132,10 +162,12 @@ mod tests {
     #[test]
     fn live_edge_with_availability_time_offset() {
         // Without ATO baseline.
-        let seg_no_ato = compute_live_edge_segment(0.0, 401.0, 4.0, 1, None, 0.0);
+        let seg_no_ato =
+            compute_live_edge_segment(0.0, 401.0, 4.0, 1, None, 0.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg_no_ato, 98);
         // With ATO=3.5 s → one segment further ahead.
-        let seg = compute_live_edge_segment(0.0, 401.0, 4.0, 1, None, 3.5);
+        let seg =
+            compute_live_edge_segment(0.0, 401.0, 4.0, 1, None, 3.5, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 99);
     }
 
@@ -145,7 +177,8 @@ mod tests {
     fn live_edge_ato_full_segment_duration() {
         // 4 s segments, ATO=4 s → effective elapsed = 404 s
         // live_edge = floor(404/4) + 1 = 101 + 1 = 102; safety=3 → 99
-        let seg = compute_live_edge_segment(0.0, 400.0, 4.0, 1, None, 4.0);
+        let seg =
+            compute_live_edge_segment(0.0, 400.0, 4.0, 1, None, 4.0, DEFAULT_LIVE_SAFETY_SEGMENTS);
         assert_eq!(seg, 99);
     }
 }

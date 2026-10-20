@@ -18,6 +18,7 @@ pub mod media_buffer;
 pub mod mp4;
 pub mod player;
 pub mod session;
+pub mod settings;
 pub mod throughput_cell;
 mod time;
 pub mod util;
@@ -52,4 +53,5 @@ pub use session::{
     BufferLevelSample, DashMetrics, DashSession, FetchOutcome, GapControllerSettings,
     GapSeekReason, GapSeekTarget, HttpRequestRecord, MediaType, RepresentationSwitchRecord,
 };
+pub use settings::{AbrSettings, BufferSettings, CdnSettings, LiveSettings, PlayerSettings};
 pub use throughput_cell::ThroughputCell;

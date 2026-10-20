@@ -20,7 +20,7 @@ use hashbrown::HashMap;
 use alloc::{borrow::ToOwned, string::String};
 
 /// Default cooldown duration matching dash.js `BlacklistController.BLACKLIST_DURATION`.
-pub(super) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
+pub(crate) const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// Time-based CDN blacklist.
 ///

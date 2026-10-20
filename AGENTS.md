@@ -384,7 +384,7 @@ for contributors and for callers who build a custom fetch loop without `run()`:
 |---|---|
 | `notify_playing()` | Starts the wall-clock used by `estimated_buffer_level_ms`. Called automatically by `run()`. |
 | `estimated_buffer_level_ms(media_type)` | Returns `(segments_fetched × segment_duration_ms) − elapsed_playing_ms`, clamped to 0. |
-| `buffer_target_ms()` | Default 12 000 ms (matches `bufferTimeDefault` in dash.js `ScheduleController`). |
+| `buffer_target_ms()` | Default 12 000 ms (matches `bufferTimeDefault` in dash.js `ScheduleController`); seeded from `PlayerSettings::buffer`. |
 | `set_buffer_target_ms(ms)` | Override the target. |
 
 `estimated_buffer_level_ms` is a wall-clock approximation — it assumes real-time
@@ -543,9 +543,22 @@ identically to a `SegmentTemplate` with the same attribute.
 ### `MPD@minBufferTime` and `buffer_target_ms`
 
 `DashSession::from_mpd_with_utc` seeds `buffer_target_ms` from `MPD@minBufferTime`
-for VOD streams: `max(minBufferTime_ms, 12_000)`.  For live streams the default
-12 000 ms is used regardless.  `DashSession::min_buffer_time_ms()` exposes the
-parsed value.
+for VOD streams: `max(minBufferTime_ms, settings.buffer.buffer_time_default_ms)`.
+For live streams `buffer_time_default_ms` (default 12 000 ms) is used regardless.
+`DashSession::min_buffer_time_ms()` exposes the parsed value.
+
+### `PlayerSettings` — construction-time configuration
+
+`PlayerSettings` (`src/settings.rs`) holds the tunables that were previously
+hardcoded: buffer target and retention, ABR rule thresholds, live safety
+segments, `GapControllerSettings`, and CDN blacklist cooldown.  Pass it via
+`DashSession::from_url_with_settings` / `from_mpd_with_settings` or the
+matching `Player` constructors; all other constructors use
+`PlayerSettings::default()`, whose values must stay identical to the previous
+hardcoded defaults.  The per-rule default constants remain in their rule files
+and `AbrSettings::default()` reads them, so there is one source for each value.
+`AbrController::from_settings` builds the standard rule pipeline; when adding a
+new ABR rule with a tunable threshold, add it to `AbrSettings` as well.
 
 ### `should_refresh_manifest` when `minimumUpdatePeriod` absent
 
@@ -677,7 +690,7 @@ Each rule lives in its own file under `src/abr/`.  Rules must:
 - Be stateless where possible.  If state is needed (e.g. `SwitchHistoryRule`),
   keep it inside the struct and expose a `record_*` method called by
   `AbrController`.
-- Be registered in `AbrController::default()` in `src/abr/mod.rs`.
+- Be registered in `AbrController::from_settings()` in `src/abr/mod.rs`.
 - Have unit tests in `tests/abr_rules.rs`.
 
 ### Adding a `MediaBuffer` implementation
@@ -732,6 +745,7 @@ fetch-http = ["dep:reqwest", "dep:tokio"]
 | Public API surface | `src/lib.rs` |
 | Error types | `src/error.rs` |
 | `Player` convenience wrapper | `src/player.rs` |
+| `PlayerSettings` (construction-time tuning) | `src/settings.rs` |
 | Platform-agnostic monotonic clock helper | `src/time.rs` |
 | ABR rule trait | `src/abr/rule.rs` |
 | ABR controller | `src/abr/mod.rs` |

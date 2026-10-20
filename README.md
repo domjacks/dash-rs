@@ -26,6 +26,8 @@ dash-rs provides the core building blocks needed to drive a DASH adaptive stream
 | `AbandonRequestsRule` | Abandons an in-flight segment and switches down when effective download speed falls far below the current bitrate | `AbandonRequestRule.js` |
 
 The `AbrController` runs all six rules and takes the most conservative result.
+Rule thresholds, the buffer target, and other defaults can be overridden with
+`PlayerSettings` (see [getting-started](docs/getting-started.md#player-settings)).
 
 ### Spec compliance and missing features
 

@@ -11,10 +11,10 @@ use crate::abr::{
 ///
 /// Mirrors the `droppedFramesThreshold` constant (`0.1`) used by the
 /// equivalent rule in dash.js.
-const DROP_THRESHOLD: f64 = 0.10;
+pub(crate) const DROP_THRESHOLD: f64 = 0.10;
 
 /// Forces the lowest quality representation when the decoder drop ratio
-/// exceeds [`DROP_THRESHOLD`].
+/// exceeds [`Self::threshold`].
 ///
 /// The caller must populate [`AbrMetrics::dropped_frames`] and
 /// [`AbrMetrics::total_decoded_frames`] from renderer statistics (e.g.
@@ -22,8 +22,19 @@ const DROP_THRESHOLD: f64 = 0.10;
 /// to act on.  When either field is `None` the rule abstains.
 ///
 /// Mirrors `DroppedFramesRule.js` in dash.js.
-#[derive(Debug, Default)]
-pub struct DroppedFramesRule;
+#[derive(Debug)]
+pub struct DroppedFramesRule {
+    /// Drop ratio above which the rule fires. Default: 0.10.
+    pub threshold: f64,
+}
+
+impl Default for DroppedFramesRule {
+    fn default() -> Self {
+        Self {
+            threshold: DROP_THRESHOLD,
+        }
+    }
+}
 
 impl AbrRule for DroppedFramesRule {
     fn name(&self) -> &str {
@@ -49,7 +60,7 @@ impl AbrRule for DroppedFramesRule {
         };
 
         let drop_ratio = dropped / total;
-        if drop_ratio > DROP_THRESHOLD {
+        if drop_ratio > self.threshold {
             Some(0)
         } else {
             None

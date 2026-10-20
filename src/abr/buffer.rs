@@ -9,12 +9,12 @@ use crate::abr::{
 use crate::math::FloatExt as _;
 
 /// Target buffer level in ms: the level we aim to maintain.
-const TARGET_BUFFER_MS: f64 = 12_000.0;
+pub(crate) const TARGET_BUFFER_MS: f64 = 12_000.0;
 /// Maximum buffer level in ms: above this there is no reason to download more.
-const MAX_BUFFER_MS: f64 = 30_000.0;
+pub(crate) const MAX_BUFFER_MS: f64 = 30_000.0;
 /// Lyapunov parameter. Higher values weight throughput more; lower values
 /// weight buffer occupancy more. Typical range: 5–20.
-const GAMMA: f64 = 5.0;
+pub(crate) const GAMMA: f64 = 5.0;
 
 /// Buffer-occupancy-based ABR rule, inspired by the BOLA (Buffer Occupancy
 /// based Lyapunov Algorithm) approach used in `BolaRule.js` from dash.js.

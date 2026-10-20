@@ -284,6 +284,8 @@ that provide a custom clock:
 | `Player::from_url_with_clock` | Playback from a URL with a platform clock |
 | `Player::from_mpd` | Tests or offline scenarios with an already-parsed manifest |
 | `Player::from_mpd_with_clock` | Already-parsed manifest with a platform clock |
+| `Player::from_url_with_settings` | Playback from a URL with a platform clock and custom `PlayerSettings` |
+| `Player::from_mpd_with_settings` | Already-parsed manifest with a platform clock and custom `PlayerSettings` |
 
 ## Player events
 
@@ -422,3 +424,46 @@ player.run().await?;
 Implement the `Clock` trait with your platform's monotonic clock, UTC clock,
 and async timer. The browser implementation in
 [`examples/wasm_player`](../examples/wasm_player) is a complete reference.
+
+## Player settings
+
+`PlayerSettings` configures the session at construction time. Every default
+matches dash.js, so only override what you need:
+
+```rust
+use std::time::Duration;
+use dash_rs::{PlayerSettings, SystemClock};
+
+let mut settings = PlayerSettings::default();
+settings.buffer.buffer_time_default_ms = 20_000.0;
+settings.abr.insufficient_buffer_threshold_ms = 4_000.0;
+settings.live.safety_segments = 2;
+settings.cdn.blacklist_cooldown = Duration::from_secs(60);
+
+let mut player = Player::from_url_with_settings(
+    &url,
+    fetcher,
+    buffer,
+    driver,
+    SystemClock::arc(),
+    settings,
+)
+.await?;
+```
+
+| Setting | Default | Notes |
+|---|---|---|
+| `buffer.buffer_time_default_ms` | 12 000 | Fetch gate target. VOD uses `max(this, MPD@minBufferTime)` |
+| `buffer.buffer_to_keep_s` | 30 | Media kept behind the playhead when pruning |
+| `abr.throughput_safety_factor` | 0.9 | `ThroughputRule` |
+| `abr.bola_target_buffer_ms` / `bola_max_buffer_ms` / `bola_gamma` | 12 000 / 30 000 / 5.0 | `BufferOccupancyRule` |
+| `abr.insufficient_buffer_threshold_ms` | 2 000 | `InsufficientBufferRule` and the post-seek guard |
+| `abr.min_switch_interval` | `Some(8 s)` | `SwitchHistoryRule`; `None` disables it |
+| `abr.dropped_frames_threshold` | 0.10 | `DroppedFramesRule` |
+| `abr.abandon_multiplier` | 0.5 | `AbandonRequestsRule` |
+| `live.safety_segments` | 3 | Used when `MPD@suggestedPresentationDelay` is absent |
+| `gaps` | `GapControllerSettings::default()` | Gap jump / stall recovery |
+| `cdn.blacklist_cooldown` | 600 s | `Duration::ZERO` disables blacklisting |
+
+The buffer target, retention window, gap settings, and CDN cooldown can still
+be changed after construction with the existing `DashSession` setters.

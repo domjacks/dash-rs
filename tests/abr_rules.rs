@@ -479,3 +479,34 @@ fn dropped_frames_rule_at_exact_threshold_abstains() {
         "exactly 10% drop rate should abstain (strict > threshold)"
     );
 }
+
+// ── AbrController::from_settings ──────────────────────────────────────────────
+
+#[test]
+fn controller_from_settings_uses_custom_insufficient_buffer_threshold() {
+    let settings = dash_rs::AbrSettings {
+        insufficient_buffer_threshold_ms: 5_000.0,
+        ..Default::default()
+    };
+    let controller = AbrController::from_settings(&settings);
+    let reps = reps();
+
+    // 3 s buffer is above the default 2 s threshold but below the custom 5 s.
+    let metrics = AbrMetrics::new(10_000_000.0, 3_000.0);
+    assert_eq!(controller.select(&reps, &metrics).index, 0);
+    assert_ne!(AbrController::default().select(&reps, &metrics).index, 0);
+}
+
+#[test]
+fn controller_from_settings_custom_safety_factor() {
+    let settings = dash_rs::AbrSettings {
+        throughput_safety_factor: 0.3,
+        ..Default::default()
+    };
+    let controller = AbrController::from_settings(&settings);
+    let reps = reps();
+
+    // 10 Mbps × 0.3 = 3 Mbps usable → "mid" rather than "high".
+    let metrics = AbrMetrics::new(10_000_000.0, 20_000.0);
+    assert_eq!(controller.select(&reps, &metrics).index, 1);
+}
