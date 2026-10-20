@@ -16,7 +16,7 @@ use crate::abr::{
 /// The fraction of the throughput estimate that must exceed a representation's
 /// bitrate before that representation is selected. A value of 0.9 means the
 /// measured bandwidth must be at least 11% above the bitrate (safety margin).
-const SAFETY_FACTOR: f64 = 0.9;
+pub(crate) const SAFETY_FACTOR: f64 = 0.9;
 
 /// Half-life of the **fast** EWMA in seconds.
 ///

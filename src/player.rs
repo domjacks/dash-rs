@@ -72,6 +72,7 @@ use crate::{
 };
 
 use crate::mp4::parse_all_emsg;
+use crate::settings::PlayerSettings;
 
 type EventHandler = Box<dyn FnMut(&PlayerEvent)>;
 type EventHandlers = Rc<RefCell<Vec<EventHandler>>>;
@@ -270,12 +271,7 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
     #[cfg(feature = "std")]
     pub async fn from_url(url: &Url, fetcher: F, buf: S, driver: D) -> Result<Self, DashError> {
         let session = DashSession::from_url(url, fetcher).await?;
-        Ok(Self {
-            session,
-            buf,
-            driver,
-            event_handlers: new_event_handlers(),
-        })
+        Ok(Self::from_session(session, buf, driver))
     }
 
     /// Like [`Self::from_url`] but accepts a custom [`Clock`] implementation.
@@ -289,13 +285,21 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         driver: D,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
-        let session = DashSession::from_url_with_clock(url, fetcher, clock).await?;
-        Ok(Self {
-            session,
-            buf,
-            driver,
-            event_handlers: new_event_handlers(),
-        })
+        Self::from_url_with_settings(url, fetcher, buf, driver, clock, PlayerSettings::default())
+            .await
+    }
+
+    /// Like [`Self::from_url_with_clock`] but tuned by `settings`.
+    pub async fn from_url_with_settings(
+        url: &Url,
+        fetcher: F,
+        buf: S,
+        driver: D,
+        clock: Arc<dyn Clock>,
+        settings: PlayerSettings,
+    ) -> Result<Self, DashError> {
+        let session = DashSession::from_url_with_settings(url, fetcher, clock, settings).await?;
+        Ok(Self::from_session(session, buf, driver))
     }
 
     /// Wrap an already-parsed `mpd` into a `Player` ready to
@@ -316,12 +320,7 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         driver: D,
     ) -> Result<Self, DashError> {
         let session = DashSession::from_mpd(mpd, base_url, fetcher)?;
-        Ok(Self {
-            session,
-            buf,
-            driver,
-            event_handlers: new_event_handlers(),
-        })
+        Ok(Self::from_session(session, buf, driver))
     }
 
     /// Like [`Self::from_mpd`] but accepts a custom [`Clock`] implementation.
@@ -337,13 +336,38 @@ impl<F: SegmentFetcher, S: MediaBuffer, D: PlaybackDriver> Player<F, S, D> {
         driver: D,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
-        let session = DashSession::from_mpd_with_clock(mpd, base_url, fetcher, clock)?;
-        Ok(Self {
+        Self::from_mpd_with_settings(
+            mpd,
+            base_url,
+            fetcher,
+            buf,
+            driver,
+            clock,
+            PlayerSettings::default(),
+        )
+    }
+
+    /// Like [`Self::from_mpd_with_clock`] but tuned by `settings`.
+    pub fn from_mpd_with_settings(
+        mpd: MPD,
+        base_url: Url,
+        fetcher: Arc<F>,
+        buf: S,
+        driver: D,
+        clock: Arc<dyn Clock>,
+        settings: PlayerSettings,
+    ) -> Result<Self, DashError> {
+        let session = DashSession::from_mpd_with_settings(mpd, base_url, fetcher, clock, settings)?;
+        Ok(Self::from_session(session, buf, driver))
+    }
+
+    fn from_session(session: DashSession<F>, buf: S, driver: D) -> Self {
+        Self {
             session,
             buf,
             driver,
             event_handlers: new_event_handlers(),
-        })
+        }
     }
 
     // ── Playback ──────────────────────────────────────────────────────────────

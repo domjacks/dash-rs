@@ -20,10 +20,10 @@
 //! | `segment_url` | [`expand_template`], `collect_candidate_base_urls`, `resolve_effective_base_url` |
 //! | `utc` | `resolve_utc_timing`, `query_http_utc` — `UTCTiming` clock-sync |
 
-mod blacklist;
+pub(crate) mod blacklist;
 pub mod driver;
 mod gap;
-mod live;
+pub(crate) mod live;
 pub mod metrics;
 mod mpd;
 mod segment_url;
@@ -49,6 +49,7 @@ use alloc::{
 };
 
 use crate::manifest::mpd_types::{AdaptationSet, Period, Representation, MPD};
+use crate::settings::PlayerSettings;
 use crate::Url;
 #[cfg(feature = "std")]
 use futures::future::{self as fut, Either};
@@ -647,6 +648,10 @@ pub struct DashSession<F: SegmentFetcher> {
     /// automatically at period boundaries.  Callers drive detection via
     /// [`Self::tick_gap`].
     gap_controller: GapController,
+    /// Live-edge safety margin used when `@suggestedPresentationDelay` is absent.
+    live_safety_segments: u64,
+    /// Buffer level that keeps the post-seek ABR guard active.
+    insufficient_buffer_threshold_ms: f64,
     /// DVR window depth in milliseconds, parsed from `MPD@timeShiftBufferDepth`.
     ///
     /// For live streams: segment numbers older than
@@ -717,6 +722,17 @@ impl<F: SegmentFetcher> DashSession<F> {
         fetcher: F,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
+        Self::from_url_with_settings(url, fetcher, clock, PlayerSettings::default()).await
+    }
+
+    /// Like [`Self::from_url_with_clock`] but tuned by `settings` (buffer
+    /// target, ABR thresholds, live safety margin, gap and CDN behaviour).
+    pub async fn from_url_with_settings(
+        url: &Url,
+        fetcher: F,
+        clock: Arc<dyn Clock>,
+        settings: PlayerSettings,
+    ) -> Result<Self, DashError> {
         let fetcher = Arc::new(fetcher);
         let loader = ManifestLoader::new(Arc::clone(&fetcher));
         let (mpd, base_url) = loader.load(url).await?;
@@ -730,7 +746,8 @@ impl<F: SegmentFetcher> DashSession<F> {
         let client_now_s = clock.unix_s();
         let utc_offset = utc::resolve_utc_timing(&mpd, &fetcher, client_now_s).await;
 
-        let mut session = Self::from_mpd_with_utc(mpd, base_url, fetcher, utc_offset, clock)?;
+        let mut session =
+            Self::from_mpd_with_utc(mpd, base_url, fetcher, utc_offset, clock, settings)?;
         session.last_manifest_refresh = Some(session.clock.now_ms());
         Ok(session)
     }
@@ -746,13 +763,7 @@ impl<F: SegmentFetcher> DashSession<F> {
     /// inject a different clock, use [`Self::from_mpd_with_clock`].
     #[cfg(feature = "std")]
     pub fn from_mpd(mpd: MPD, base_url: Url, fetcher: Arc<F>) -> Result<Self, DashError> {
-        Self::from_mpd_with_utc(
-            mpd,
-            base_url,
-            fetcher,
-            0.0,
-            crate::clock::SystemClock::arc(),
-        )
+        Self::from_mpd_with_clock(mpd, base_url, fetcher, crate::clock::SystemClock::arc())
     }
 
     /// Like [`Self::from_mpd`] but accepts a custom [`Clock`] implementation.
@@ -765,17 +776,29 @@ impl<F: SegmentFetcher> DashSession<F> {
         fetcher: Arc<F>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, DashError> {
-        Self::from_mpd_with_utc(mpd, base_url, fetcher, 0.0, clock)
+        Self::from_mpd_with_settings(mpd, base_url, fetcher, clock, PlayerSettings::default())
     }
 
-    /// Internal constructor shared by [`Self::from_url_with_clock`] and
-    /// [`Self::from_mpd_with_clock`].
+    /// Like [`Self::from_mpd_with_clock`] but tuned by `settings`.
+    pub fn from_mpd_with_settings(
+        mpd: MPD,
+        base_url: Url,
+        fetcher: Arc<F>,
+        clock: Arc<dyn Clock>,
+        settings: PlayerSettings,
+    ) -> Result<Self, DashError> {
+        Self::from_mpd_with_utc(mpd, base_url, fetcher, 0.0, clock, settings)
+    }
+
+    /// Internal constructor shared by [`Self::from_url_with_settings`] and
+    /// [`Self::from_mpd_with_settings`].
     fn from_mpd_with_utc(
         mpd: MPD,
         base_url: Url,
         fetcher: Arc<F>,
         utc_clock_offset_s: f64,
         clock: Arc<dyn Clock>,
+        settings: PlayerSettings,
     ) -> Result<Self, DashError> {
         if mpd.periods.is_empty() {
             return Err(DashError::EmptyManifest);
@@ -872,6 +895,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                         track.start_number,
                         spd_s,
                         track.availability_time_offset_s,
+                        settings.live.safety_segments,
                     );
                     track.segment_number = seg;
                     track.initial_segment_number = seg;
@@ -884,6 +908,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                         track.start_number,
                         spd_s,
                         track.availability_time_offset_s,
+                        settings.live.safety_segments,
                     );
                     track.segment_number = seg;
                     track.initial_segment_number = seg;
@@ -963,7 +988,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         // dash.js uses `Math.max(minBufferTime, bufferTimeDefault)` for VOD and
         // `bufferTimeDefault` for live; we follow the same policy.
         let buffer_target_ms = {
-            let default_ms = 12_000.0_f64;
+            let default_ms = settings.buffer.buffer_time_default_ms;
             if let Some(mbt) = mpd.minBufferTime {
                 let mbt_ms = mbt.as_millis() as f64;
                 if mpd.mpdtype.as_deref().is_none_or(|t| t != "dynamic") {
@@ -984,12 +1009,14 @@ impl<F: SegmentFetcher> DashSession<F> {
             .iter()
             .filter_map(|loc| base_url.join(&loc.url).ok())
             .collect();
+        let mut cdn_blacklist = CdnBlacklist::new();
+        cdn_blacklist.set_cooldown(settings.cdn.blacklist_cooldown);
         Ok(Self {
             mpd,
             base_url,
             location_urls,
             fetcher,
-            abr: AbrController::default(),
+            abr: AbrController::from_settings(&settings.abr),
             video_track,
             audio_track,
             current_period_index: 0,
@@ -1000,7 +1027,7 @@ impl<F: SegmentFetcher> DashSession<F> {
             paused_at: None,
             total_paused_ms: 0.0,
             schedule_while_paused: false,
-            buffer_to_keep_s: 30.0,
+            buffer_to_keep_s: settings.buffer.buffer_to_keep_s,
             abandon_timeout_ms: None,
             minimum_update_period_ms: mpd_minimum_update_period_ms,
             last_manifest_refresh: None,
@@ -1008,8 +1035,10 @@ impl<F: SegmentFetcher> DashSession<F> {
             utc_clock_offset_s,
             video_max_bitrate_bps: None,
             audio_max_bitrate_bps: None,
-            cdn_blacklist: CdnBlacklist::new(),
-            gap_controller: GapController::new(),
+            cdn_blacklist,
+            gap_controller: GapController::with_settings(settings.gaps),
+            live_safety_segments: settings.live.safety_segments,
+            insufficient_buffer_threshold_ms: settings.abr.insufficient_buffer_threshold_ms,
             time_shift_buffer_depth_ms: mpd_ref_tsbd,
             live_pts_remap_offset_s: 0.0,
             dash_metrics: DashMetrics::new(),
@@ -2491,6 +2520,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                             track.start_number,
                             spd_s,
                             track.availability_time_offset_s,
+                            self.live_safety_segments,
                         );
                         if track.segment_number < new_live_edge {
                             track.segment_number = new_live_edge;
@@ -2722,6 +2752,7 @@ impl<F: SegmentFetcher> DashSession<F> {
                     track.start_number,
                     self.mpd.suggestedPresentationDelay.map(|d| d.as_secs_f64()),
                     track.availability_time_offset_s,
+                    self.live_safety_segments,
                 );
                 let window_segments = (tsbd_ms / 1_000.0 / seg_dur_s).floor() as u64;
                 let dvr_floor = live_edge
@@ -2784,9 +2815,7 @@ impl<F: SegmentFetcher> DashSession<F> {
         // critical.  A seek near the end of a segment can leave less than two
         // seconds buffered after the first append; clearing the guard too early
         // lets InsufficientBufferRule immediately clamp to the lowest quality.
-        if !metrics.is_post_seek
-            || metrics.buffer_level_ms
-                > crate::abr::insufficient_buffer::CRITICAL_BUFFER_THRESHOLD_MS
+        if !metrics.is_post_seek || metrics.buffer_level_ms > self.insufficient_buffer_threshold_ms
         {
             self.track_mut(&media_type)?.post_seek = false;
         }

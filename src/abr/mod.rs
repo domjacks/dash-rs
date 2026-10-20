@@ -20,6 +20,7 @@ use crate::abr::{
     dropped_frames::DroppedFramesRule, insufficient_buffer::InsufficientBufferRule,
     switch_history::SwitchHistoryRule, throughput::ThroughputRule,
 };
+use crate::settings::AbrSettings;
 
 /// Aggregates multiple [`AbrRule`]s and returns a single [`QualityDecision`].
 ///
@@ -36,20 +37,39 @@ pub struct AbrController {
 impl Default for AbrController {
     /// Creates a controller with the standard rule pipeline.
     fn default() -> Self {
-        Self {
-            rules: vec![
-                Box::new(ThroughputRule::default()),
-                Box::new(BufferOccupancyRule::default()),
-                Box::new(InsufficientBufferRule::default()),
-                Box::new(DroppedFramesRule),
-                Box::new(AbandonRequestsRule),
-            ],
-            switch_history: Some(SwitchHistoryRule::default()),
-        }
+        Self::from_settings(&AbrSettings::default())
     }
 }
 
 impl AbrController {
+    /// Create the standard rule pipeline tuned by `settings`.
+    pub fn from_settings(settings: &AbrSettings) -> Self {
+        Self {
+            rules: vec![
+                Box::new(ThroughputRule::with_safety_factor(
+                    settings.throughput_safety_factor,
+                )),
+                Box::new(BufferOccupancyRule {
+                    target_buffer_ms: settings.bola_target_buffer_ms,
+                    max_buffer_ms: settings.bola_max_buffer_ms,
+                    gamma: settings.bola_gamma,
+                }),
+                Box::new(InsufficientBufferRule {
+                    critical_threshold_ms: settings.insufficient_buffer_threshold_ms,
+                }),
+                Box::new(DroppedFramesRule {
+                    threshold: settings.dropped_frames_threshold,
+                }),
+                Box::new(AbandonRequestsRule {
+                    multiplier: settings.abandon_multiplier,
+                }),
+            ],
+            switch_history: settings
+                .min_switch_interval
+                .map(SwitchHistoryRule::with_min_switch_interval),
+        }
+    }
+
     /// Create a controller with a custom set of rules and default switch
     /// history throttling.
     pub fn with_rules(rules: Vec<Box<dyn AbrRule>>) -> Self {

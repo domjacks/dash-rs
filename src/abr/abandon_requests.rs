@@ -11,7 +11,7 @@ use crate::abr::{
 ///
 /// Mirrors the `abandonMultiplier` constant (`0.5`) from dash.js's
 /// `AbandonRequestsRule`.
-const ABANDON_MULTIPLIER: f64 = 0.5;
+pub(crate) const ABANDON_MULTIPLIER: f64 = 0.5;
 
 /// Forces the lowest quality representation when
 /// [`AbrMetrics::effective_download_ratio`] indicates the in-flight segment
@@ -29,8 +29,19 @@ const ABANDON_MULTIPLIER: f64 = 0.5;
 /// common case when no slow download is detected) the rule abstains.
 ///
 /// Mirrors `AbandonRequestsRule.js` in dash.js.
-#[derive(Debug, Default)]
-pub struct AbandonRequestsRule;
+#[derive(Debug)]
+pub struct AbandonRequestsRule {
+    /// Ratio below which the rule fires. Default: 0.5.
+    pub multiplier: f64,
+}
+
+impl Default for AbandonRequestsRule {
+    fn default() -> Self {
+        Self {
+            multiplier: ABANDON_MULTIPLIER,
+        }
+    }
+}
 
 impl AbrRule for AbandonRequestsRule {
     fn name(&self) -> &str {
@@ -51,7 +62,7 @@ impl AbrRule for AbandonRequestsRule {
         }
 
         let ratio = metrics.effective_download_ratio?;
-        if ratio < ABANDON_MULTIPLIER {
+        if ratio < self.multiplier {
             Some(0)
         } else {
             None

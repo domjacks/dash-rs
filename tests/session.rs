@@ -6935,3 +6935,73 @@ mod mock_fetcher_exhaustion {
         );
     }
 }
+
+// ── PlayerSettings ────────────────────────────────────────────────────────────
+
+fn session_with_settings(
+    xml: &str,
+    settings: dash_rs::PlayerSettings,
+) -> DashSession<dash_rs::fetch::stub::StubSegmentFetcher> {
+    let mpd = dash_rs::manifest::parse(xml).expect("MPD parse failed");
+    let base_url = Url::parse("http://example.com/").unwrap();
+    let fetcher = Arc::new(dash_rs::fetch::stub::StubSegmentFetcher);
+    DashSession::from_mpd_with_settings(
+        mpd,
+        base_url,
+        fetcher,
+        dash_rs::SystemClock::arc(),
+        settings,
+    )
+    .expect("from_mpd_with_settings failed")
+}
+
+#[test]
+fn default_settings_match_plain_constructor() {
+    let plain = session_from_xml(STATIC_MPD);
+    let configured = session_with_settings(STATIC_MPD, dash_rs::PlayerSettings::default());
+    assert_eq!(plain.buffer_target_ms(), configured.buffer_target_ms());
+    assert_eq!(plain.buffer_to_keep_s(), configured.buffer_to_keep_s());
+    assert_eq!(
+        plain.cdn_blacklist_cooldown_ms(),
+        configured.cdn_blacklist_cooldown_ms()
+    );
+}
+
+#[test]
+fn settings_override_buffer_cdn_and_gap_defaults() {
+    let mut settings = dash_rs::PlayerSettings::default();
+    settings.buffer.buffer_time_default_ms = 20_000.0;
+    settings.buffer.buffer_to_keep_s = 10.0;
+    settings.cdn.blacklist_cooldown = std::time::Duration::from_secs(5);
+    settings.gaps.jump_large_gaps = false;
+
+    let session = session_with_settings(STATIC_MPD, settings);
+    assert_eq!(session.buffer_target_ms(), 20_000.0);
+    assert_eq!(session.buffer_to_keep_s(), 10.0);
+    assert_eq!(session.cdn_blacklist_cooldown_ms(), 5_000);
+    assert!(!session.gap_settings().jump_large_gaps);
+}
+
+#[test]
+fn settings_buffer_target_still_respects_vod_min_buffer_time() {
+    let xml = STATIC_MPD.replace(r#"type="static""#, r#"type="static" minBufferTime="PT15S""#);
+    let mut settings = dash_rs::PlayerSettings::default();
+    settings.buffer.buffer_time_default_ms = 8_000.0;
+    let session = session_with_settings(&xml, settings);
+    assert_eq!(session.buffer_target_ms(), 15_000.0);
+}
+
+#[test]
+fn settings_live_safety_segments_moves_start_position() {
+    let (xml, default_start) = live_mpd_with_ast(1_000);
+    let mut settings = dash_rs::PlayerSettings::default();
+    settings.live.safety_segments = 1;
+    let session = session_with_settings(&xml, settings);
+    let start = session.current_segment_number(&MediaType::Video);
+    // Default safety is 3; with 1 we start two segments closer (±1 for clock jitter).
+    assert!(
+        start.abs_diff(default_start + 2) <= 1,
+        "start {start}, expected ≈{}",
+        default_start + 2
+    );
+}

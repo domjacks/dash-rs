@@ -43,6 +43,7 @@ DashSession
 | `MediaBuffer` | `src/media_buffer.rs` | Receives initialization/media bytes and maps timeline state into the renderer |
 | `PlaybackDriver` | `src/session/driver.rs` | Reports renderer position/state and handles renderer seeks or lifecycle hooks |
 | `Clock` | `src/clock.rs` | Supplies monotonic time, UTC time, and async sleeps for native, WASM, and no-std targets |
+| `PlayerSettings` | `src/settings.rs` | Construction-time tuning (buffer target, ABR thresholds, live safety margin, gaps, CDN cooldown) |
 
 Built-in buffers are intentionally minimal:
 
@@ -65,7 +66,7 @@ URL
     └── manifest::parse(xml)
         └── roxmltree tree walk into manifest::MPD
 
-DashSession::from_url_with_clock
+DashSession::from_url_with_settings   (from_url / from_url_with_clock use PlayerSettings::default())
 ├── resolve eager XLink references
 ├── resolve UTCTiming to compute server/client clock offset
 └── from_mpd_with_utc
@@ -74,7 +75,7 @@ DashSession::from_url_with_clock
     ├── compute MIME, timestampOffset, append window, and segment timing
     ├── create TrackState for available tracks
     ├── snap live streams to the live edge
-    └── initialize buffer target, metrics, gap controller, and CDN blacklist
+    └── initialize buffer target, ABR controller, metrics, gap controller, and CDN blacklist from PlayerSettings
 ```
 
 The MPD model in `src/manifest/mpd_types.rs` intentionally declares only the
@@ -184,6 +185,7 @@ directly and avoids the wrappers.
 |---|---|
 | `src/lib.rs` | Public module exports and top-level re-exports |
 | `src/player.rs` | `Player`, `PlayerEvent`, event wrapper adapters |
+| `src/settings.rs` | `PlayerSettings` and its sub-structs with dash.js defaults |
 | `src/session/mod.rs` | Main DASH session coordinator and fetch loop |
 | `src/session/mpd.rs` | MPD-to-track extraction helpers |
 | `src/session/segment_url.rs` | Template expansion and BaseURL candidate resolution |
